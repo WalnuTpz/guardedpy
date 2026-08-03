@@ -23,7 +23,7 @@ def _command(*args: str, summary: str = "approved command") -> RunCommandAction:
         (_command("git", "diff", "--no-ext-diff", "--check"), None, CommandRuleKind.GIT_DIFF_CHECK),
         (_command("git", "push", "origin", "main"), "main", CommandRuleKind.GIT_PUSH),
         (
-            _command("python", "-m", "pip", "install", "ruff==0.5.0", "httpx[http2]>=0.27"),
+            _command("python", "-m", "pip", "install", "ruff==0.5.0", "httpx>=0.27"),
             None,
             CommandRuleKind.PIP_INSTALL,
         ),
@@ -112,6 +112,11 @@ def test_changed_branch_never_matches_git_push_rule(
         _command("python", "-m", "pip", "install", "-e", "."),
         _command("python", "-m", "pip", "install", "-r", "requirements.txt"),
         _command("python", "-m", "pip", "install", "--index-url", "https://example.invalid"),
+        _command("python", "-m", "pip", "install", "evil.whl"),
+        _command("python", "-m", "pip", "install", "pkg.tar.gz"),
+        _command("python", "-m", "pip", "install", "httpx[http2]>=0.27"),
+        _command("python", "-m", "pip", "install", "pkg==1!!!"),
+        _command("python", "-m", "pip", "install", "pkg>=abc"),
         _command("python", "-m", "pip", "install", "ruff;id"),
         _command("python", "-m", "pip", "install", "ruff==1.*"),
         _command("python", "-m", "pip", "install"),
@@ -127,6 +132,18 @@ def test_unsafe_or_expanded_command_cannot_become_a_rule(
 
     with pytest.raises(ValueError, match="eligible command family"):
         CommandRuleStore(tmp_path).add_from(action, "main")
+
+
+def test_existing_bare_archive_filename_cannot_become_a_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches archive rejection depending on whether a local file happens to exist."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "evil.whl").write_bytes(b"not a wheel")
+    action = _command("python", "-m", "pip", "install", "evil.whl")
+
+    with pytest.raises(ValueError, match="eligible command family"):
+        CommandRuleStore(tmp_path).add_from(action, None)
 
 
 def test_persisted_rule_omits_raw_action_summary_and_unsafe_values(

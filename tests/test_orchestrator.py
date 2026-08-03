@@ -453,6 +453,42 @@ def test_once_approval_is_consumed_without_creating_a_persistent_rule(
     assert CommandRuleStore(tmp_path).list_rules() == []
 
 
+@pytest.mark.parametrize(
+    "approval_kwargs",
+    [
+        {"decision": "invalid"},
+        {"decision": True},
+        {"approved": "yes"},
+    ],
+)
+def test_invalid_approval_input_does_not_execute_and_pending_remains_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approval_kwargs: dict[str, object],
+) -> None:
+    """Catches orchestration popping or executing pending work before validating input."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    target = tmp_path / "obsolete.txt"
+    target.write_text("preserve until a valid decision\n")
+    task = _bugfix_task()
+    action = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
+    orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
+
+    waiting = orchestrator.run(task)
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+    invalid = orchestrator.resolve_approval(
+        task.id,
+        action_hash or "",
+        **approval_kwargs,  # type: ignore[arg-type]
+    )
+
+    assert invalid is False
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    assert target.exists()
+    assert orchestrator.resolve_approval(task.id, action_hash or "", decision="once") is True
+    assert target.exists() is False
+
+
 def test_always_approval_survives_store_restart_without_raw_pending_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

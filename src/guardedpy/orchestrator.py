@@ -29,7 +29,14 @@ from guardedpy.actions import (
 )
 from guardedpy.context import ContextBuilder, LlmContext
 from guardedpy.command_rules import CommandRuleStore
-from guardedpy.domain import ApprovalDecision, PolicyDecision, PolicyVerdict, TaskState, TaskStatus
+from guardedpy.domain import (
+    ApprovalDecision,
+    PolicyDecision,
+    PolicyVerdict,
+    TaskState,
+    TaskStatus,
+    is_approval_decision,
+)
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 from guardedpy.feedback import FeedbackCollector, PytestFeedback
 from guardedpy.llm import LLMClient, TemporaryProviderFailure
@@ -245,10 +252,10 @@ class TaskOrchestrator:
     ) -> bool:
         """Consume an exact approval decision and execute only the bound allowed action."""
         if decision is None:
-            if approved is None:
+            if type(approved) is not bool:
                 return False
             decision = "once" if approved else "reject"
-        elif approved is not None:
+        elif approved is not None or not is_approval_decision(decision):
             return False
         with self._state_lock:
             key = (task_id, action_hash)

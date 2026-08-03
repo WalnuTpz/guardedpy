@@ -18,13 +18,25 @@ from guardedpy.domain import CommandApprovalRule, CommandRuleKind
 _GIT_DIFF_CHECK = ("git", "diff", "--no-ext-diff", "--check")
 _PIP_INSTALL_PREFIX = ("python", "-m", "pip", "install")
 _BRANCH = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9_-])?")
-_PACKAGE_SPEC = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
-    r"(?:\[[A-Za-z0-9._-]+(?:,[A-Za-z0-9._-]+)*\])?"
-    r"(?:"
-    r"(?:===|==|~=|!=|<=|>=|<|>)[A-Za-z0-9][A-Za-z0-9._+!-]*"
-    r"(?:,(?:===|==|~=|!=|<=|>=|<|>)[A-Za-z0-9][A-Za-z0-9._+!-]*)*"
-    r")?"
+_PACKAGE_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_VERSION = (
+    r"(?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*"
+    r"(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?"
+    r"(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?"
+)
+_VERSION_CONSTRAINT = re.compile(rf"(?:==|~=|!=|<=|>=|<|>){_VERSION}")
+_ARCHIVE_SUFFIXES = (
+    ".whl",
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tgz",
+    ".tbz",
+    ".tbz2",
+    ".txz",
+    ".egg",
 )
 _SHELL_METACHARACTERS = frozenset(";&|<>$`(){}*?[]\n\r\0\\")
 
@@ -35,7 +47,7 @@ def has_shell_metacharacter(arguments: tuple[str, ...]) -> bool:
     return any(
         character in _SHELL_METACHARACTERS
         for index, argument in enumerate(arguments)
-        if not (package_command and index >= 4 and _PACKAGE_SPEC.fullmatch(argument))
+        if not (package_command and index >= 4 and _valid_package_spec(argument))
         for character in argument
     )
 
@@ -59,7 +71,7 @@ def command_rule_kind(
     if (
         action.args[:4] == _PIP_INSTALL_PREFIX
         and len(action.args) > 4
-        and all(_PACKAGE_SPEC.fullmatch(spec) for spec in action.args[4:])
+        and all(_valid_package_spec(spec) for spec in action.args[4:])
     ):
         return CommandRuleKind.PIP_INSTALL
     return None
@@ -200,3 +212,13 @@ def _valid_branch(branch: str) -> bool:
         and not branch.endswith((".", "/", ".lock"))
         and all(not part.startswith(".") for part in branch.split("/"))
     )
+
+
+def _valid_package_spec(spec: str) -> bool:
+    operator = next((index for index, character in enumerate(spec) if character in "<>=!~"), None)
+    name = spec if operator is None else spec[:operator]
+    if not _PACKAGE_NAME.fullmatch(name) or name.lower().endswith(_ARCHIVE_SUFFIXES):
+        return False
+    if operator is None:
+        return True
+    return all(_VERSION_CONSTRAINT.fullmatch(part) for part in spec[operator:].split(","))

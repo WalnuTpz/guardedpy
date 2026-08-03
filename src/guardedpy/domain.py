@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, TypeGuard
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
@@ -42,6 +42,12 @@ class PolicyVerdict(StrEnum):
 
 
 ApprovalDecision: TypeAlias = Literal["reject", "once", "always"]
+_APPROVAL_DECISIONS = frozenset({"reject", "once", "always"})
+
+
+def is_approval_decision(value: object) -> TypeGuard[ApprovalDecision]:
+    """Recognize only the three exact string decisions at runtime."""
+    return type(value) is str and value in _APPROVAL_DECISIONS
 
 
 class CommandRuleKind(StrEnum):

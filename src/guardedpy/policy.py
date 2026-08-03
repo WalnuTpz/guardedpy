@@ -29,6 +29,7 @@ from guardedpy.domain import (
     TaskMode,
     TaskState,
     TddPhase,
+    is_approval_decision,
 )
 from guardedpy.feedback import PytestFeedback
 
@@ -184,6 +185,13 @@ class PolicyEngine:
         self, pending: PolicyDecision, action: Action, decision: ApprovalDecision
     ) -> PolicyDecision:
         """Consume an exact pending approval as rejection, one-time, or constrained durable access."""
+        if not is_approval_decision(decision):
+            return self._deny(
+                None,
+                action,
+                "approval.invalid_decision",
+                "approval decision must be reject, once, or always",
+            )
         if pending.verdict is not PolicyVerdict.APPROVAL_REQUIRED or pending.task_id is None:
             return self._deny(None, action, "approval.not_pending", "action has no pending approval")
         if pending.action_hash != stable_hash(action):

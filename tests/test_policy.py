@@ -449,6 +449,30 @@ def test_delete_approval_is_exact_and_single_use(
     assert (replayed.verdict, replayed.rule_id) == (PolicyVerdict.DENY, "approval.already_used")
 
 
+@pytest.mark.parametrize("invalid_decision", ["invalid", True])
+def test_invalid_approval_decision_is_denied_without_consuming_pending_action(
+    policy: PolicyEngine,
+    ready_bugfix_task: TaskState,
+    invalid_decision: object,
+) -> None:
+    """Catches unknown or wrong-type decisions falling through as one-time approval."""
+    action = DeletePathAction(kind="delete_path", summary="remove test", path="tests/test_example.py")
+    pending = policy.request_approval(ready_bugfix_task, action)
+
+    invalid = policy.apply_approval(
+        pending,
+        action,
+        decision=invalid_decision,  # type: ignore[arg-type]
+    )
+    retry = policy.apply_approval(pending, action, decision="once")
+
+    assert (invalid.verdict, invalid.rule_id) == (
+        PolicyVerdict.DENY,
+        "approval.invalid_decision",
+    )
+    assert retry.verdict is PolicyVerdict.ALLOW
+
+
 def test_approval_does_not_match_a_different_action(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
