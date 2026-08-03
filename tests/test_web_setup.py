@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 import importlib
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 from uuid import UUID
@@ -561,6 +562,154 @@ def test_local_services_defers_keyring_lookup_until_a_completion_call(
         )
     )
     assert calls == ["get"]
+
+
+def test_local_git_branch_probe_uses_a_fixed_read_only_bounded_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches branch discovery invoking a shell, network command, or unbounded child."""
+    web = _web_module()
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((arguments, kwargs))
+        return subprocess.CompletedProcess(arguments, 0, "main\n", "")
+
+    monkeypatch.setattr(web.subprocess, "run", run)
+
+    branch = web._current_git_branch(tmp_path)
+
+    assert branch == "main"
+    assert calls == [
+        (
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            ],
+            {
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "shell": False,
+                "timeout": 5,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        subprocess.CompletedProcess(["git"], 1, "main\n", ""),
+        subprocess.CompletedProcess(["git"], 0, "\n", ""),
+        OSError("git unavailable"),
+        subprocess.TimeoutExpired(["git"], 5),
+    ],
+)
+def test_local_git_branch_probe_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: subprocess.CompletedProcess[str] | Exception,
+) -> None:
+    """Catches probe failures or detached/blank output becoming a trusted branch."""
+    web = _web_module()
+
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(web.subprocess, "run", run)
+
+    assert web._current_git_branch(tmp_path) is None
+
+
+def test_local_services_uses_live_project_branch_to_pause_exact_push_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches local composition omitting branch governance or executing before approval."""
+    web = _web_module()
+    import guardedpy.orchestrator as orchestrator_module
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    class Keyring:
+        def get_password(self, service_name: str, username: str) -> str:
+            del service_name, username
+            return "test-key"
+
+        def set_password(self, service_name: str, username: str, password: str) -> None:
+            del service_name, username, password
+
+        def delete_password(self, service_name: str, username: str) -> None:
+            del service_name, username
+
+    class Completions:
+        def create(self, **kwargs: object) -> object:
+            del kwargs
+            message = type(
+                "Message",
+                (),
+                {
+                    "content": (
+                        '{"kind":"run_command","summary":"push current branch",'
+                        '"args":["git","push","origin","main"]}'
+                    )
+                },
+            )()
+            return type(
+                "Response",
+                (),
+                {"choices": [type("Choice", (), {"message": message})()]},
+            )()
+
+    transport = type(
+        "Transport",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+    branch_roots: list[Path] = []
+    command_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(web, "_system_keyring", lambda: Keyring())
+    monkeypatch.setattr(
+        orchestrator_module.subprocess,
+        "run",
+        lambda arguments, **kwargs: command_calls.append(tuple(arguments))
+        or subprocess.CompletedProcess(arguments, 0, "", ""),
+    )
+    services = web.local_services(
+        transport_factory=lambda key: transport,
+        current_branch_provider=lambda root: branch_roots.append(root) or "main",
+    )
+    config = HarnessConfig(
+        source_dirs=(Path("src"),),
+        test_dirs=(Path("tests"),),
+        pytest_command=("pytest",),
+    )
+    orchestrator = services.orchestrator_factory(
+        tmp_path,
+        config,
+        web.MemoryStore(tmp_path),
+    )
+
+    waiting = orchestrator.run(
+        TaskState(
+            description="Push current branch",
+            mode=TaskMode.BUGFIX,
+            bugfix_target="tests/test_value.py::test_value_is_fixed",
+            config=config,
+        )
+    )
+
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    assert branch_roots and set(branch_roots) == {tmp_path.resolve()}
+    assert command_calls == []
 
 
 def test_serve_binds_uvicorn_to_loopback_only(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -7,6 +7,7 @@ import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 import shlex
+import subprocess
 from threading import Thread
 from typing import Any, Callable, Protocol
 from uuid import UUID
@@ -491,12 +492,40 @@ def _deepseek_transport(
     )
 
 
+def _current_git_branch(project_root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_root),
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    branch = completed.stdout.strip()
+    if completed.returncode != 0 or not branch:
+        return None
+    return branch
+
+
 def local_services(
     *,
     transport_factory: Callable[[str], Any] | None = None,
+    current_branch_provider: Callable[[Path], str | None] | None = None,
 ) -> WebServices:
     """Compose real local dependencies without asking keyring for a key at startup."""
     credentials = CredentialService(_system_keyring())
+    branch_provider = current_branch_provider or _current_git_branch
 
     def orchestrator_factory(
         project_root: Path, config: HarnessConfig, memory_store: MemoryStore
@@ -508,7 +537,12 @@ def local_services(
                 timeout_seconds=config.timeout_seconds,
             )
         llm = DeepSeekClient(credentials.get_key, config.model, configured_transport_factory)
-        return TaskOrchestrator(project_root, llm, memory_store=memory_store)
+        return TaskOrchestrator(
+            project_root,
+            llm,
+            memory_store=memory_store,
+            current_branch_provider=lambda: branch_provider(project_root),
+        )
 
     return WebServices(credentials=credentials, orchestrator_factory=orchestrator_factory)
 

@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from guardedpy.actions import (
+    Action,
     ApplyPatchAction,
     DeletePathAction,
     FinishAction,
@@ -15,7 +16,15 @@ from guardedpy.actions import (
 )
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TddPhase
+from guardedpy.domain import (
+    ApprovalDecision,
+    FeedbackKind,
+    PolicyDecision,
+    PolicyVerdict,
+    TaskMode,
+    TaskState,
+    TddPhase,
+)
 from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
 from guardedpy.policy import PolicyEngine
 
@@ -84,6 +93,15 @@ def _record_bugfix_red_baseline(policy: PolicyEngine, task: TaskState) -> None:
         ),
     )
     assert decision.verdict is PolicyVerdict.ALLOW
+
+
+def _request_approval(
+    policy: PolicyEngine,
+    task: TaskState,
+    action: Action,
+) -> PolicyDecision:
+    decision = policy.decide(task, action)
+    return policy.request_approval(task, action, decision)
 
 
 @pytest.fixture
@@ -641,7 +659,7 @@ def test_delete_approval_is_exact_and_single_use(
 ) -> None:
     """Catches an approval replay that authorizes a dangerous delete more than once."""
     action = DeletePathAction(kind="delete_path", summary="remove file", path="obsolete.txt")
-    pending = policy.request_approval(ready_bugfix_task, action)
+    pending = _request_approval(policy, ready_bugfix_task, action)
 
     accepted = policy.apply_approval(pending, action, decision="once")
     replayed = policy.apply_approval(pending, action, decision="once")
@@ -682,7 +700,7 @@ def test_explicit_approval_request_is_exact_hitl_and_not_permanent_eligible(
         reason="model-controlled reason must not become policy evidence",
     )
 
-    pending = policy.request_approval(feature_task, action)
+    pending = _request_approval(policy, feature_task, action)
 
     assert pending.verdict is PolicyVerdict.APPROVAL_REQUIRED
     assert pending.action_hash == action.stable_hash()
@@ -697,7 +715,7 @@ def test_invalid_approval_decision_is_denied_without_consuming_pending_action(
 ) -> None:
     """Catches unknown or wrong-type decisions falling through as one-time approval."""
     action = DeletePathAction(kind="delete_path", summary="remove file", path="obsolete.txt")
-    pending = policy.request_approval(ready_bugfix_task, action)
+    pending = _request_approval(policy, ready_bugfix_task, action)
 
     invalid = policy.apply_approval(
         pending,
@@ -717,10 +735,8 @@ def test_approval_does_not_match_a_different_action(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
     """Catches an approval binding that ignores the exact proposed action hash."""
-    pending = policy.request_approval(
-        ready_bugfix_task,
-        DeletePathAction(kind="delete_path", summary="first", path="obsolete.txt"),
-    )
+    first = DeletePathAction(kind="delete_path", summary="first", path="obsolete.txt")
+    pending = _request_approval(policy, ready_bugfix_task, first)
 
     result = policy.apply_approval(
         pending,
@@ -736,7 +752,7 @@ def test_approval_cannot_override_a_direct_denial(
 ) -> None:
     """Catches an approval route that turns a TDD violation into permission."""
     action = ApplyPatchAction(kind="apply_patch", summary="change", diff=SOURCE_DIFF)
-    pending = policy.request_approval(feature_task, action)
+    pending = _request_approval(policy, feature_task, action)
 
     result = policy.apply_approval(pending, action, decision="once")
 
@@ -789,7 +805,10 @@ def test_each_exact_command_family_requires_approval_without_a_rule(
     current_branch: str | None,
 ) -> None:
     """Catches an eligible command family executing before any human decision."""
-    result = PolicyEngine(tmp_path, current_branch=current_branch).decide(
+    result = PolicyEngine(
+        tmp_path,
+        current_branch_provider=lambda: current_branch,
+    ).decide(
         feature_task,
         RunCommandAction(kind="run_command", summary="eligible command", args=args),
     )
@@ -856,7 +875,11 @@ def test_matching_always_allowed_git_push_rule_bypasses_new_prompt(
         kind="run_command", summary="new wording", args=("git", "push", "origin", "main")
     )
 
-    result = PolicyEngine(tmp_path, current_branch="main", command_rules=store).decide(
+    result = PolicyEngine(
+        tmp_path,
+        current_branch_provider=lambda: "main",
+        command_rules=store,
+    ).decide(
         feature_task, same_push
     )
 
@@ -864,6 +887,70 @@ def test_matching_always_allowed_git_push_rule_bypasses_new_prompt(
         PolicyVerdict.ALLOW,
         "command.persistent_rule",
     )
+
+
+def test_command_decision_uses_one_fresh_branch_for_family_and_rule_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_task: TaskState
+) -> None:
+    """Catches either caching a branch or reading two branch values in one decision."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    action = RunCommandAction(
+        kind="run_command",
+        summary="push current branch",
+        args=("git", "push", "origin", "main"),
+    )
+    store = CommandRuleStore(tmp_path)
+    store.add_from(action, "main")
+    branch = "main"
+    reads: list[str] = []
+
+    def current_branch() -> str:
+        reads.append(branch)
+        return branch
+
+    policy = PolicyEngine(
+        tmp_path,
+        current_branch_provider=current_branch,
+        command_rules=store,
+    )
+
+    allowed = policy.decide(feature_task, action)
+    branch = "feature"
+    changed = policy.decide(feature_task, action)
+
+    assert (allowed.verdict, allowed.rule_id) == (
+        PolicyVerdict.ALLOW,
+        "command.persistent_rule",
+    )
+    assert changed.verdict is PolicyVerdict.DENY
+    assert reads == ["main", "feature"]
+
+
+@pytest.mark.parametrize("approval_decision", ("once", "always"))
+def test_changed_branch_invalidates_approval_before_it_is_consumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    feature_task: TaskState,
+    approval_decision: ApprovalDecision,
+) -> None:
+    """Catches exact approval authorizing a push after the repository branch changes."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    branch = "main"
+    policy = PolicyEngine(tmp_path, current_branch_provider=lambda: branch)
+    action = RunCommandAction(
+        kind="run_command",
+        summary="push current branch",
+        args=("git", "push", "origin", "main"),
+    )
+    pending = _request_approval(policy, feature_task, action)
+
+    branch = "feature"
+    invalidated = policy.apply_approval(pending, action, decision=approval_decision)
+    branch = "main"
+    retry = policy.apply_approval(pending, action, decision=approval_decision)
+
+    assert invalidated.verdict is PolicyVerdict.DENY
+    assert retry.verdict is PolicyVerdict.ALLOW
 
 
 def test_policy_rejects_a_rule_store_injected_from_another_project_root(
@@ -918,7 +1005,11 @@ def test_branch_url_force_and_direct_denies_run_before_persistent_rules(
         "main",
     )
 
-    result = PolicyEngine(tmp_path, current_branch="main", command_rules=store).decide(
+    result = PolicyEngine(
+        tmp_path,
+        current_branch_provider=lambda: "main",
+        command_rules=store,
+    ).decide(
         feature_task,
         RunCommandAction(kind="run_command", summary="unsafe variant", args=args),
     )

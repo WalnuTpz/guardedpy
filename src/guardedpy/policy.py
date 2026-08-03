@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path, PurePath
 import re
+from typing import Callable
 from uuid import UUID
 
 from guardedpy.actions import (
@@ -129,13 +130,13 @@ class PolicyEngine:
         self,
         project_root: Path,
         *,
-        current_branch: str | None = None,
+        current_branch_provider: Callable[[], str | None] | None = None,
         command_rules: CommandRuleStore | None = None,
     ) -> None:
         self._project_root = project_root.resolve()
         if command_rules is not None and command_rules.project_root != self._project_root:
             raise ValueError("command rule store belongs to another project root")
-        self._current_branch = current_branch
+        self._current_branch_provider = current_branch_provider or (lambda: None)
         self._command_rules = command_rules or CommandRuleStore(self._project_root)
         self._read_paths: dict[UUID, set[str]] = {}
         self._feature_test_changes: set[UUID] = set()
@@ -326,9 +327,20 @@ class PolicyEngine:
             "a feature baseline must pass before tests change",
         )
 
-    def request_approval(self, task: TaskState, action: Action) -> PolicyDecision:
-        """Register one pending approval when the proposed action needs one."""
-        decision = self.decide(task, action)
+    def request_approval(
+        self,
+        task: TaskState,
+        action: Action,
+        decision: PolicyDecision,
+    ) -> PolicyDecision:
+        """Register the exact policy decision already bound to this task and action."""
+        if decision.task_id != task.id or decision.action_hash != stable_hash(action):
+            return self._deny(
+                task,
+                action,
+                "approval.decision_mismatch",
+                "approval registration must use the exact policy decision",
+            )
         if decision.verdict is PolicyVerdict.APPROVAL_REQUIRED:
             self._pending_approvals.add((task.id, stable_hash(action)))
         return decision
@@ -354,6 +366,16 @@ class PolicyEngine:
         if decision == "reject":
             self._pending_approvals.remove(approval_key)
             return self._deny(None, action, "approval.declined", "user declined the action")
+        current_branch: str | None = None
+        if isinstance(action, RunCommandAction):
+            current_branch = self._current_branch_provider()
+            if command_rule_kind(action, current_branch) is None:
+                return self._deny(
+                    None,
+                    action,
+                    "approval.command_invalidated",
+                    "the command no longer matches its constrained approval family",
+                )
         if decision == "always":
             if not isinstance(action, RunCommandAction):
                 return self._deny(
@@ -361,16 +383,6 @@ class PolicyEngine:
                     action,
                     "approval.permanent_command_only",
                     "only constrained command families support permanent approval",
-                )
-            try:
-                self._command_rules.add_from(action, self._current_branch)
-            except ValueError:
-                self._pending_approvals.remove(approval_key)
-                return self._deny(
-                    None,
-                    action,
-                    "approval.permanent_rule_invalid",
-                    "action cannot derive a constrained permanent rule",
                 )
         self._pending_approvals.remove(approval_key)
         return PolicyDecision(
@@ -384,6 +396,29 @@ class PolicyEngine:
             task_id=pending.task_id,
             action_hash=pending.action_hash,
         )
+
+    def finalize_command_approval(
+        self,
+        task: TaskState,
+        action: RunCommandAction,
+        *,
+        permanent: bool,
+    ) -> PolicyDecision:
+        """Revalidate immediately before dispatch and then persist an eligible rule."""
+        current_branch = self._current_branch_provider()
+        decision = self._command_decision_with_branch(task, action, current_branch)
+        if decision.verdict is PolicyVerdict.DENY or not permanent:
+            return decision
+        try:
+            self._command_rules.add_from(action, current_branch)
+        except ValueError:
+            return self._deny(
+                task,
+                action,
+                "approval.permanent_rule_invalid",
+                "action cannot derive a constrained permanent rule",
+            )
+        return decision
 
     def _read_decision(self, task: TaskState, path: str, action: Action) -> PolicyDecision:
         normalized_path = self._normalized_project_path(path)
@@ -497,6 +532,18 @@ class PolicyEngine:
         return self._approval_required(task, action, "delete.approval_required", "deletion requires approval")
 
     def _command_decision(self, task: TaskState, action: RunCommandAction) -> PolicyDecision:
+        return self._command_decision_with_branch(
+            task,
+            action,
+            self._current_branch_provider(),
+        )
+
+    def _command_decision_with_branch(
+        self,
+        task: TaskState,
+        action: RunCommandAction,
+        current_branch: str | None,
+    ) -> PolicyDecision:
         command = action.args[0] if action.args else ""
         if command in {"sudo", "doas", "su"}:
             return self._deny(task, action, "command.privilege", "privilege escalation is forbidden")
@@ -524,7 +571,7 @@ class PolicyEngine:
                 "command.source_or_test_write",
                 "generic commands cannot target source or test directories",
             )
-        kind = command_rule_kind(action, self._current_branch)
+        kind = command_rule_kind(action, current_branch)
         if kind is None:
             return self._deny(
                 task,
@@ -535,7 +582,7 @@ class PolicyEngine:
         projection_denial = self._approval_projection_denial(task, action)
         if projection_denial is not None:
             return projection_denial
-        if self._command_rules.matches(action, self._current_branch):
+        if self._command_rules.matches(action, current_branch):
             return self._allow(
                 task,
                 action,

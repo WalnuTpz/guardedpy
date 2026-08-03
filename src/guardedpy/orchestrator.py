@@ -8,7 +8,7 @@ import json
 from pathlib import Path, PurePosixPath
 import subprocess
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -70,7 +70,7 @@ class TaskOrchestrator:
         *,
         max_rounds: int = 20,
         memory_store: MemoryStore | None = None,
-        current_branch: str | None = None,
+        current_branch_provider: Callable[[], str | None] | None = None,
         command_rules: CommandRuleStore | None = None,
     ) -> None:
         self._project_root = project_root.resolve()
@@ -79,7 +79,7 @@ class TaskOrchestrator:
         self._memory_store = memory_store or MemoryStore(self._project_root)
         self._policy = PolicyEngine(
             self._project_root,
-            current_branch=current_branch,
+            current_branch_provider=current_branch_provider,
             command_rules=command_rules,
         )
         self._workspace_by_task: dict[UUID, Workspace] = {}
@@ -173,7 +173,7 @@ class TaskOrchestrator:
                 with self._state_lock:
                     if self._is_cancelled(task):
                         return task
-                    self._policy.request_approval(task, action)
+                    self._policy.request_approval(task, action, decision)
                     self._pending[(task.id, action_hash)] = (action, decision, round_number)
                     task.status = TaskStatus.WAITING_APPROVAL
                     self._events.append(
@@ -267,7 +267,7 @@ class TaskOrchestrator:
             action, pending_decision, round_number = pending
             approval = self._policy.apply_approval(pending_decision, action, decision=decision)
             if approval.verdict is not PolicyVerdict.ALLOW:
-                if decision == "always" and not pending_decision.permanent_eligible:
+                if decision != "reject":
                     self._events.append(
                         self._decision_event(
                             task,
@@ -291,6 +291,25 @@ class TaskOrchestrator:
                 return False
             if self._is_cancelled(task):
                 return False
+            if isinstance(action, RunCommandAction):
+                dispatch_validation = self._policy.finalize_command_approval(
+                    task,
+                    action,
+                    permanent=decision == "always",
+                )
+                if dispatch_validation.verdict is PolicyVerdict.DENY:
+                    self._pending.pop(key)
+                    task.status = TaskStatus.BLOCKED
+                    self._events.append(
+                        self._decision_event(
+                            task,
+                            action,
+                            dispatch_validation,
+                            approval_granted=False,
+                            stop_reason=StopReason.BLOCKED,
+                        )
+                    )
+                    return False
             self._pending.pop(key)
             task.status = TaskStatus.RUNNING
             self._events.append(

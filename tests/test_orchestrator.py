@@ -13,7 +13,7 @@ import guardedpy.orchestrator as orchestrator_module
 from guardedpy.actions import RunCommandAction
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
-from guardedpy.domain import TaskMode, TaskState, TaskStatus, TddPhase
+from guardedpy.domain import ApprovalDecision, TaskMode, TaskState, TaskStatus, TddPhase
 from guardedpy.events import EventStore, RunEvent, StopReason
 from guardedpy.feedback import PytestRun
 from guardedpy.llm import ScriptedLLM
@@ -574,6 +574,154 @@ def test_once_approval_is_consumed_without_creating_a_persistent_rule(
     assert replayed is False
     assert task.status is TaskStatus.RUNNING
     assert CommandRuleStore(tmp_path).list_rules() == []
+
+
+@pytest.mark.parametrize("approval_decision", ("once", "always"))
+def test_branch_change_before_decision_keeps_push_pending_and_unexecuted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approval_decision: ApprovalDecision,
+) -> None:
+    """Catches a stale branch-bound approval being consumed or dispatched."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    branch = "main"
+    action = _action(
+        kind="run_command",
+        summary="push current branch",
+        args=["git", "push", "origin", "main"],
+    )
+    executions: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        TaskOrchestrator,
+        "_run_command",
+        lambda _self, command: executions.append(command.args)
+        or ToolResult(True, "simulated command", {}),
+    )
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(
+        tmp_path,
+        ScriptedLLM([action]),
+        current_branch_provider=lambda: branch,
+    )
+
+    waiting = orchestrator.run(task)
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+    branch = "feature"
+    accepted = orchestrator.resolve_approval(
+        task.id,
+        action_hash or "",
+        decision=approval_decision,
+    )
+
+    assert accepted is False
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    assert executions == []
+
+
+def test_approval_registration_uses_the_original_single_fresh_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches policy and orchestrator registering different live-branch decisions."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    branch = "main"
+    reads: list[str] = []
+
+    def current_branch() -> str:
+        nonlocal branch
+        value = branch
+        reads.append(value)
+        if len(reads) == 1:
+            branch = "feature"
+        return value
+
+    action = _action(
+        kind="run_command",
+        summary="push current branch",
+        args=["git", "push", "origin", "main"],
+    )
+    executions: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        TaskOrchestrator,
+        "_run_command",
+        lambda _self, command: executions.append(command.args)
+        or ToolResult(True, "simulated command", {}),
+    )
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(
+        tmp_path,
+        ScriptedLLM([action]),
+        current_branch_provider=current_branch,
+    )
+
+    waiting = orchestrator.run(task)
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+    stale = orchestrator.resolve_approval(
+        task.id,
+        action_hash or "",
+        decision="once",
+    )
+    branch = "main"
+    retried = orchestrator.resolve_approval(
+        task.id,
+        action_hash or "",
+        decision="once",
+    )
+
+    assert waiting.status is TaskStatus.RUNNING
+    assert stale is False
+    assert retried is True
+    assert executions == [("git", "push", "origin", "main")]
+
+
+@pytest.mark.parametrize("approval_decision", ("once", "always"))
+def test_branch_is_revalidated_immediately_before_approved_push_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approval_decision: ApprovalDecision,
+) -> None:
+    """Catches a branch change between approval validation and tool dispatch."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    branch_reads = 0
+
+    def current_branch() -> str:
+        nonlocal branch_reads
+        branch_reads += 1
+        return "feature" if branch_reads >= 3 else "main"
+
+    action = _action(
+        kind="run_command",
+        summary="push current branch",
+        args=["git", "push", "origin", "main"],
+    )
+    executions: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        TaskOrchestrator,
+        "_run_command",
+        lambda _self, command: executions.append(command.args)
+        or ToolResult(True, "simulated command", {}),
+    )
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(
+        tmp_path,
+        ScriptedLLM([action]),
+        current_branch_provider=current_branch,
+    )
+
+    waiting = orchestrator.run(task)
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+    accepted = orchestrator.resolve_approval(
+        task.id,
+        action_hash or "",
+        decision=approval_decision,
+    )
+
+    assert accepted is False
+    assert task.status is TaskStatus.BLOCKED
+    assert executions == []
+    assert CommandRuleStore(tmp_path).list_rules() == []
+    events = EventStore(tmp_path).events_for(task.id)
+    assert not any(event.approval_granted is True for event in events)
+    assert events[-1].approval_granted is False
 
 
 @pytest.mark.parametrize(
