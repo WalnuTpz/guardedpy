@@ -476,12 +476,24 @@ def _system_keyring() -> KeyringBackend:
     return keyring.get_keyring()
 
 
-def _deepseek_transport(api_key: str) -> Any:
-    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+def _deepseek_transport(
+    api_key: str,
+    *,
+    timeout_seconds: int,
+    openai_factory: Callable[..., Any] | None = None,
+) -> Any:
+    factory = OpenAI if openai_factory is None else openai_factory
+    return factory(
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        timeout=timeout_seconds,
+        max_retries=0,
+    )
 
 
 def local_services(
-    *, transport_factory: Callable[[str], Any] = _deepseek_transport
+    *,
+    transport_factory: Callable[[str], Any] | None = None,
 ) -> WebServices:
     """Compose real local dependencies without asking keyring for a key at startup."""
     credentials = CredentialService(_system_keyring())
@@ -489,7 +501,13 @@ def local_services(
     def orchestrator_factory(
         project_root: Path, config: HarnessConfig, memory_store: MemoryStore
     ) -> TaskOrchestrator:
-        llm = DeepSeekClient(credentials.get_key, config.model, transport_factory)
+        configured_transport_factory = transport_factory
+        if configured_transport_factory is None:
+            configured_transport_factory = lambda api_key: _deepseek_transport(
+                api_key,
+                timeout_seconds=config.timeout_seconds,
+            )
+        llm = DeepSeekClient(credentials.get_key, config.model, configured_transport_factory)
         return TaskOrchestrator(project_root, llm, memory_store=memory_store)
 
     return WebServices(credentials=credentials, orchestrator_factory=orchestrator_factory)

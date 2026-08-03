@@ -36,11 +36,11 @@ Demo mode is a distinct FastAPI factory with three fixed, offline mock-LLM scena
 
 ## Keyring lifecycle
 
-The local setup form writes its submitted key directly to the operating-system keyring; the credentials page reports only configured/not-configured status and never displays the key. `CredentialService` implements deterministic set and clear operations, but this WebUI revision has no user-facing update or clear control. Replace an existing key by completing setup again; use your platform's keyring tooling to remove it. A missing or unavailable keyring is reported as an error—there is no plaintext fallback.
+The local setup form writes its submitted key directly to the operating-system keyring; the credentials page reports only configured/not-configured status and never displays the key. That page provides hidden update and explicit clear controls. A missing or unavailable keyring is reported as the same generic local error for status, update, and clear operations—there is no plaintext fallback.
 
 ## Safety boundaries
 
-The harness treats LLM output and repository text as untrusted. Deterministic policy code enforces repository boundaries, read-before-patch, TDD state transitions, restricted pytest execution, dangerous-action denial, and exact one-time approvals. It is not an OS sandbox: a user-selected repository and its tests remain trusted inputs, and malicious pytest code is out of scope.
+The harness treats LLM output and repository text as untrusted. Deterministic policy code enforces repository boundaries, read-before-patch, TDD state transitions, restricted pytest execution, dangerous-action denial, exact one-time approvals, and narrow project-scoped command rules. It is not an OS sandbox: a user-selected repository and its tests remain trusted inputs, and malicious pytest code is out of scope.
 
 ## Tests and build
 
@@ -53,6 +53,26 @@ make build
 ```
 
 `make test` runs the offline pytest suite. `make demo` executes the three literal demo scenarios and exits nonzero if their statuses differ from the expected deterministic result. `make build` runs `python -m build --no-isolation` to create a wheel and sdist in `dist/`.
+
+## Directory structure
+
+```text
+.
+├── src/guardedpy/          # self-owned loop, governance, tools, provider adapter, and WebUI
+│   ├── templates/          # server-rendered local and demo pages
+│   └── static/             # handwritten CSS and polling JavaScript
+├── tests/                  # offline unit, integration, UI, demo, and packaging contracts
+├── docs/                   # course requirements plus Superpowers plans, specs, and reviews
+├── Makefile                # one-command tests, mechanism demo, and package build
+├── pyproject.toml          # package metadata, runtime dependencies, and console entry point
+├── render.yaml             # public fixed-scenario demo blueprint only
+├── .github/workflows/ci.yml
+└── .gitlab-ci.yml
+```
+
+## Repository and PR evidence
+
+The configured GitHub origin, verified locally with `git remote get-url origin`, is `git@github.com:WalnuTpz/guardedpy.git`. There is currently no PR URL because creating or pushing a real pull request has not been authorized for this remediation work. A PR link belongs here only after an authorized PR actually exists; this README does not substitute a branch name or invented URL for that evidence.
 
 ## Render demo wake-up
 
@@ -70,6 +90,6 @@ The local templates and CSS follow the selected [Open Design Agentic direction](
 
 - Local mode supports one active task and Python 3.11+ projects that use pytest; it is not a multi-user, remote, or multi-project runner.
 - The public demo is evidence of fixed mechanisms, not a hosted version of the local coding harness.
-- Local mode needs a functioning OS keyring. The current WebUI lacks a visible credential update/clear control, as noted above.
+- Local mode needs a functioning OS keyring; an unavailable backend does not fall back to plaintext credentials.
 - The Render blueprint is deployment preparation only: it has not been deployed, and no public URL is available yet.
 - Neither a remote CI execution nor a Render deployment has been run from this task.
