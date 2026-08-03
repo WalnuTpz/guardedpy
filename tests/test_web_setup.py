@@ -126,6 +126,19 @@ def _app(credentials: FakeCredentials, orchestrator: FakeOrchestrator) -> Any:
     )
 
 
+def test_ui_credential_protocol_exposes_only_nonsecret_operations() -> None:
+    """Catches the local WebUI dependency contract regaining a secret-read operation."""
+    web = _web_module()
+
+    public_operations = {
+        name
+        for name, value in vars(web.CredentialPort).items()
+        if not name.startswith("_") and callable(value)
+    }
+
+    assert public_operations == {"status", "set_key", "clear_key"}
+
+
 def test_setup_saves_a_nonsecret_validated_snapshot_without_echoing_the_key(tmp_path: Path) -> None:
     """Catches setup persisting or rendering an API key instead of sending it straight to keyring."""
     root = _project_root(tmp_path)
