@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
+import sys
 from threading import Thread
 from typing import Any, Callable, Protocol
 from uuid import UUID
@@ -21,6 +22,7 @@ import yaml
 
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialService, CredentialStatus, KeyringBackend
+from guardedpy.demo import create_demo_app
 from guardedpy.domain import PolicyVerdict, TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.llm import DeepSeekClient
@@ -362,5 +364,8 @@ def local_services(
 
 
 def serve() -> None:
-    """Run the local-only control surface; public demo uses a separate factory."""
+    """Run local controls by default or the separately composed public demo."""
+    if sys.argv[1:] == ["demo"]:
+        uvicorn.run(create_demo_app(), host="127.0.0.1")
+        return
     uvicorn.run(create_app("local", local_services()), host="127.0.0.1")
