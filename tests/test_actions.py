@@ -34,7 +34,7 @@ from guardedpy.domain import TddPhase
     ],
 )
 def test_parse_action_returns_the_matching_known_action(payload: str, action_type: type) -> None:
-    """Catches a parser branch that cannot construct one of the eight supported actions."""
+    """Catches a parser branch that cannot construct one of the nine supported actions."""
     assert isinstance(parse_action(payload), action_type)
 
 

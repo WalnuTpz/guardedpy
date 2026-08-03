@@ -122,32 +122,30 @@ def test_feature_task_records_red_only_after_a_test_patch(
 ) -> None:
     """Catches a transition that accepts an unrelated failing test as feature TDD evidence."""
     target_run = RunPytestAction(
-        kind="run_pytest", summary="run new test", targets=("tests/test_example.py",)
+        kind="run_pytest", summary="run new test", targets=("tests/test_created.py",)
     )
     first = policy.record_pytest(
         feature_task,
         target_run,
-        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_example.py",), "assertion failed"),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_created.py",), "assertion failed"),
     )
 
-    policy.record_read(
-        feature_task, ReadFileAction(kind="read_file", summary="read test", path="tests/test_example.py")
-    )
     proposed = policy.decide(
-        feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=TEST_DIFF)
+        feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
     )
     second = policy.record_pytest(
         feature_task,
         target_run,
-        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_example.py",), "assertion failed"),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_created.py",), "assertion failed"),
     )
     recorded = policy.record_patch(
-        feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=TEST_DIFF)
+        feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
     )
+    policy.record_new_test_path(feature_task, "tests/test_created.py")
     third = policy.record_pytest(
         feature_task,
         target_run,
-        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_example.py",), "assertion failed"),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_created.py",), "assertion failed"),
     )
 
     assert (first.verdict, first.rule_id) == (PolicyVerdict.DENY, "tdd.test_change_required")
@@ -156,6 +154,45 @@ def test_feature_task_records_red_only_after_a_test_patch(
     assert recorded.verdict is PolicyVerdict.ALLOW
     assert third.verdict is PolicyVerdict.ALLOW
     assert feature_task.tdd_phase is TddPhase.RED_OBSERVED
+
+
+def test_feature_red_requires_registered_created_test_target_and_feedback(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches an unrelated assertion failure unlocking a new source file."""
+    created_test = ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
+    source = ApplyPatchAction(kind="apply_patch", summary="add source", diff=NEW_SOURCE_DIFF)
+    policy.record_patch(feature_task, created_test)
+    policy.record_new_test_path(feature_task, "tests/test_created.py")
+
+    unrelated = policy.record_pytest(
+        feature_task,
+        RunPytestAction(kind="run_pytest", summary="run unrelated", targets=("tests/test_existing.py",)),
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_existing.py::test_existing",),
+            "assert False",
+        ),
+    )
+
+    assert (unrelated.verdict, unrelated.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.created_test_required",
+    )
+    assert policy.decide(feature_task, source).rule_id == "tdd.red_required"
+
+    matching = policy.record_pytest(
+        feature_task,
+        RunPytestAction(kind="run_pytest", summary="run created", targets=("tests/test_created.py",)),
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_created.py::test_created",),
+            "assert False",
+        ),
+    )
+
+    assert matching.verdict is PolicyVerdict.ALLOW
+    assert policy.decide(feature_task, source).verdict is PolicyVerdict.ALLOW
 
 
 def test_bugfix_only_selected_assertion_failure_records_red(

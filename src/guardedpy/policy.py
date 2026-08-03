@@ -114,6 +114,15 @@ class PolicyEngine:
                     "tdd.test_change_required",
                     "a feature task must change a test before observing red",
                 )
+            if task.mode is TaskMode.FEATURE and not self._feature_red_matches_created_test(
+                task, action, feedback
+            ):
+                return self._deny(
+                    task,
+                    None,
+                    "tdd.created_test_required",
+                    "a feature red result must target its successfully created test",
+                )
             if task.mode is TaskMode.BUGFIX and (
                 task.bugfix_target is None or feedback.node_ids != (task.bugfix_target,)
             ):
@@ -227,6 +236,18 @@ class PolicyEngine:
             return self._allow(task, action, "patch.test_allowed", "test patch is allowed before red")
         return self._allow(task, action, "patch.source_allowed", "source patch follows observed red")
 
+    def created_test_paths(self, task: TaskState, action: ApplyPatchAction) -> tuple[str, ...]:
+        """Return policy-normalized test paths created by an already allowed patch."""
+        operations, error_rule = self._patch_operations(action.diff)
+        assert error_rule is None
+        normalized_paths = self._normalized_paths(tuple(path for path, _created in operations))
+        assert normalized_paths is not None
+        return tuple(
+            normalized_path
+            for (_path, created), normalized_path in zip(operations, normalized_paths, strict=True)
+            if created and self._path_category(task, normalized_path) == "test"
+        )
+
     def _delete_decision(self, task: TaskState, action: DeletePathAction) -> PolicyDecision:
         normalized_path = self._normalized_project_path(action.path)
         if normalized_path is None:
@@ -304,6 +325,22 @@ class PolicyEngine:
             if self._path_category(task, normalized_path) != "test":
                 return self._deny(task, action, "pytest.target_not_test", "pytest target must be in a test directory")
         return self._allow(task, action, "pytest.allowed", "restricted pytest is allowed")
+
+    def _feature_red_matches_created_test(
+        self, task: TaskState, action: RunPytestAction, feedback: PytestFeedback
+    ) -> bool:
+        created_paths = self._new_test_paths.get(task.id, set())
+        target_paths = tuple(
+            self._normalized_project_path(target.split("::", maxsplit=1)[0])
+            for target in action.targets
+        )
+        node_paths = tuple(
+            self._normalized_project_path(node_id.split("::", maxsplit=1)[0])
+            for node_id in feedback.node_ids
+        )
+        return bool(target_paths and node_paths) and all(
+            path in created_paths for path in (*target_paths, *node_paths)
+        )
 
     def _path_category(self, task: TaskState, path: str) -> str:
         normalized_path = self._normalized_project_path(path)

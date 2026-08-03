@@ -13,10 +13,11 @@ import guardedpy.orchestrator as orchestrator_module
 from guardedpy.config import HarnessConfig
 from guardedpy.domain import TaskMode, TaskState, TaskStatus, TddPhase
 from guardedpy.events import EventStore, RunEvent, StopReason
+from guardedpy.feedback import PytestRun
 from guardedpy.llm import ScriptedLLM
 from guardedpy.memory import MemoryStore
 from guardedpy.orchestrator import TaskOrchestrator
-from guardedpy.workspace import Workspace
+from guardedpy.workspace import ToolResult, Workspace
 
 
 def _config() -> HarnessConfig:
@@ -38,6 +39,10 @@ def _bugfix_task() -> TaskState:
         bugfix_target="tests/test_value.py::test_value_is_fixed",
         config=_config(),
     )
+
+
+def _feature_task() -> TaskState:
+    return TaskState(description="Add a created module", mode=TaskMode.FEATURE, config=_config())
 
 
 def test_submit_registers_a_pending_task_before_its_background_run(
@@ -120,16 +125,128 @@ def test_terminal_memory_proposal_enters_queue_but_not_persistent_search(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     task = _bugfix_task()
     memory_store = MemoryStore(tmp_path)
-    proposal = _action(
-        kind="propose_memory", summary="save parser note", text="Use parser fixtures"
-    )
+    sentinel = "SENTINEL-PRIVATE-PROPOSAL"
+    proposal = _action(kind="propose_memory", summary="save parser note", text=sentinel)
     finish = _action(kind="finish", summary="stop", status="blocked")
+    llm = ScriptedLLM([proposal, finish])
 
-    result = TaskOrchestrator(tmp_path, ScriptedLLM([proposal, finish]), memory_store=memory_store).run(task)
+    result = TaskOrchestrator(tmp_path, llm, memory_store=memory_store).run(task)
 
     assert result.status is TaskStatus.BLOCKED
-    assert [entry.text for entry in memory_store.proposals()] == ["Use parser fixtures"]
+    assert [entry.text for entry in memory_store.proposals()] == [sentinel]
     assert MemoryStore(tmp_path).search("parser") == []
+    assert sentinel not in llm.contexts[1]
+    assert sentinel not in repr(EventStore(tmp_path).events_for(task.id))
+
+
+def test_orchestrator_records_a_normalized_created_test_before_source_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a raw `src/../tests` creation being lost after the workspace write."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    create_test = """--- /dev/null
++++ b/src/../tests/test_created.py
+@@ -0,0 +1,2 @@
++def test_created() -> None:
++    assert False
+"""
+    create_source = """--- /dev/null
++++ b/src/created.py
+@@ -0,0 +1 @@
++VALUE = 'created'
+"""
+    llm = ScriptedLLM(
+        [
+            _action(kind="apply_patch", summary="create test", diff=create_test),
+            _action(kind="run_pytest", summary="observe red", targets=["tests/test_created.py"]),
+            _action(kind="apply_patch", summary="create source", diff=create_source),
+            _action(kind="finish", summary="stop", status="blocked"),
+        ]
+    )
+
+    stopped = TaskOrchestrator(tmp_path, llm).run(_feature_task())
+
+    assert stopped.status is TaskStatus.BLOCKED
+    assert (tmp_path / "src" / "created.py").read_text() == "VALUE = 'created'\n"
+
+
+def test_source_spelled_through_tests_parent_does_not_register_as_a_test_or_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches raw `tests/../src` being registered as a test after it is written."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    create_test = """--- /dev/null
++++ b/tests/test_created.py
+@@ -0,0 +1,2 @@
++def test_created() -> None:
++    assert False
+"""
+    create_source = """--- /dev/null
++++ b/tests/../src/created.py
+@@ -0,0 +1 @@
++VALUE = 'created'
+"""
+    task = _feature_task()
+    llm = ScriptedLLM(
+        [
+            _action(kind="apply_patch", summary="create test", diff=create_test),
+            _action(kind="run_pytest", summary="observe red", targets=["tests/test_created.py"]),
+            _action(kind="apply_patch", summary="create source", diff=create_source),
+            _action(kind="finish", summary="stop", status="blocked"),
+        ]
+    )
+
+    stopped = TaskOrchestrator(tmp_path, llm).run(task)
+
+    assert stopped.status is TaskStatus.BLOCKED
+    assert (tmp_path / "src" / "created.py").read_text() == "VALUE = 'created'\n"
+    assert EventStore(tmp_path).events_for(task.id)[-1].stop_reason is StopReason.BLOCKED
+
+
+def test_failed_workspace_test_creation_does_not_register_a_feature_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a failed atomic create supplying feature red evidence anyway."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "tests").mkdir()
+    create_test = """--- /dev/null
++++ b/tests/test_created.py
+@@ -0,0 +1,2 @@
++def test_created() -> None:
++    assert False
+"""
+
+    monkeypatch.setattr(
+        Workspace,
+        "apply_patch",
+        lambda *_args: ToolResult(False, "Patch rejected", {"reason": "invalid_patch"}),
+    )
+    monkeypatch.setattr(
+        Workspace,
+        "run_pytest",
+        lambda *_args: PytestRun(
+            1,
+            "FAILED tests/test_created.py::test_created - assert False\nE   assert False\n",
+            "",
+            False,
+        ),
+    )
+    llm = ScriptedLLM(
+        [
+            _action(kind="apply_patch", summary="create test", diff=create_test),
+            _action(kind="run_pytest", summary="observe red", targets=["tests/test_created.py"]),
+            _action(kind="finish", summary="stop", status="blocked"),
+        ]
+    )
+
+    TaskOrchestrator(tmp_path, llm).run(_feature_task())
+
+    assert not (tmp_path / "tests" / "test_created.py").exists()
+    assert '"tdd_phase": "test_design"' in llm.contexts[2]
 
 
 def test_invalid_model_json_stops_without_executing_a_workspace_tool(

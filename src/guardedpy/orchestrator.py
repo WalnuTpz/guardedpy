@@ -292,10 +292,11 @@ class TaskOrchestrator:
             self._record_tool_result(task, action, decision, result, round_number)
             return
         if isinstance(action, ApplyPatchAction):
+            created_test_paths = self._policy.created_test_paths(task, action)
             result = workspace.apply_patch(action.diff)
             if result.ok:
                 self._policy.record_patch(task, action)
-                for path in self._created_test_paths(task, action):
+                for path in created_test_paths:
                     self._policy.record_new_test_path(task, path)
             self._record_tool_result(task, action, decision, result, round_number)
             return
@@ -427,21 +428,6 @@ class TaskOrchestrator:
             sort_keys=True,
         )
         return sha256(canonical.encode()).hexdigest()
-
-    @staticmethod
-    def _created_test_paths(task: TaskState, action: ApplyPatchAction) -> tuple[str, ...]:
-        operations, error_rule = PolicyEngine._patch_operations(action.diff)
-        assert error_rule is None
-        return tuple(
-            path
-            for path, created in operations
-            if created
-            and any(
-                PurePosixPath(directory) in PurePosixPath(path).parents
-                or PurePosixPath(path) == PurePosixPath(directory)
-                for directory in task.config.test_dirs
-            )
-        )
 
     def _discard_pending(self, task_id: UUID) -> None:
         for key in tuple(self._pending):
