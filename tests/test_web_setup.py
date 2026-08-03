@@ -287,3 +287,23 @@ def test_local_services_defers_keyring_lookup_until_a_completion_call(
     assert calls == []
     orchestrator.run(TaskState(description="Stop", mode=TaskMode.BUGFIX, config=config))
     assert calls == ["get"]
+
+
+def test_serve_binds_uvicorn_to_loopback_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches a local-control server accidentally binding a network-reachable interface."""
+    web = _web_module()
+    services = object()
+    application = object()
+    received: dict[str, object] = {}
+
+    monkeypatch.setattr(web, "local_services", lambda: services)
+    monkeypatch.setattr(web, "create_app", lambda mode, injected: application)
+    monkeypatch.setattr(
+        web.uvicorn,
+        "run",
+        lambda app, *, host: received.update({"app": app, "host": host}),
+    )
+
+    web.serve()
+
+    assert received == {"app": application, "host": "127.0.0.1"}
