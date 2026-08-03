@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 from keyring.errors import NoKeyringError
 
@@ -44,8 +46,18 @@ def test_status_is_boolean_only_and_key_can_be_set_and_cleared() -> None:
     assert service.status().configured is False
 
 
-def test_unavailable_keyring_raises_clear_error_instead_of_plaintext_fallback() -> None:
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(lambda service: service.status(), id="status"),
+        pytest.param(lambda service: service.set_key("not-a-real-key"), id="set-key"),
+        pytest.param(lambda service: service.clear_key(), id="clear-key"),
+    ],
+)
+def test_unavailable_keyring_rejects_every_public_operation_without_plaintext_fallback(
+    operation: Callable[[CredentialService], object],
+) -> None:
     service = CredentialService(UnavailableKeyring())
 
     with pytest.raises(CredentialBackendUnavailableError, match="keyring backend is unavailable"):
-        service.status()
+        operation(service)
