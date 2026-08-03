@@ -167,6 +167,12 @@ class TaskOrchestrator:
 
         return self._stop(task, StopReason.ROUND_LIMIT, loop.next_round)
 
+    def submit(self, task: TaskState) -> TaskState:
+        """Register a pending task before a caller starts its background run."""
+        self._reject_second_active_task(task)
+        self._tasks[task.id] = task
+        return task
+
     def cancel(self, task_id: UUID) -> TaskState:
         """Cancel one known non-terminal task and discard its in-memory pending action."""
         task = self._tasks[task_id]

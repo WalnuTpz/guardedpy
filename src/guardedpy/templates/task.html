@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <p class="eyebrow">GOVERNED TASK</p>
+  <h1>Start a task</h1>
+  {% if error %}<p class="notice notice-error" role="alert">{{ error }}</p>{% endif %}
+  {% if task %}<p>Current task: <span class="badge {% if task.status in ['completed', 'cancelled'] %}badge-green{% elif task.status == 'blocked' %}badge-red{% else %}badge-amber{% endif %}">{{ task.status }}</span></p>{% endif %}
+  <form method="post" action="/tasks" class="form-grid">
+    <label>Task mode
+      <select name="mode"><option value="feature">Feature</option><option value="bugfix">Bugfix</option></select>
+    </label>
+    <label>Task description <textarea name="description" required></textarea></label>
+    <button type="submit">Submit governed task</button>
+  </form>
+  {% if task and task.status in ['pending', 'running', 'waiting_approval'] %}
+  <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="secondary" type="submit">Cancel current task</button></form>
+  {% endif %}
+</section>
+{% endblock %}
