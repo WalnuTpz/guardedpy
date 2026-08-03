@@ -7,6 +7,10 @@ from typing import Any, Callable, Protocol
 from guardedpy.context import LlmContext
 
 
+class TemporaryProviderFailure(RuntimeError):
+    """The provider remained temporarily unavailable after the bounded retry."""
+
+
 class LLMClient(Protocol):
     """Return exactly one untrusted action payload for one context."""
 
@@ -55,5 +59,5 @@ class DeepSeekClient:
                 return response.choices[0].message.content
             except (ConnectionError, TimeoutError):
                 if attempt == 1:
-                    return '{"kind":"finish","summary":"temporary provider failure","status":"blocked"}'
+                    raise TemporaryProviderFailure from None
         raise AssertionError("unreachable")

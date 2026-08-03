@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
+from guardedpy.config import HarnessConfig
 from guardedpy.context import LlmContext
+from guardedpy.domain import TaskMode, TaskState, TaskStatus
+from guardedpy.events import EventStore, StopReason
 from guardedpy.llm import DeepSeekClient
+from guardedpy.orchestrator import TaskOrchestrator
 
 
 @dataclass
@@ -85,3 +90,23 @@ def test_deepseek_client_retries_only_temporary_transport_failures() -> None:
     permanent = _Transport([ValueError("bad request")])
     with pytest.raises(ValueError, match="bad request"):
         DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: permanent).complete(LlmContext.minimal())
+
+
+def test_two_temporary_provider_failures_stop_with_their_own_audit_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches retry exhaustion being misrepresented as a model-selected finish action."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    transport = _Transport([ConnectionError("offline"), ConnectionError("offline")])
+    client = DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: transport)
+    task = TaskState(
+        description="Repair the selected failure",
+        mode=TaskMode.BUGFIX,
+        config=HarnessConfig(source_dirs=(Path("src"),), test_dirs=(Path("tests"),), pytest_command=("pytest",)),
+    )
+
+    stopped = TaskOrchestrator(tmp_path, client).run(task)
+
+    assert stopped.status is TaskStatus.BLOCKED
+    assert EventStore(tmp_path).events_for(task.id)[-1].stop_reason is StopReason.PROVIDER_TEMPORARY_FAILURE
+    assert "secret" not in repr(EventStore(tmp_path).events_for(task.id))
