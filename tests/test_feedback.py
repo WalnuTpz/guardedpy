@@ -17,7 +17,7 @@ def test_collector_extracts_assertion_failure_node_and_bounded_excerpt() -> None
     """Catches feedback that loses the failed test identity or returns all pytest output."""
     run = PytestRun(
         1,
-        "FAILED tests/test_a.py::test_x - assert 1 == 2\n" + "x" * 2_000,
+        "FAILED tests/test_a.py::test_x - assertion failed\nE       assert 1 == 2\n" + "x" * 2_000,
         "",
         False,
     )
@@ -36,6 +36,24 @@ def test_collector_treats_failed_runtime_with_node_as_execution_error() -> None:
     run = PytestRun(
         1,
         "FAILED tests/test_parser.py::test_bad_input - TypeError: parser() missing 1 required argument\n",
+        "",
+        False,
+    )
+
+    result = FeedbackCollector().collect(run)
+
+    assert result.kind is FeedbackKind.EXECUTION_ERROR
+    assert result.node_ids == ("tests/test_parser.py::test_bad_input",)
+
+
+def test_collector_does_not_treat_source_assert_in_a_runtime_traceback_as_assertion_evidence() -> None:
+    """Catches a source assertion line making a TypeError look like an assertion failure."""
+    run = PytestRun(
+        1,
+        "FAILED tests/test_parser.py::test_bad_input - TypeError: unsupported input\n"
+        "src/parser.py:8: in parse\n"
+        "    assert payload is not None\n"
+        "E   TypeError: unsupported input\n",
         "",
         False,
     )

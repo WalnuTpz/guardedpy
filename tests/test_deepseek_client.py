@@ -102,6 +102,7 @@ def test_two_temporary_provider_failures_stop_with_their_own_audit_reason(
     task = TaskState(
         description="Repair the selected failure",
         mode=TaskMode.BUGFIX,
+        bugfix_target="tests/test_value.py::test_value_is_fixed",
         config=HarnessConfig(source_dirs=(Path("src"),), test_dirs=(Path("tests"),), pytest_command=("pytest",)),
     )
 

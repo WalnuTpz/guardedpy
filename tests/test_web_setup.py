@@ -200,7 +200,16 @@ def test_task_creation_submits_before_starting_one_daemon_thread_and_rejects_a_s
     assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
 
     created = asyncio.run(
-        _request(app, "POST", "/tasks", data={"mode": "bugfix", "description": "Repair a test"})
+        _request(
+            app,
+            "POST",
+            "/tasks",
+            data={
+                "mode": "bugfix",
+                "description": "Repair a test",
+                "bugfix_target": "tests/test_value.py::test_value_is_fixed",
+            },
+        )
     )
     duplicate = asyncio.run(
         _request(app, "POST", "/tasks", data={"mode": "feature", "description": "Add another"})
@@ -209,6 +218,7 @@ def test_task_creation_submits_before_starting_one_daemon_thread_and_rejects_a_s
     assert created.status_code == 303
     assert created.headers["location"] == "/tasks/new"
     assert [task.mode for task in orchestrator.submitted] == [TaskMode.BUGFIX]
+    assert orchestrator.submitted[0].bugfix_target == "tests/test_value.py::test_value_is_fixed"
     assert timeline == ["submit", "thread"]
     assert len(CapturingThread.instances) == 1
     assert CapturingThread.instances[0].daemon is True
@@ -245,6 +255,39 @@ def test_blank_task_description_is_rejected_and_cancellation_delegates(tmp_path:
     assert cancelled.status_code == 303
     assert cancelled.headers["location"] == "/tasks/new"
     assert orchestrator.cancelled == [task_id]
+
+
+def test_bugfix_form_requires_and_submits_a_selected_target_while_feature_remains_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a UI that admits targetless bugfixes or forces a target on feature tasks."""
+    root = _project_root(tmp_path)
+    orchestrator = FakeOrchestrator([])
+    app = _app(FakeCredentials(), orchestrator)
+    web = _web_module()
+
+    class DormantThread:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(web, "Thread", DormantThread)
+    asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root)))
+
+    page = asyncio.run(_request(app, "GET", "/tasks/new"))
+    missing_target = asyncio.run(
+        _request(app, "POST", "/tasks", data={"mode": "bugfix", "description": "Repair parser"})
+    )
+    feature = asyncio.run(
+        _request(app, "POST", "/tasks", data={"mode": "feature", "description": "Add parser docs"})
+    )
+
+    assert 'name="bugfix_target"' in page.text
+    assert missing_target.status_code == 422
+    assert feature.status_code == 303
+    assert orchestrator.submitted[0].bugfix_target is None
 
 
 def test_local_factory_rejects_demo_mode() -> None:
@@ -286,7 +329,14 @@ def test_local_services_defers_keyring_lookup_until_a_completion_call(
     orchestrator = services.orchestrator_factory(tmp_path, config, web.MemoryStore(tmp_path))
 
     assert calls == []
-    orchestrator.run(TaskState(description="Stop", mode=TaskMode.BUGFIX, config=config))
+    orchestrator.run(
+        TaskState(
+            description="Stop",
+            mode=TaskMode.BUGFIX,
+            bugfix_target="tests/test_value.py::test_value_is_fixed",
+            config=config,
+        )
+    )
     assert calls == ["get"]
 
 

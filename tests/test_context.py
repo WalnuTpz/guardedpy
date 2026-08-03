@@ -14,6 +14,7 @@ def _task() -> TaskState:
     return TaskState(
         description="Repair the parser",
         mode=TaskMode.BUGFIX,
+        bugfix_target="tests/test_parser.py::test_bad_input",
         config=HarnessConfig(
             source_dirs=(Path("src"),),
             test_dirs=(Path("tests"),),

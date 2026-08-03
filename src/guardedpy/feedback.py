@@ -15,7 +15,7 @@ _COLLECTION_NODE = re.compile(r"^ERROR collecting (?P<node>\S+)(?:\s|$)", re.MUL
 _USEFUL_OUTPUT = re.compile(
     r"^(FAILED |ERROR collecting |INTERNALERROR|E\s{7}|.*(?:AssertionError|assert ).*)"
 )
-_ASSERTION_EVIDENCE = re.compile(r"\b(?:AssertionError|assert)\b")
+_ASSERTION_EVIDENCE = re.compile(r"^E\s+(?:AssertionError\b|assert\b)", re.MULTILINE)
 
 
 @dataclass(frozen=True)

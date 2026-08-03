@@ -102,7 +102,16 @@ def _waiting_app(
     app = web.create_app("local", web.WebServices(FakeCredentials(), factory))
     assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
     created = asyncio.run(
-        _request(app, "POST", "/tasks", data={"mode": "bugfix", "description": "Remove obsolete file"})
+        _request(
+            app,
+            "POST",
+            "/tasks",
+            data={
+                "mode": "bugfix",
+                "description": "Remove obsolete file",
+                "bugfix_target": "tests/test_value.py::test_value_is_fixed",
+            },
+        )
     )
     assert created.status_code == 303
     assert app.state.local.task is not None

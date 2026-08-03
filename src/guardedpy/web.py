@@ -168,16 +168,24 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             return render_setup(request, error="Setup could not be saved.", status_code=422)
         form = await request.form()
         description = str(form.get("description", "")).strip()
+        bugfix_target = str(form.get("bugfix_target", "")).strip()
         try:
             task_mode = TaskMode(str(form.get("mode", "")))
         except ValueError:
             return render_task(request, error="Task could not be started.", status_code=422)
         if not description:
             return render_task(request, error="Task could not be started.", status_code=422)
+        if task_mode is TaskMode.BUGFIX and not bugfix_target:
+            return render_task(request, error="Task could not be started.", status_code=422)
         if state.task is not None and state.task.status in _ACTIVE_STATUSES:
             return render_task(request, error="Another task is active.", status_code=409)
 
-        task = TaskState(description=description, mode=task_mode, config=state.config)
+        task = TaskState(
+            description=description,
+            mode=task_mode,
+            bugfix_target=bugfix_target if task_mode is TaskMode.BUGFIX else None,
+            config=state.config,
+        )
         orchestrator = services.orchestrator_factory(state.project_root, state.config, state.memory_store)
         try:
             orchestrator.submit(task)

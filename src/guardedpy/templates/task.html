@@ -10,6 +10,7 @@
       <select name="mode"><option value="feature">Feature</option><option value="bugfix">Bugfix</option></select>
     </label>
     <label>Task description <textarea name="description" required></textarea></label>
+    <label>Bugfix target <input name="bugfix_target" placeholder="tests/test_file.py::test_name"></label>
     <button type="submit">Submit governed task</button>
   </form>
   {% if task and task.status in ['pending', 'running', 'waiting_approval'] %}

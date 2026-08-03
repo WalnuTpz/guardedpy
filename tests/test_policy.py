@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from guardedpy.actions import (
     ApplyPatchAction,
@@ -10,8 +11,9 @@ from guardedpy.actions import (
     RunCommandAction,
     RunPytestAction,
 )
+from guardedpy.config import HarnessConfig
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TddPhase
-from guardedpy.feedback import PytestFeedback
+from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
 from guardedpy.policy import PolicyEngine
 
 
@@ -114,6 +116,83 @@ def test_bugfix_only_selected_assertion_failure_records_red(
 
     assert decision.rule_id == "tdd.bugfix_target_assertion_required"
     assert feature_task.tdd_phase is TddPhase.TEST_DESIGN
+
+
+def test_bugfix_requires_a_nonblank_target_at_creation(tmp_path: Path) -> None:
+    """Catches a bugfix task being admitted without a user-selected pytest node."""
+    with pytest.raises(ValidationError, match="bugfix target"):
+        TaskState(
+            description="Repair a test",
+            mode=TaskMode.BUGFIX,
+            bugfix_target="  ",
+            config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+        )
+
+
+def test_bugfix_red_requires_exactly_the_selected_assertion_node(
+    policy: PolicyEngine, tmp_path: Path
+) -> None:
+    """Catches a selected bugfix target being bypassed by an unrelated assertion failure."""
+    config = HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",))
+    selected = "tests/test_parser.py::test_bad_input"
+    action = RunPytestAction(kind="run_pytest", summary="run regression", targets=(selected,))
+    target_task = TaskState(
+        description="Repair parser", mode=TaskMode.BUGFIX, bugfix_target=selected, config=config
+    )
+    unrelated_task = TaskState(
+        description="Repair parser", mode=TaskMode.BUGFIX, bugfix_target=selected, config=config
+    )
+    selected_decision = policy.record_pytest(
+        target_task,
+        action,
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert input == expected"),
+    )
+    unrelated_decision = policy.record_pytest(
+        unrelated_task,
+        action,
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_parser.py::test_other_input",),
+            "assert input == expected",
+        ),
+    )
+
+    assert selected_decision.rule_id == "tdd.red_recorded"
+    assert target_task.tdd_phase is TddPhase.RED_OBSERVED
+    assert unrelated_decision.rule_id == "tdd.bugfix_target_assertion_required"
+    assert unrelated_task.tdd_phase is TddPhase.TEST_DESIGN
+
+
+def test_bugfix_policy_refuses_runtime_feedback_with_a_source_assert_line(
+    policy: PolicyEngine
+) -> None:
+    """Catches a source assertion in a TypeError traceback advancing the bugfix red gate."""
+    target = "tests/test_parser.py::test_bad_input"
+    task = TaskState(
+        description="Repair parser",
+        mode=TaskMode.BUGFIX,
+        bugfix_target=target,
+        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+    )
+    feedback = FeedbackCollector().collect(
+        PytestRun(
+            1,
+            "FAILED tests/test_parser.py::test_bad_input - TypeError: unsupported input\n"
+            "    assert payload is not None\n"
+            "E   TypeError: unsupported input\n",
+            "",
+            False,
+        )
+    )
+    decision = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="run regression", targets=(target,)),
+        feedback,
+    )
+
+    assert feedback.kind is FeedbackKind.EXECUTION_ERROR
+    assert decision.rule_id == "tdd.bugfix_target_assertion_required"
+    assert task.tdd_phase is TddPhase.TEST_DESIGN
 
 
 def test_source_patch_requires_a_current_read_after_red(

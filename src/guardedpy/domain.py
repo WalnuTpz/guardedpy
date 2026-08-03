@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from guardedpy.config import HarnessConfig
 
@@ -67,3 +67,10 @@ class TaskState(BaseModel):
     status: TaskStatus = TaskStatus.PENDING
     tdd_phase: TddPhase = TddPhase.TEST_DESIGN
     bugfix_target: str | None = None
+
+    @model_validator(mode="after")
+    def require_bugfix_target(self) -> "TaskState":
+        """Require one explicit pytest node before admitting a bugfix task."""
+        if self.mode is TaskMode.BUGFIX and not (self.bugfix_target and self.bugfix_target.strip()):
+            raise ValueError("bugfix target must be a nonblank pytest node")
+        return self

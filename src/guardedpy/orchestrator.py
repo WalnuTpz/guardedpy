@@ -7,6 +7,7 @@ from hashlib import sha256
 import json
 from pathlib import Path, PurePosixPath
 import subprocess
+from threading import RLock
 from typing import Any
 from uuid import UUID
 
@@ -65,27 +66,29 @@ class TaskOrchestrator:
         self._loop_by_task: dict[UUID, _LoopState] = {}
         self._pending: dict[tuple[UUID, str], tuple[Action, PolicyDecision, int]] = {}
         self._cancelled_task_ids: set[UUID] = set()
+        self._state_lock = RLock()
         self._events = EventStore(self._project_root)
         self._events.mark_unfinished_interrupted()
         self._feedback_collector = FeedbackCollector()
 
     def run(self, task: TaskState) -> TaskState:
         """Advance a task until it reaches a terminal, approval, or bounded stop state."""
-        self._reject_second_active_task(task)
-        self._tasks[task.id] = task
-        if task.status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.BLOCKED,
-            TaskStatus.CANCELLED,
-            TaskStatus.INTERRUPTED,
-        }:
-            return task
-        if task.status is TaskStatus.WAITING_APPROVAL:
-            return task
-        self._workspace_by_task.setdefault(task.id, Workspace(self._project_root, task.config))
-        if task.status is not TaskStatus.RUNNING:
-            task.status = TaskStatus.RUNNING
-            self._events.append(RunEvent(task_id=task.id, task_status=task.status))
+        with self._state_lock:
+            self._reject_second_active_task(task)
+            self._tasks[task.id] = task
+            if task.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.BLOCKED,
+                TaskStatus.CANCELLED,
+                TaskStatus.INTERRUPTED,
+            }:
+                return task
+            if task.status is TaskStatus.WAITING_APPROVAL:
+                return task
+            self._workspace_by_task.setdefault(task.id, Workspace(self._project_root, task.config))
+            if task.status is not TaskStatus.RUNNING:
+                task.status = TaskStatus.RUNNING
+                self._events.append(RunEvent(task_id=task.id, task_status=task.status))
         loop = self._loop_by_task.setdefault(task.id, _LoopState())
 
         while loop.next_round < self._max_rounds:
@@ -112,21 +115,26 @@ class TaskOrchestrator:
                 action = parse_action(completion)
             except (ValidationError, ValueError, json.JSONDecodeError):
                 return self._stop(task, StopReason.INVALID_MODEL_OUTPUT, round_number)
+            if self._is_cancelled(task):
+                return task
             loop.next_round += 1
 
             action_hash = stable_hash(action)
             repeat_key = self._repeat_key(action)
             if repeat_key in loop.seen_actions:
-                self._events.append(
-                    RunEvent(
-                        task_id=task.id,
-                        task_status=TaskStatus.BLOCKED,
-                        action=action,
-                        retry_count=round_number,
-                        stop_reason=StopReason.REPEATED_ACTION,
+                with self._state_lock:
+                    if self._is_cancelled(task):
+                        return task
+                    self._events.append(
+                        RunEvent(
+                            task_id=task.id,
+                            task_status=TaskStatus.BLOCKED,
+                            action=action,
+                            retry_count=round_number,
+                            stop_reason=StopReason.REPEATED_ACTION,
+                        )
                     )
-                )
-                task.status = TaskStatus.BLOCKED
+                    task.status = TaskStatus.BLOCKED
                 return task
             loop.seen_actions.add(repeat_key)
 
@@ -140,23 +148,29 @@ class TaskOrchestrator:
                 }
                 continue
             if decision.verdict is PolicyVerdict.APPROVAL_REQUIRED:
-                self._policy.request_approval(task, action)
-                self._pending[(task.id, action_hash)] = (action, decision, round_number)
-                task.status = TaskStatus.WAITING_APPROVAL
-                self._events.append(
-                    RunEvent(
-                        task_id=task.id,
-                        task_status=task.status,
-                        action=action,
-                        policy_verdict=decision.verdict,
-                        retry_count=round_number,
+                with self._state_lock:
+                    if self._is_cancelled(task):
+                        return task
+                    self._policy.request_approval(task, action)
+                    self._pending[(task.id, action_hash)] = (action, decision, round_number)
+                    task.status = TaskStatus.WAITING_APPROVAL
+                    self._events.append(
+                        RunEvent(
+                            task_id=task.id,
+                            task_status=task.status,
+                            action=action,
+                            policy_verdict=decision.verdict,
+                            retry_count=round_number,
+                        )
                     )
-                )
                 return task
             if isinstance(action, FinishAction):
-                task.status = (
-                    TaskStatus.COMPLETED if action.status == "completed" else TaskStatus.BLOCKED
-                )
+                with self._state_lock:
+                    if self._is_cancelled(task):
+                        return task
+                    task.status = (
+                        TaskStatus.COMPLETED if action.status == "completed" else TaskStatus.BLOCKED
+                    )
                 return self._stop(
                     task,
                     StopReason.COMPLETED if task.status is TaskStatus.COMPLETED else StopReason.BLOCKED,
@@ -166,7 +180,10 @@ class TaskOrchestrator:
                 )
 
             try:
-                self._execute_allowed(task, action, decision, round_number)
+                with self._state_lock:
+                    if self._is_cancelled(task):
+                        return task
+                    self._execute_allowed(task, action, decision, round_number)
             except Exception:
                 return self._stop(
                     task,
@@ -182,77 +199,80 @@ class TaskOrchestrator:
 
     def submit(self, task: TaskState) -> TaskState:
         """Register a pending task before a caller starts its background run."""
-        self._reject_second_active_task(task)
-        self._tasks[task.id] = task
+        with self._state_lock:
+            self._reject_second_active_task(task)
+            self._tasks[task.id] = task
         return task
 
     def cancel(self, task_id: UUID) -> TaskState:
         """Cancel one known non-terminal task and discard its in-memory pending action."""
-        task = self._tasks[task_id]
-        if task.status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.BLOCKED,
-            TaskStatus.CANCELLED,
-            TaskStatus.INTERRUPTED,
-        }:
-            return task
-        self._cancelled_task_ids.add(task_id)
-        self._discard_pending(task_id)
-        task.status = TaskStatus.CANCELLED
-        self._events.append(
-            RunEvent(
-                task_id=task.id,
-                task_status=task.status,
-                stop_reason=StopReason.CANCELLED,
+        with self._state_lock:
+            task = self._tasks[task_id]
+            if task.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.BLOCKED,
+                TaskStatus.CANCELLED,
+                TaskStatus.INTERRUPTED,
+            }:
+                return task
+            self._cancelled_task_ids.add(task_id)
+            self._discard_pending(task_id)
+            task.status = TaskStatus.CANCELLED
+            self._events.append(
+                RunEvent(
+                    task_id=task.id,
+                    task_status=task.status,
+                    stop_reason=StopReason.CANCELLED,
+                )
             )
-        )
         return task
 
     def resolve_approval(self, task_id: UUID, action_hash: str, *, approved: bool) -> bool:
         """Consume exactly one in-memory approval and execute only its exact allowed action."""
-        key = (task_id, action_hash)
-        pending = self._pending.pop(key, None)
-        task = self._tasks.get(task_id)
-        if pending is None or task is None or task.status is not TaskStatus.WAITING_APPROVAL:
-            return False
-        action, decision, round_number = pending
-        approval = self._policy.apply_approval(decision, action, approved)
-        if approval.verdict is not PolicyVerdict.ALLOW:
-            task.status = TaskStatus.BLOCKED
+        with self._state_lock:
+            key = (task_id, action_hash)
+            pending = self._pending.pop(key, None)
+            task = self._tasks.get(task_id)
+            if pending is None or task is None or task.status is not TaskStatus.WAITING_APPROVAL:
+                return False
+            action, decision, round_number = pending
+            approval = self._policy.apply_approval(decision, action, approved)
+            if approval.verdict is not PolicyVerdict.ALLOW:
+                task.status = TaskStatus.BLOCKED
+                self._events.append(
+                    RunEvent(
+                        task_id=task.id,
+                        task_status=task.status,
+                        action=action,
+                        policy_verdict=approval.verdict,
+                        approval_granted=False,
+                        stop_reason=StopReason.BLOCKED,
+                    )
+                )
+                return False
+            if self._is_cancelled(task):
+                return False
+            task.status = TaskStatus.RUNNING
             self._events.append(
                 RunEvent(
                     task_id=task.id,
                     task_status=task.status,
                     action=action,
                     policy_verdict=approval.verdict,
-                    approval_granted=False,
-                    stop_reason=StopReason.BLOCKED,
+                    approval_granted=True,
                 )
             )
-            return False
-        if self._is_cancelled(task):
-            return False
-        task.status = TaskStatus.RUNNING
-        self._events.append(
-            RunEvent(
-                task_id=task.id,
-                task_status=task.status,
-                action=action,
-                policy_verdict=approval.verdict,
-                approval_granted=True,
-            )
-        )
-        try:
-            self._execute_allowed(task, action, approval, round_number)
-        except Exception:
-            self._stop(
-                task,
-                StopReason.UNRECOVERABLE_ERROR,
-                round_number,
-                action=action,
-                decision=approval,
-            )
-        return True
+            try:
+                self._execute_allowed(task, action, approval, round_number)
+            except Exception:
+                self._stop(
+                    task,
+                    StopReason.UNRECOVERABLE_ERROR,
+                    round_number,
+                    action=action,
+                    decision=approval,
+                )
+            return True
 
     def _execute_allowed(
         self, task: TaskState, action: Action, decision: PolicyDecision, round_number: int
@@ -349,25 +369,28 @@ class TaskOrchestrator:
         action: Action | None = None,
         decision: PolicyDecision | None = None,
     ) -> TaskState:
-        if reason in {
-            StopReason.INVALID_MODEL_OUTPUT,
-            StopReason.PROVIDER_TEMPORARY_FAILURE,
-            StopReason.UNRECOVERABLE_ERROR,
-            StopReason.ROUND_LIMIT,
-            StopReason.REPEATED_ACTION,
-            StopReason.BLOCKED,
-        }:
-            task.status = TaskStatus.BLOCKED
-        self._events.append(
-            RunEvent(
-                task_id=task.id,
-                task_status=task.status,
-                action=action,
-                policy_verdict=decision.verdict if decision else None,
-                retry_count=round_number,
-                stop_reason=reason,
+        with self._state_lock:
+            if self._is_cancelled(task):
+                return task
+            if reason in {
+                StopReason.INVALID_MODEL_OUTPUT,
+                StopReason.PROVIDER_TEMPORARY_FAILURE,
+                StopReason.UNRECOVERABLE_ERROR,
+                StopReason.ROUND_LIMIT,
+                StopReason.REPEATED_ACTION,
+                StopReason.BLOCKED,
+            }:
+                task.status = TaskStatus.BLOCKED
+            self._events.append(
+                RunEvent(
+                    task_id=task.id,
+                    task_status=task.status,
+                    action=action,
+                    policy_verdict=decision.verdict if decision else None,
+                    retry_count=round_number,
+                    stop_reason=reason,
+                )
             )
-        )
         return task
 
     def _context(self, task: TaskState) -> LlmContext:
@@ -403,7 +426,8 @@ class TaskOrchestrator:
                 self._pending.pop(key)
 
     def _is_cancelled(self, task: TaskState) -> bool:
-        return task.id in self._cancelled_task_ids or task.status is TaskStatus.CANCELLED
+        with self._state_lock:
+            return task.id in self._cancelled_task_ids or task.status is TaskStatus.CANCELLED
 
     def _reject_second_active_task(self, task: TaskState) -> None:
         """Keep one task's unsafe pause and control state isolated from every other task."""

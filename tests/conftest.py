@@ -28,6 +28,7 @@ def ready_bugfix_task(tmp_path: Path) -> TaskState:
     return TaskState(
         description="Fix a failing test",
         mode=TaskMode.BUGFIX,
+        bugfix_target="tests/test_example.py::test_before",
         config=safe_config(tmp_path),
         tdd_phase=TddPhase.RED_OBSERVED,
     )

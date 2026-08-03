@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 
+import guardedpy.orchestrator as orchestrator_module
 from guardedpy.config import HarnessConfig
 from guardedpy.domain import TaskMode, TaskState, TaskStatus, TddPhase
 from guardedpy.events import EventStore, RunEvent, StopReason
@@ -246,6 +247,29 @@ def test_cancelled_task_does_not_dispatch_an_approved_action(
     assert EventStore(tmp_path).events_for(task.id)[-1].stop_reason is StopReason.CANCELLED
 
 
+def test_cancellation_during_action_parsing_remains_terminal_before_approval_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches parsing-time cancellation being overwritten by waiting-for-approval state."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    task = _bugfix_task()
+    action = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
+    orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
+    original_parse = orchestrator_module.parse_action
+
+    def cancel_then_parse(payload: str) -> object:
+        orchestrator.cancel(task.id)
+        return original_parse(payload)
+
+    monkeypatch.setattr(orchestrator_module, "parse_action", cancel_then_parse)
+    orchestrator.submit(task)
+
+    stopped = orchestrator.run(task)
+
+    assert stopped.status is TaskStatus.CANCELLED
+    assert EventStore(tmp_path).events_for(task.id)[-1].stop_reason is StopReason.CANCELLED
+
+
 def test_exact_approved_action_executes_once_and_keeps_full_action_out_of_event_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -324,6 +348,7 @@ def test_pytest_execution_error_does_not_count_as_the_required_red_observation(
     task = TaskState(
         description="Repair a test",
         mode=TaskMode.BUGFIX,
+        bugfix_target="tests/test_value.py::test_value_is_fixed",
         config=HarnessConfig(
             source_dirs=(Path("src"),),
             test_dirs=(Path("tests"),),
