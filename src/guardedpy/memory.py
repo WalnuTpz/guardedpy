@@ -35,6 +35,14 @@ class MemoryStore:
         self._proposals[entry.id] = entry
         return entry
 
+    def proposals(self) -> list[MemoryEntry]:
+        """Return only the current process's unapproved memory candidates."""
+        return list(self._proposals.values())
+
+    def approved(self) -> list[MemoryEntry]:
+        """Return approved memories for the local memory-management view."""
+        return list(self._approved.values())
+
     def approve(self, memory_id: UUID) -> MemoryEntry:
         proposal = self._proposals.pop(memory_id)
         entry = MemoryEntry(
@@ -65,9 +73,13 @@ class MemoryStore:
         )[:5]
 
     def delete(self, memory_id: UUID) -> None:
-        if memory_id in self._approved:
-            del self._approved[memory_id]
-            self._save()
+        if memory_id in self._proposals:
+            del self._proposals[memory_id]
+            return
+        if memory_id not in self._approved:
+            raise KeyError(memory_id)
+        del self._approved[memory_id]
+        self._save()
 
     def _load(self) -> dict[UUID, MemoryEntry]:
         if not self._path.exists():

@@ -9,6 +9,7 @@ nav a { color: #4e5661; text-decoration: none; }
 .canvas { margin: 0 auto; max-width: 68rem; padding: 2rem 1.25rem; }
 .card { background: #ffffff; border: 1px solid #dfe3e8; border-radius: .55rem; box-shadow: 0 1px 2px rgb(20 29 40 / 6%); margin-bottom: 1rem; max-width: 46rem; padding: 1.5rem; }
 h1 { font-size: 1.6rem; letter-spacing: -.025em; margin: .25rem 0 .75rem; }
+h2 { font-size: 1.05rem; margin: .25rem 0 .75rem; }
 .muted { color: #667085; }
 .form-grid { display: grid; gap: 1rem; }
 label { display: grid; font-weight: 650; gap: .4rem; }
@@ -22,5 +23,11 @@ button.secondary { background: white; color: #303846; margin-top: 1rem; }
 .badge-red { background: #fee2e2; color: #991b1b; }
 .notice { border-radius: .35rem; padding: .7rem; }
 .notice-error { background: #fee2e2; color: #991b1b; }
+.approval-actions, .memory-list li { align-items: center; display: flex; flex-wrap: wrap; gap: .6rem; }
+.approval-actions .secondary, .memory-list .secondary { margin-top: 0; }
+.timeline, .memory-list { display: grid; gap: .75rem; margin: 0; padding-left: 1.25rem; }
+.timeline li { display: flex; flex-wrap: wrap; gap: .45rem; }
+.memory-list li { border-top: 1px solid #dfe3e8; padding-top: .75rem; }
+.memory-list p { flex-basis: 100%; margin: 0; }
 .narrow-menu { display: none; color: #4e5661; font-size: .85rem; }
 @media (max-width: 36rem) { nav { display: none; } .narrow-menu { display: inline; } .topbar { align-items: flex-start; } }

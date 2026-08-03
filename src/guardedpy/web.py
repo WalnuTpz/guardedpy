@@ -9,7 +9,7 @@ from threading import Thread
 from typing import Any, Callable, Protocol
 from uuid import UUID
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -21,7 +21,8 @@ import yaml
 
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialService, CredentialStatus, KeyringBackend
-from guardedpy.domain import TaskMode, TaskState, TaskStatus
+from guardedpy.domain import PolicyVerdict, TaskMode, TaskState, TaskStatus
+from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.llm import DeepSeekClient
 from guardedpy.memory import MemoryStore
 from guardedpy.orchestrator import TaskOrchestrator
@@ -48,6 +49,8 @@ class OrchestratorPort(Protocol):
 
     def cancel(self, task_id: UUID) -> TaskState: ...
 
+    def resolve_approval(self, task_id: UUID, action_hash: str, *, approved: bool) -> bool: ...
+
 
 OrchestratorFactory = Callable[[Path, HarnessConfig, MemoryStore], OrchestratorPort]
 
@@ -71,6 +74,12 @@ class _LocalState:
 
 
 _ACTIVE_STATUSES = {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL}
+_TERMINAL_STATUSES = {
+    TaskStatus.COMPLETED,
+    TaskStatus.BLOCKED,
+    TaskStatus.CANCELLED,
+    TaskStatus.INTERRUPTED,
+}
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
@@ -103,6 +112,18 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             {"error": error, "configured": state.config is not None, "task": state.task},
             status_code=status_code,
         )
+
+    def task_for(task_id: UUID) -> TaskState:
+        task = app.state.local.task
+        if task is None or task.id != task_id:
+            raise HTTPException(status_code=404, detail="Task was not found.")
+        return task
+
+    def task_events(task_id: UUID) -> list[StoredRunEvent]:
+        state: _LocalState = app.state.local
+        if state.project_root is None:
+            raise HTTPException(status_code=404, detail="Task was not found.")
+        return EventStore(state.project_root).events_for(task_id)
 
     @app.get("/", response_class=HTMLResponse)
     async def home(request: Request) -> HTMLResponse:
@@ -167,6 +188,60 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         thread.start()
         return RedirectResponse("/tasks/new", status_code=303)
 
+    @app.get("/tasks/{task_id}", response_class=HTMLResponse)
+    async def task_detail(task_id: UUID, request: Request) -> HTMLResponse:
+        task = task_for(task_id)
+        events = task_events(task_id)
+        approval_event = next(
+            (
+                event
+                for event in reversed(events)
+                if event.task_status is TaskStatus.WAITING_APPROVAL
+                and event.policy_verdict is PolicyVerdict.APPROVAL_REQUIRED
+                and event.action_hash is not None
+            ),
+            None,
+        )
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "task_detail.html",
+            {
+                "task": task,
+                "events": events,
+                "approval_event": approval_event,
+                "terminal": task.status in _TERMINAL_STATUSES,
+            },
+        )
+
+    @app.get("/tasks/{task_id}/events")
+    async def task_event_feed(task_id: UUID) -> list[dict[str, object]]:
+        task_for(task_id)
+        return [event.model_dump(mode="json") for event in task_events(task_id)]
+
+    @app.post("/tasks/{task_id}/approval", response_class=HTMLResponse)
+    async def resolve_task_approval(task_id: UUID, request: Request) -> Response:
+        state: _LocalState = app.state.local
+        task = task_for(task_id)
+        if state.orchestrator is None:
+            raise HTTPException(status_code=404, detail="Task was not found.")
+        form = await request.form()
+        action_hash = str(form.get("action_hash", ""))
+        decision = str(form.get("decision", ""))
+        if decision not in {"approve", "reject"}:
+            raise HTTPException(status_code=409, detail="Approval is stale.")
+
+        approved = decision == "approve"
+        was_waiting = task.status is TaskStatus.WAITING_APPROVAL
+        accepted = state.orchestrator.resolve_approval(task_id, action_hash, approved=approved)
+        if accepted:
+            thread = Thread(target=state.orchestrator.run, args=(task,), daemon=True)
+            state.thread = thread
+            thread.start()
+            return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+        if not approved and was_waiting and task.status is TaskStatus.BLOCKED:
+            return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+        raise HTTPException(status_code=409, detail="Approval is stale.")
+
     @app.post("/tasks/{task_id}/cancel", response_class=HTMLResponse)
     async def cancel_task(task_id: UUID, request: Request) -> Response:
         state: _LocalState = app.state.local
@@ -174,6 +249,39 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             return render_task(request, error="Task was not found.", status_code=404)
         state.task = state.orchestrator.cancel(task_id)
         return RedirectResponse("/tasks/new", status_code=303)
+
+    @app.get("/memories", response_class=HTMLResponse)
+    async def memories(request: Request) -> HTMLResponse:
+        memory_store = app.state.local.memory_store
+        if memory_store is None:
+            raise HTTPException(status_code=404, detail="Memory store was not found.")
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "memory.html",
+            {"proposals": memory_store.proposals(), "approved": memory_store.approved()},
+        )
+
+    @app.post("/memories/{memory_id}/approve", response_class=HTMLResponse)
+    async def approve_memory(memory_id: UUID) -> Response:
+        memory_store = app.state.local.memory_store
+        if memory_store is None:
+            raise HTTPException(status_code=404, detail="Memory was not found.")
+        try:
+            memory_store.approve(memory_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Memory was not found.") from None
+        return RedirectResponse("/memories", status_code=303)
+
+    @app.post("/memories/{memory_id}/delete", response_class=HTMLResponse)
+    async def delete_memory(memory_id: UUID) -> Response:
+        memory_store = app.state.local.memory_store
+        if memory_store is None:
+            raise HTTPException(status_code=404, detail="Memory was not found.")
+        try:
+            memory_store.delete(memory_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Memory was not found.") from None
+        return RedirectResponse("/memories", status_code=303)
 
     @app.get("/settings/credentials", response_class=HTMLResponse)
     async def credentials_page(request: Request) -> HTMLResponse:
