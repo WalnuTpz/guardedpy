@@ -8,6 +8,7 @@ from guardedpy.actions import (
     FinishAction,
     ReadFileAction,
     RunCommandAction,
+    RunPytestAction,
 )
 from guardedpy.domain import PolicyVerdict, TaskMode, TaskState, TddPhase
 from guardedpy.policy import PolicyEngine
@@ -46,18 +47,32 @@ def test_feature_task_records_red_only_after_a_test_patch(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
     """Catches a transition that accepts an unrelated failing test as feature TDD evidence."""
-    first = policy.record_pytest(feature_task, passed=False)
+    target_run = RunPytestAction(
+        kind="run_pytest", summary="run new test", targets=("tests/test_example.py",)
+    )
+    first = policy.record_pytest(feature_task, target_run, passed=False)
 
     policy.record_read(
         feature_task, ReadFileAction(kind="read_file", summary="read test", path="tests/test_example.py")
     )
-    policy.decide(
+    proposed = policy.decide(
         feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=TEST_DIFF)
     )
-    second = policy.record_pytest(feature_task, passed=False)
+    second = policy.record_pytest(feature_task, target_run, passed=False)
+    recorded = policy.record_patch(
+        feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=TEST_DIFF)
+    )
+    third = policy.record_pytest(
+        feature_task,
+        target_run,
+        passed=False,
+    )
 
     assert (first.verdict, first.rule_id) == (PolicyVerdict.DENY, "tdd.test_change_required")
-    assert second.verdict is PolicyVerdict.ALLOW
+    assert proposed.verdict is PolicyVerdict.ALLOW
+    assert (second.verdict, second.rule_id) == (PolicyVerdict.DENY, "tdd.test_change_required")
+    assert recorded.verdict is PolicyVerdict.ALLOW
+    assert third.verdict is PolicyVerdict.ALLOW
     assert feature_task.tdd_phase is TddPhase.RED_OBSERVED
 
 
@@ -72,10 +87,10 @@ def test_source_patch_requires_a_current_read_after_red(
     assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "patch.read_required")
 
 
-def test_read_source_then_patch_transitions_to_implementation(
+def test_deciding_source_patch_does_not_transition_to_implementation(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
-    """Catches a policy that allows implementation without recording its state transition."""
+    """Catches decide() treating an unexecuted patch as a successful write."""
     policy.record_read(
         ready_bugfix_task, ReadFileAction(kind="read_file", summary="read source", path="src/example.py")
     )
@@ -84,27 +99,42 @@ def test_read_source_then_patch_transitions_to_implementation(
     )
 
     assert result.verdict is PolicyVerdict.ALLOW
+    assert ready_bugfix_task.tdd_phase is TddPhase.RED_OBSERVED
+    recorded = policy.record_patch(
+        ready_bugfix_task, ApplyPatchAction(kind="apply_patch", summary="change", diff=SOURCE_DIFF)
+    )
+    assert recorded.verdict is PolicyVerdict.ALLOW
     assert ready_bugfix_task.tdd_phase is TddPhase.IMPLEMENTATION
 
 
-def test_passing_pytest_allows_completed_finish_only_after_implementation(
+def test_passing_target_pytest_does_not_allow_completed_finish(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
-    """Catches an early completed finish that skips the green-test observation."""
+    """Catches finish.completed accepting target-only green test evidence."""
     policy.record_read(
         ready_bugfix_task, ReadFileAction(kind="read_file", summary="read source", path="src/example.py")
     )
+    source_patch = ApplyPatchAction(kind="apply_patch", summary="change", diff=SOURCE_DIFF)
     policy.decide(
-        ready_bugfix_task, ApplyPatchAction(kind="apply_patch", summary="change", diff=SOURCE_DIFF)
+        ready_bugfix_task, source_patch
     )
-    policy.record_pytest(ready_bugfix_task, passed=True)
+    policy.record_patch(ready_bugfix_task, source_patch)
+    target_run = RunPytestAction(
+        kind="run_pytest", summary="run selected test", targets=("tests/test_example.py",)
+    )
+    policy.record_pytest(ready_bugfix_task, target_run, passed=True)
 
     result = policy.decide(
         ready_bugfix_task, FinishAction(kind="finish", summary="all tests pass", status="completed")
     )
 
-    assert result.verdict is PolicyVerdict.ALLOW
-    assert ready_bugfix_task.tdd_phase is TddPhase.FINISHED
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "pytest.full_suite_required")
+    full_run = RunPytestAction(kind="run_pytest", summary="run configured suite")
+    policy.record_pytest(ready_bugfix_task, full_run, passed=True)
+    completed = policy.decide(
+        ready_bugfix_task, FinishAction(kind="finish", summary="all tests pass", status="completed")
+    )
+    assert completed.verdict is PolicyVerdict.ALLOW
 
 
 def test_patch_outside_configured_directories_is_denied(
@@ -179,18 +209,121 @@ def test_approval_cannot_override_a_direct_denial(
     assert result.verdict is PolicyVerdict.DENY
 
 
-def test_dependency_command_requires_exact_approval(
+def test_dependency_command_is_directly_denied(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
-    """Catches an automatic dependency installation through the generic command tool."""
+    """Catches a dependency command being sent to approval instead of rejected."""
     action = RunCommandAction(kind="run_command", summary="install", args=("pip", "install", "ruff"))
+
+    result = policy.decide(feature_task, action)
+
+    assert result.verdict is PolicyVerdict.DENY
+
+
+def test_only_exact_read_only_git_diff_can_wait_for_approval(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches an allowed command family that can modify the repository or run helpers."""
+    action = RunCommandAction(
+        kind="run_command",
+        summary="check diff whitespace",
+        args=("git", "diff", "--no-ext-diff", "--check"),
+    )
 
     result = policy.decide(feature_task, action)
 
     assert (result.verdict, result.rule_id) == (
         PolicyVerdict.APPROVAL_REQUIRED,
-        "command.dependency_install",
+        "command.read_only_approval_required",
     )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("git", "show", "src/example.py"),
+        ("git", "diff", "--no-ext-diff", "--check", "harness.yaml"),
+        ("curl", "https://example.invalid"),
+    ],
+)
+def test_generic_command_cannot_bypass_protected_paths_or_network(
+    policy: PolicyEngine, feature_task: TaskState, args: tuple[str, ...]
+) -> None:
+    """Catches approval of commands outside the narrowly read-only command contract."""
+    result = policy.decide(
+        feature_task,
+        RunCommandAction(kind="run_command", summary="generic command", args=args),
+    )
+
+    assert result.verdict is PolicyVerdict.DENY
+
+
+@pytest.mark.parametrize(
+    ("targets", "rule_id"),
+    [
+        (("src/example.py",), "pytest.target_not_test"),
+        (("../outside_test.py",), "pytest.target_outside_root"),
+        (("-k", "name"), "pytest.option_not_allowed"),
+    ],
+)
+def test_pytest_rejects_non_test_targets_and_options(
+    policy: PolicyEngine,
+    feature_task: TaskState,
+    targets: tuple[str, ...],
+    rule_id: str,
+) -> None:
+    """Catches pytest arguments escaping the configured test-directory contract."""
+    result = policy.decide(
+        feature_task,
+        RunPytestAction(kind="run_pytest", summary="run selected tests", targets=targets),
+    )
+
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, rule_id)
+
+
+def test_patch_rejects_deletion_hidden_beside_a_valid_test_change(
+    policy: PolicyEngine, ready_bugfix_task: TaskState
+) -> None:
+    """Catches a parser that validates only +++ paths and misses a deleted sensitive file."""
+    diff = """--- a/.env
++++ /dev/null
+@@ -1 +0,0 @@
+-token=secret
+--- a/tests/test_example.py
++++ b/tests/test_example.py
+@@ -1 +1 @@
+-before
++after
+"""
+
+    result = policy.decide(
+        ready_bugfix_task, ApplyPatchAction(kind="apply_patch", summary="change", diff=diff)
+    )
+
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "patch.delete_unsupported")
+
+
+def test_patch_rejects_rename_hidden_beside_a_valid_test_change(
+    policy: PolicyEngine, ready_bugfix_task: TaskState
+) -> None:
+    """Catches a parser that ignores an old path while admitting a renamed file."""
+    diff = """--- a/src/old.py
++++ b/src/new.py
+@@ -1 +1 @@
+-before
++after
+--- a/tests/test_example.py
++++ b/tests/test_example.py
+@@ -1 +1 @@
+-before
++after
+"""
+
+    result = policy.decide(
+        ready_bugfix_task, ApplyPatchAction(kind="apply_patch", summary="change", diff=diff)
+    )
+
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "patch.rename_unsupported")
 
 
 @pytest.mark.parametrize(
