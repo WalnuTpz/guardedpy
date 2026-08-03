@@ -11,7 +11,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from guardedpy.actions import Action, stable_hash
+from guardedpy.actions import Action, ApplyPatchAction, DeletePathAction, RunCommandAction, stable_hash
 from guardedpy.config import app_state_dir
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskStatus
 
@@ -86,6 +86,8 @@ class StoredRunEvent(BaseModel):
     feedback_kind: FeedbackKind | None = None
     feedback_excerpt: str | None = None
     retry_count: int | None = None
+    policy_rule_id: str | None = None
+    policy_reason: str | None = None
     stop_reason: StopReason | None = None
     id: int | None = None
     created_at: datetime | None = None
@@ -103,6 +105,24 @@ def _project_feedback(feedback: FeedbackAudit | None) -> tuple[FeedbackKind | No
     return feedback.kind, _FEEDBACK_TEMPLATES[feedback.kind]
 
 
+def _project_approval_policy(event: RunEvent) -> tuple[str | None, str | None]:
+    """Project only fixed policy metadata for an already validated approval event."""
+    if event.policy_verdict is not PolicyVerdict.APPROVAL_REQUIRED:
+        return None, None
+    if isinstance(event.action, DeletePathAction):
+        return "delete.approval_required", "deletion requires approval"
+    if isinstance(event.action, ApplyPatchAction):
+        return "patch.non_code", "non-code files require approval"
+    if isinstance(event.action, RunCommandAction):
+        if event.action.args == ("git", "diff", "--no-ext-diff", "--check"):
+            return (
+                "command.read_only_approval_required",
+                "the read-only Git whitespace check requires approval",
+            )
+        return "command.approval_required", "the constrained command requires approval"
+    return None, None
+
+
 class EventStore:
     """Append-only task events with a separate current-state index."""
 
@@ -115,6 +135,7 @@ class EventStore:
         """Persist one fixed-format audit projection and update the task's state."""
         action_summary, action_hash = _project_action(event.action)
         feedback_kind, feedback_excerpt = _project_feedback(event.feedback)
+        policy_rule_id, policy_reason = _project_approval_policy(event)
         created_at = datetime.now(timezone.utc)
         with closing(sqlite3.connect(self.database_path)) as connection:
             cursor = connection.execute(
@@ -146,6 +167,11 @@ class EventStore:
                 """,
                 (str(event.task_id), event.task_status.value),
             )
+            if policy_rule_id is not None and policy_reason is not None:
+                connection.execute(
+                    "INSERT INTO event_policies (event_id, rule_id, reason) VALUES (?, ?, ?)",
+                    (cursor.lastrowid, policy_rule_id, policy_reason),
+                )
             connection.commit()
             return StoredRunEvent(
                 task_id=event.task_id,
@@ -157,6 +183,8 @@ class EventStore:
                 feedback_kind=feedback_kind,
                 feedback_excerpt=feedback_excerpt,
                 retry_count=event.retry_count,
+                policy_rule_id=policy_rule_id,
+                policy_reason=policy_reason,
                 stop_reason=event.stop_reason,
                 id=cursor.lastrowid,
                 created_at=created_at,
@@ -166,7 +194,14 @@ class EventStore:
         """Return a task's audit trail in insertion order."""
         with closing(sqlite3.connect(self.database_path)) as connection:
             rows = connection.execute(
-                "SELECT * FROM events WHERE task_id = ? ORDER BY id", (str(task_id),)
+                """
+                SELECT events.*, event_policies.rule_id, event_policies.reason
+                FROM events
+                LEFT JOIN event_policies ON event_policies.event_id = events.id
+                WHERE events.task_id = ?
+                ORDER BY events.id
+                """,
+                (str(task_id),),
             ).fetchall()
         return [
             StoredRunEvent(
@@ -182,6 +217,8 @@ class EventStore:
                 retry_count=row[9],
                 stop_reason=StopReason(row[10]) if row[10] else None,
                 created_at=datetime.fromisoformat(row[11]),
+                policy_rule_id=row[12],
+                policy_reason=row[13],
             )
             for row in rows
         ]
@@ -235,6 +272,12 @@ class EventStore:
                 CREATE TABLE IF NOT EXISTS task_states (
                     task_id TEXT PRIMARY KEY,
                     task_status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS event_policies (
+                    event_id INTEGER PRIMARY KEY,
+                    rule_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    FOREIGN KEY(event_id) REFERENCES events(id)
                 );
                 """
             )

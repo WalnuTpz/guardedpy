@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from guardedpy.config import HarnessConfig
-from guardedpy.credentials import CredentialStatus
+from guardedpy.credentials import CredentialBackendUnavailableError, CredentialStatus
 from guardedpy.domain import TaskMode, TaskState, TaskStatus
 
 
@@ -45,13 +45,20 @@ class FakeCredentials:
         self.set_calls.append(key)
         self.configured = True
 
-    def get_key(self) -> str:
-        if not self.configured:
-            raise RuntimeError("key is absent")
-        return self.set_calls[-1]
-
     def clear_key(self) -> None:
         self.configured = False
+
+
+@dataclass
+class UnavailableCredentials:
+    def status(self) -> CredentialStatus:
+        raise CredentialBackendUnavailableError("backend leaked-secret is unavailable")
+
+    def set_key(self, key: str) -> None:
+        raise CredentialBackendUnavailableError(f"backend rejected {key}")
+
+    def clear_key(self) -> None:
+        raise CredentialBackendUnavailableError("backend leaked-secret is unavailable")
 
 
 @dataclass
@@ -132,6 +139,49 @@ def test_setup_saves_a_nonsecret_validated_snapshot_without_echoing_the_key(tmp_
     }
 
 
+def test_credential_update_clear_and_unavailable_backend_do_not_echo_key(tmp_path: Path) -> None:
+    """Catches credential mutations leaking a submitted key or backend diagnostics."""
+    root = _project_root(tmp_path)
+    credentials = FakeCredentials()
+    app = _app(credentials, FakeOrchestrator([]))
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+
+    updated = asyncio.run(
+        _request(app, "POST", "/settings/credentials", data={"api_key": "new-secret"})
+    )
+    cleared = asyncio.run(_request(app, "POST", "/settings/credentials/clear"))
+    page = asyncio.run(_request(app, "GET", "/settings/credentials"))
+
+    assert updated.status_code == 303
+    assert cleared.status_code == 303
+    assert credentials.set_calls == ["secret-key", "new-secret"]
+    assert "new-secret" not in updated.text + cleared.text + page.text
+    assert 'type="password"' in page.text
+    assert 'action="/settings/credentials/clear"' in page.text
+
+    unavailable = _app(UnavailableCredentials(), FakeOrchestrator([]))
+    unavailable_page = asyncio.run(_request(unavailable, "GET", "/settings/credentials"))
+    unavailable_update = asyncio.run(
+        _request(
+            unavailable,
+            "POST",
+            "/settings/credentials",
+            data={"api_key": "never-echo-this"},
+        )
+    )
+    unavailable_clear = asyncio.run(
+        _request(unavailable, "POST", "/settings/credentials/clear")
+    )
+
+    assert unavailable_page.status_code == 503
+    assert unavailable_update.status_code == 503
+    assert unavailable_clear.status_code == 503
+    body = unavailable_page.text + unavailable_update.text + unavailable_clear.text
+    assert body.count("Credential store is unavailable.") == 3
+    assert "never-echo-this" not in body
+    assert "leaked-secret" not in body
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -169,6 +219,46 @@ def test_snapshot_write_failure_does_not_store_the_submitted_key(tmp_path: Path)
     assert response.status_code == 422
     assert response.text.count("Setup could not be saved.") == 1
     assert credentials.set_calls == []
+
+
+def test_active_task_rejects_setup_replacement_before_any_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches setup replacement moving an active task to another root or key."""
+    first_root = _project_root(tmp_path / "first")
+    second_root = _project_root(tmp_path / "second")
+    credentials = FakeCredentials()
+    orchestrator = FakeOrchestrator([])
+    app = _app(credentials, orchestrator)
+    web = _web_module()
+
+    class DormantThread:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(web, "Thread", DormantThread)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(first_root))).status_code == 303
+    assert asyncio.run(
+        _request(app, "POST", "/tasks", data={"mode": "feature", "description": "Keep root"})
+    ).status_code == 303
+
+    replaced = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/setup",
+            data=_setup_data(second_root, api_key="second-secret"),
+        )
+    )
+
+    assert replaced.status_code == 409
+    assert app.state.local.project_root == first_root.resolve()
+    assert credentials.set_calls == ["secret-key"]
+    assert not (second_root / "harness.yaml").exists()
+    assert "second-secret" not in replaced.text
 
 
 def test_task_creation_submits_before_starting_one_daemon_thread_and_rejects_a_second_active_task(

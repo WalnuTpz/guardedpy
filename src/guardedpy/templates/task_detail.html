@@ -12,10 +12,13 @@
   <p class="eyebrow">ACTION APPROVAL REQUIRED</p>
   <h2>{{ approval_event.action_summary }}</h2>
   <p>Policy: <span class="badge badge-amber">{{ approval_event.policy_verdict }}</span></p>
+  {% if approval_event.policy_rule_id %}<p>Policy rule: {{ approval_event.policy_rule_id }}</p>{% endif %}
+  {% if approval_event.policy_reason %}<p>Policy reason: {{ approval_event.policy_reason }}</p>{% endif %}
   <form method="post" action="/tasks/{{ task.id }}/approval" class="approval-actions">
     <input type="hidden" name="action_hash" value="{{ approval_event.action_hash }}">
-    <button type="submit" name="decision" value="approve">Approve action</button>
     <button class="secondary" type="submit" name="decision" value="reject">Reject action</button>
+    <button type="submit" name="decision" value="once">Allow once</button>
+    <button type="submit" name="decision" value="always">Always allow this rule</button>
   </form>
 </section>
 {% endif %}
@@ -34,5 +37,5 @@
     {% endfor %}
   </ol>
 </section>
-<script defer src="{{ url_for('static', path='app.js') }}"></script>
+{% if not terminal %}<script defer src="{{ url_for('static', path='app.js') }}"></script>{% endif %}
 {% endblock %}

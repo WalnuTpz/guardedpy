@@ -21,9 +21,24 @@ import uvicorn
 import yaml
 
 from guardedpy.config import HarnessConfig
-from guardedpy.credentials import CredentialService, CredentialStatus, KeyringBackend
+from guardedpy.command_rules import CommandRuleStore
+from guardedpy.credentials import (
+    CredentialBackendUnavailableError,
+    CredentialService,
+    CredentialStatus,
+    KeyringBackend,
+)
 from guardedpy.demo import create_demo_app
-from guardedpy.domain import PolicyVerdict, TaskMode, TaskState, TaskStatus
+from guardedpy.domain import (
+    ApprovalDecision,
+    CommandApprovalRule,
+    CommandRuleKind,
+    PolicyVerdict,
+    TaskMode,
+    TaskState,
+    TaskStatus,
+    is_approval_decision,
+)
 from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.llm import DeepSeekClient
 from guardedpy.memory import MemoryStore
@@ -37,8 +52,6 @@ class CredentialPort(Protocol):
 
     def set_key(self, key: str) -> None: ...
 
-    def get_key(self) -> str: ...
-
     def clear_key(self) -> None: ...
 
 
@@ -51,7 +64,9 @@ class OrchestratorPort(Protocol):
 
     def cancel(self, task_id: UUID) -> TaskState: ...
 
-    def resolve_approval(self, task_id: UUID, action_hash: str, *, approved: bool) -> bool: ...
+    def resolve_approval(
+        self, task_id: UUID, action_hash: str, *, decision: ApprovalDecision
+    ) -> bool: ...
 
 
 OrchestratorFactory = Callable[[Path, HarnessConfig, MemoryStore], OrchestratorPort]
@@ -83,6 +98,7 @@ _TERMINAL_STATUSES = {
     TaskStatus.INTERRUPTED,
 }
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+_CREDENTIAL_ERROR = "Credential store is unavailable."
 
 
 def create_app(mode: str, services: WebServices) -> FastAPI:
@@ -94,14 +110,42 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
     app.state.local = _LocalState()
 
+    def credential_status() -> tuple[CredentialStatus, str | None]:
+        try:
+            return services.credentials.status(), None
+        except CredentialBackendUnavailableError:
+            return CredentialStatus(configured=False), _CREDENTIAL_ERROR
+
     def render_setup(request: Request, *, error: str | None = None, status_code: int = 200) -> HTMLResponse:
+        status, credential_error = credential_status()
+        if credential_error is not None:
+            error = credential_error
+            status_code = 503
         return _TEMPLATES.TemplateResponse(
             request,
             "setup.html",
             {
                 "request": request,
                 "error": error,
-                "configured": services.credentials.status().configured,
+                "configured": status.configured,
+            },
+            status_code=status_code,
+        )
+
+    def render_credentials(
+        request: Request, *, error: str | None = None, status_code: int = 200
+    ) -> HTMLResponse:
+        status, credential_error = credential_status()
+        if credential_error is not None:
+            error = credential_error
+            status_code = 503
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "base.html",
+            {
+                "configured": status.configured,
+                "error": error,
+                "page": "credentials",
             },
             status_code=status_code,
         )
@@ -136,6 +180,9 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
 
     @app.post("/setup", response_class=HTMLResponse)
     async def setup(request: Request) -> Response:
+        state: _LocalState = app.state.local
+        if state.task is not None and state.task.status in _ACTIVE_STATUSES:
+            return render_task(request, error="Another task is active.", status_code=409)
         form = await request.form()
         try:
             project_root, config, api_key = _validated_setup(form)
@@ -149,7 +196,6 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         except Exception:
             return render_setup(request, error="Setup could not be saved.", status_code=422)
 
-        state: _LocalState = app.state.local
         state.project_root = project_root
         state.config = config
         state.memory_store = memory_store
@@ -237,18 +283,17 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         form = await request.form()
         action_hash = str(form.get("action_hash", ""))
         decision = str(form.get("decision", ""))
-        if decision not in {"approve", "reject"}:
+        if not is_approval_decision(decision):
             raise HTTPException(status_code=409, detail="Approval is stale.")
 
-        approved = decision == "approve"
         was_waiting = task.status is TaskStatus.WAITING_APPROVAL
-        accepted = state.orchestrator.resolve_approval(task_id, action_hash, approved=approved)
+        accepted = state.orchestrator.resolve_approval(task_id, action_hash, decision=decision)
         if accepted:
             thread = Thread(target=state.orchestrator.run, args=(task,), daemon=True)
             state.thread = thread
             thread.start()
             return RedirectResponse(f"/tasks/{task_id}", status_code=303)
-        if not approved and was_waiting and task.status is TaskStatus.BLOCKED:
+        if decision == "reject" and was_waiting and task.status is TaskStatus.BLOCKED:
             return RedirectResponse(f"/tasks/{task_id}", status_code=303)
         raise HTTPException(status_code=409, detail="Approval is stale.")
 
@@ -295,11 +340,53 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
 
     @app.get("/settings/credentials", response_class=HTMLResponse)
     async def credentials_page(request: Request) -> HTMLResponse:
+        return render_credentials(request)
+
+    @app.post("/settings/credentials", response_class=HTMLResponse)
+    async def update_credentials(request: Request) -> Response:
+        form = await request.form()
+        api_key = str(form.get("api_key", ""))
+        if not api_key.strip():
+            return render_credentials(
+                request, error="Credential could not be updated.", status_code=422
+            )
+        try:
+            services.credentials.set_key(api_key)
+        except CredentialBackendUnavailableError:
+            return render_credentials(request, error=_CREDENTIAL_ERROR, status_code=503)
+        return RedirectResponse("/settings/credentials", status_code=303)
+
+    @app.post("/settings/credentials/clear", response_class=HTMLResponse)
+    async def clear_credentials(request: Request) -> Response:
+        try:
+            services.credentials.clear_key()
+        except CredentialBackendUnavailableError:
+            return render_credentials(request, error=_CREDENTIAL_ERROR, status_code=503)
+        return RedirectResponse("/settings/credentials", status_code=303)
+
+    @app.get("/settings/command-rules", response_class=HTMLResponse)
+    async def command_rules(request: Request) -> HTMLResponse:
+        project_root = app.state.local.project_root
+        if project_root is None:
+            raise HTTPException(status_code=404, detail="Project was not found.")
+        rules = [
+            (rule, _command_rule_projection(rule))
+            for rule in CommandRuleStore(project_root).list_rules()
+        ]
         return _TEMPLATES.TemplateResponse(
             request,
-            "base.html",
-            {"configured": services.credentials.status().configured, "page": "credentials"},
+            "command_rules.html",
+            {"rules": rules},
         )
+
+    @app.post("/settings/command-rules/{rule_id}/delete", response_class=HTMLResponse)
+    async def delete_command_rule(rule_id: str) -> Response:
+        project_root = app.state.local.project_root
+        if project_root is None:
+            raise HTTPException(status_code=404, detail="Project was not found.")
+        if not CommandRuleStore(project_root).delete(rule_id):
+            raise HTTPException(status_code=404, detail="Command rule was not found.")
+        return RedirectResponse("/settings/command-rules", status_code=303)
 
     return app
 
@@ -324,6 +411,15 @@ def _validated_setup(form: Any) -> tuple[Path, HarnessConfig, str]:
         timeout_seconds=int(str(form.get("timeout_seconds", ""))),
     )
     return project_root, config, api_key
+
+
+def _command_rule_projection(rule: CommandApprovalRule) -> str:
+    """Format only the structured fields admitted by command-family validation."""
+    if rule.kind is CommandRuleKind.GIT_DIFF_CHECK:
+        return "Git whitespace check"
+    if rule.kind is CommandRuleKind.GIT_PUSH:
+        return f"Git push to origin/{rule.branch}"
+    return f"Python package install: {', '.join(rule.package_specs)}"
 
 
 def _configured_directories(value: str, project_root: Path) -> tuple[Path, ...]:

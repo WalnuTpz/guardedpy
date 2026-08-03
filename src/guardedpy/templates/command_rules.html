@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <p class="eyebrow">PROJECT COMMAND POLICY</p>
+  <h1>Command rules</h1>
+  <p class="muted">Only constrained rules for the currently connected project appear here.</p>
+</section>
+<section class="card">
+  {% if rules %}
+  <ul class="memory-list">
+    {% for rule, projection in rules %}
+    <li>
+      <p>{{ projection }}</p>
+      <form method="post" action="/settings/command-rules/{{ rule.id }}/delete">
+        <button class="secondary" type="submit">Revoke rule</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">No persistent command rules.</p>{% endif %}
+</section>
+{% endblock %}

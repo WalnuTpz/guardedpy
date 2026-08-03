@@ -13,6 +13,7 @@
         <a href="/">Setup</a>
         <a href="/tasks/new">Tasks</a>
         <a href="/memories">Memory</a>
+        <a href="/settings/command-rules">Command rules</a>
         <a href="/settings/credentials">Credentials</a>
       </nav>
       <span class="narrow-menu" aria-label="Menu">Menu: Setup · Tasks · Memory · Credentials</span>
@@ -24,6 +25,16 @@
         <h1>Credentials</h1>
         <p>DeepSeek credential status: {% if configured %}<span class="badge badge-green">Configured</span>{% else %}<span class="badge badge-amber">Not configured</span>{% endif %}</p>
         <p class="muted">Keys are stored only in your operating-system keyring and are never displayed here.</p>
+        {% if error %}<p class="notice notice-error" role="alert">{{ error }}</p>{% endif %}
+        <form method="post" action="/settings/credentials" class="form-grid">
+          <label>Replace DeepSeek API key
+            <input name="api_key" type="password" autocomplete="new-password" required>
+          </label>
+          <button type="submit">Update credential</button>
+        </form>
+        <form method="post" action="/settings/credentials/clear">
+          <button class="secondary" type="submit">Clear credential</button>
+        </form>
       </section>
       {% endif %}
       {% block content %}{% endblock %}
