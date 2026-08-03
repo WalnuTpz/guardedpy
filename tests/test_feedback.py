@@ -31,6 +31,21 @@ def test_collector_extracts_assertion_failure_node_and_bounded_excerpt() -> None
     assert "x" * 2_000 not in result.excerpt
 
 
+def test_collector_treats_failed_runtime_with_node_as_execution_error() -> None:
+    """Catches a FAILED node line turning an exception in the test into red TDD evidence."""
+    run = PytestRun(
+        1,
+        "FAILED tests/test_parser.py::test_bad_input - TypeError: parser() missing 1 required argument\n",
+        "",
+        False,
+    )
+
+    result = FeedbackCollector().collect(run)
+
+    assert result.kind is FeedbackKind.EXECUTION_ERROR
+    assert result.node_ids == ("tests/test_parser.py::test_bad_input",)
+
+
 def test_collector_prioritizes_timeout_without_inferring_a_node() -> None:
     """Catches a timed-out run being misreported from its incomplete output."""
     result = FeedbackCollector().collect(

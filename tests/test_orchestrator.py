@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 from uuid import uuid4
 
@@ -31,7 +31,12 @@ def _action(**payload: object) -> str:
 
 
 def _bugfix_task() -> TaskState:
-    return TaskState(description="Repair the selected failure", mode=TaskMode.BUGFIX, config=_config())
+    return TaskState(
+        description="Repair the selected failure",
+        mode=TaskMode.BUGFIX,
+        bugfix_target="tests/test_value.py::test_value_is_fixed",
+        config=_config(),
+    )
 
 
 def test_submit_registers_a_pending_task_before_its_background_run(
@@ -182,6 +187,65 @@ def test_cancellation_of_waiting_task_is_terminal_and_exact_approval_does_not_ru
     assert EventStore(tmp_path).events_for(task.id)[-1].stop_reason is StopReason.CANCELLED
 
 
+def test_cancelled_task_does_not_dispatch_action_returned_after_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an action returned by the LLM after cancellation reaching the workspace."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    task = _bugfix_task()
+    workspace_calls: list[PurePosixPath] = []
+    action = _action(kind="list_files", summary="list project", path=".")
+
+    class BlockingLLM:
+        def complete(self, _context: object) -> str:
+            orchestrator.cancel(task.id)
+            return action
+
+    def list_files(_self: Workspace, path: PurePosixPath) -> object:
+        workspace_calls.append(path)
+        raise AssertionError("cancelled action reached workspace")
+
+    monkeypatch.setattr(Workspace, "list_files", list_files)
+    orchestrator = TaskOrchestrator(tmp_path, BlockingLLM())
+    orchestrator.submit(task)
+
+    stopped = orchestrator.run(task)
+
+    assert stopped.status is TaskStatus.CANCELLED
+    assert workspace_calls == []
+    assert EventStore(tmp_path).events_for(task.id)[-1].stop_reason is StopReason.CANCELLED
+
+
+def test_cancelled_task_does_not_dispatch_an_approved_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches approval consuming cancellation and dispatching its previously allowed action."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    target = tmp_path / "obsolete.txt"
+    target.write_text("preserve when cancellation wins\n")
+    task = _bugfix_task()
+    delete = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
+    orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([delete]))
+
+    waiting = orchestrator.run(task)
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+    original_apply_approval = orchestrator._policy.apply_approval
+
+    def cancel_after_approval(*args: object, **kwargs: object) -> object:
+        result = original_apply_approval(*args, **kwargs)
+        orchestrator.cancel(task.id)
+        return result
+
+    monkeypatch.setattr(orchestrator._policy, "apply_approval", cancel_after_approval)
+
+    approved = orchestrator.resolve_approval(task.id, action_hash or "", approved=True)
+
+    assert approved is False
+    assert task.status is TaskStatus.CANCELLED
+    assert target.exists()
+    assert EventStore(tmp_path).events_for(task.id)[-1].stop_reason is StopReason.CANCELLED
+
+
 def test_exact_approved_action_executes_once_and_keeps_full_action_out_of_event_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -232,6 +296,7 @@ def test_failed_patch_does_not_advance_tdd_phase_before_the_tool_succeeds(
     (tmp_path / "src" / "value.py").write_text("VALUE = 'broken'\n")
     (tmp_path / "tests" / "test_value.py").write_text("def test_stays_red() -> None:\n    assert False\n")
     task = _bugfix_task()
+    task.bugfix_target = "tests/test_value.py::test_stays_red"
     llm = ScriptedLLM(
         [
             _action(kind="run_pytest", summary="observe red", targets=["tests/test_value.py"]),

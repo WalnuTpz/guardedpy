@@ -10,7 +10,8 @@ from guardedpy.actions import (
     RunCommandAction,
     RunPytestAction,
 )
-from guardedpy.domain import PolicyVerdict, TaskMode, TaskState, TddPhase
+from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TddPhase
+from guardedpy.feedback import PytestFeedback
 from guardedpy.policy import PolicyEngine
 
 
@@ -57,7 +58,11 @@ def test_feature_task_records_red_only_after_a_test_patch(
     target_run = RunPytestAction(
         kind="run_pytest", summary="run new test", targets=("tests/test_example.py",)
     )
-    first = policy.record_pytest(feature_task, target_run, passed=False)
+    first = policy.record_pytest(
+        feature_task,
+        target_run,
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_example.py",), "assertion failed"),
+    )
 
     policy.record_read(
         feature_task, ReadFileAction(kind="read_file", summary="read test", path="tests/test_example.py")
@@ -65,14 +70,18 @@ def test_feature_task_records_red_only_after_a_test_patch(
     proposed = policy.decide(
         feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=TEST_DIFF)
     )
-    second = policy.record_pytest(feature_task, target_run, passed=False)
+    second = policy.record_pytest(
+        feature_task,
+        target_run,
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_example.py",), "assertion failed"),
+    )
     recorded = policy.record_patch(
         feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=TEST_DIFF)
     )
     third = policy.record_pytest(
         feature_task,
         target_run,
-        passed=False,
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, ("tests/test_example.py",), "assertion failed"),
     )
 
     assert (first.verdict, first.rule_id) == (PolicyVerdict.DENY, "tdd.test_change_required")
@@ -81,6 +90,30 @@ def test_feature_task_records_red_only_after_a_test_patch(
     assert recorded.verdict is PolicyVerdict.ALLOW
     assert third.verdict is PolicyVerdict.ALLOW
     assert feature_task.tdd_phase is TddPhase.RED_OBSERVED
+
+
+def test_bugfix_only_selected_assertion_failure_records_red(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches bugfix red evidence that omits its selected target or assertion classification."""
+    feature_task.mode = TaskMode.BUGFIX
+    feature_task.bugfix_target = "tests/test_parser.py::test_bad_input"
+    pytest_action = RunPytestAction(
+        kind="run_pytest", summary="run selected regression", targets=(feature_task.bugfix_target,)
+    )
+
+    decision = policy.record_pytest(
+        feature_task,
+        pytest_action,
+        feedback=PytestFeedback(
+            FeedbackKind.EXECUTION_ERROR,
+            ("tests/test_parser.py::test_bad_input",),
+            "TypeError",
+        ),
+    )
+
+    assert decision.rule_id == "tdd.bugfix_target_assertion_required"
+    assert feature_task.tdd_phase is TddPhase.TEST_DESIGN
 
 
 def test_source_patch_requires_a_current_read_after_red(
@@ -129,7 +162,7 @@ def test_passing_target_pytest_does_not_allow_completed_finish(
     target_run = RunPytestAction(
         kind="run_pytest", summary="run selected test", targets=("tests/test_example.py",)
     )
-    policy.record_pytest(ready_bugfix_task, target_run, passed=True)
+    policy.record_pytest(ready_bugfix_task, target_run, PytestFeedback(FeedbackKind.PASSED, (), ""))
 
     result = policy.decide(
         ready_bugfix_task, FinishAction(kind="finish", summary="all tests pass", status="completed")
@@ -137,7 +170,7 @@ def test_passing_target_pytest_does_not_allow_completed_finish(
 
     assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "pytest.full_suite_required")
     full_run = RunPytestAction(kind="run_pytest", summary="run configured suite")
-    policy.record_pytest(ready_bugfix_task, full_run, passed=True)
+    policy.record_pytest(ready_bugfix_task, full_run, PytestFeedback(FeedbackKind.PASSED, (), ""))
     completed = policy.decide(
         ready_bugfix_task, FinishAction(kind="finish", summary="all tests pass", status="completed")
     )

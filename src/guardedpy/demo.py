@@ -91,6 +91,7 @@ def run_scenario(name: str) -> ScenarioResult:
         task = TaskState(
             description=_description_for(name),
             mode=TaskMode.BUGFIX,
+            bugfix_target="tests/test_value.py::test_value_is_fixed",
             config=HarnessConfig(
                 source_dirs=(Path("src"),),
                 test_dirs=(Path("tests"),),

@@ -26,7 +26,7 @@ from guardedpy.actions import (
     stable_hash,
 )
 from guardedpy.context import ContextBuilder, LlmContext
-from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskState, TaskStatus
+from guardedpy.domain import PolicyDecision, PolicyVerdict, TaskState, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 from guardedpy.feedback import FeedbackCollector, PytestFeedback
 from guardedpy.llm import LLMClient, TemporaryProviderFailure
@@ -64,6 +64,7 @@ class TaskOrchestrator:
         self._feedback: dict[UUID, dict[str, Any] | None] = {}
         self._loop_by_task: dict[UUID, _LoopState] = {}
         self._pending: dict[tuple[UUID, str], tuple[Action, PolicyDecision, int]] = {}
+        self._cancelled_task_ids: set[UUID] = set()
         self._events = EventStore(self._project_root)
         self._events.mark_unfinished_interrupted()
         self._feedback_collector = FeedbackCollector()
@@ -92,13 +93,25 @@ class TaskOrchestrator:
                 return task
             round_number = loop.next_round
             try:
-                action = parse_action(self._llm.complete(self._context(task)))
+                completion = self._llm.complete(self._context(task))
             except TemporaryProviderFailure:
+                if self._is_cancelled(task):
+                    return task
                 return self._stop(task, StopReason.PROVIDER_TEMPORARY_FAILURE, round_number)
             except (ValidationError, ValueError, json.JSONDecodeError):
+                if self._is_cancelled(task):
+                    return task
                 return self._stop(task, StopReason.INVALID_MODEL_OUTPUT, round_number)
             except Exception:
+                if self._is_cancelled(task):
+                    return task
                 return self._stop(task, StopReason.UNRECOVERABLE_ERROR, round_number)
+            if self._is_cancelled(task):
+                return task
+            try:
+                action = parse_action(completion)
+            except (ValidationError, ValueError, json.JSONDecodeError):
+                return self._stop(task, StopReason.INVALID_MODEL_OUTPUT, round_number)
             loop.next_round += 1
 
             action_hash = stable_hash(action)
@@ -183,6 +196,7 @@ class TaskOrchestrator:
             TaskStatus.INTERRUPTED,
         }:
             return task
+        self._cancelled_task_ids.add(task_id)
         self._discard_pending(task_id)
         task.status = TaskStatus.CANCELLED
         self._events.append(
@@ -216,6 +230,8 @@ class TaskOrchestrator:
                 )
             )
             return False
+        if self._is_cancelled(task):
+            return False
         task.status = TaskStatus.RUNNING
         self._events.append(
             RunEvent(
@@ -241,6 +257,8 @@ class TaskOrchestrator:
     def _execute_allowed(
         self, task: TaskState, action: Action, decision: PolicyDecision, round_number: int
     ) -> None:
+        if self._is_cancelled(task):
+            return
         workspace = self._workspace_by_task[task.id]
         if isinstance(action, ListFilesAction):
             result = workspace.list_files(PurePosixPath(action.path))
@@ -267,8 +285,7 @@ class TaskOrchestrator:
         if isinstance(action, RunPytestAction):
             run = workspace.run_pytest(action.targets)
             feedback = self._feedback_collector.collect(run)
-            if feedback.kind in {FeedbackKind.PASSED, FeedbackKind.ASSERTION_FAILURE}:
-                self._policy.record_pytest(task, action, passed=feedback.kind is FeedbackKind.PASSED)
+            self._policy.record_pytest(task, action, feedback)
             self._feedback[task.id] = self._pytest_feedback(feedback)
             self._events.append(
                 RunEvent(
@@ -384,6 +401,9 @@ class TaskOrchestrator:
         for key in tuple(self._pending):
             if key[0] == task_id:
                 self._pending.pop(key)
+
+    def _is_cancelled(self, task: TaskState) -> bool:
+        return task.id in self._cancelled_task_ids or task.status is TaskStatus.CANCELLED
 
     def _reject_second_active_task(self, task: TaskState) -> None:
         """Keep one task's unsafe pause and control state isolated from every other task."""

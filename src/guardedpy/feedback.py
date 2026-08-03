@@ -15,6 +15,7 @@ _COLLECTION_NODE = re.compile(r"^ERROR collecting (?P<node>\S+)(?:\s|$)", re.MUL
 _USEFUL_OUTPUT = re.compile(
     r"^(FAILED |ERROR collecting |INTERNALERROR|E\s{7}|.*(?:AssertionError|assert ).*)"
 )
+_ASSERTION_EVIDENCE = re.compile(r"\b(?:AssertionError|assert)\b")
 
 
 @dataclass(frozen=True)
@@ -54,8 +55,11 @@ class FeedbackCollector:
 
         failed_nodes = self._node_ids(_FAILED_NODE, output)
         if failed_nodes:
+            excerpt = self._excerpt(output)
+            if not _ASSERTION_EVIDENCE.search(excerpt):
+                return PytestFeedback(FeedbackKind.EXECUTION_ERROR, failed_nodes, excerpt)
             return PytestFeedback(
-                FeedbackKind.ASSERTION_FAILURE, failed_nodes, self._excerpt(output)
+                FeedbackKind.ASSERTION_FAILURE, failed_nodes, excerpt
             )
         return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), self._excerpt(output))
 

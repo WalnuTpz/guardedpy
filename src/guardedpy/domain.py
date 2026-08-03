@@ -66,3 +66,4 @@ class TaskState(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     status: TaskStatus = TaskStatus.PENDING
     tdd_phase: TddPhase = TddPhase.TEST_DESIGN
+    bugfix_target: str | None = None

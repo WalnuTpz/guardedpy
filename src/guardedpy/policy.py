@@ -17,7 +17,8 @@ from guardedpy.actions import (
     RunPytestAction,
     stable_hash,
 )
-from guardedpy.domain import PolicyDecision, PolicyVerdict, TaskMode, TaskState, TddPhase
+from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskMode, TaskState, TddPhase
+from guardedpy.feedback import PytestFeedback
 
 
 class PolicyEngine:
@@ -85,13 +86,13 @@ class PolicyEngine:
         return decision
 
     def record_pytest(
-        self, task: TaskState, action: RunPytestAction, *, passed: bool
+        self, task: TaskState, action: RunPytestAction, feedback: PytestFeedback
     ) -> PolicyDecision:
         """Advance the TDD state only from an observed pytest outcome."""
         decision = self.decide(task, action)
         if decision.verdict is not PolicyVerdict.ALLOW:
             return decision
-        if not passed:
+        if feedback.kind is FeedbackKind.ASSERTION_FAILURE:
             if task.tdd_phase is not TddPhase.TEST_DESIGN:
                 return self._deny(task, None, "tdd.red_out_of_sequence", "red result is out of sequence")
             if task.mode is TaskMode.FEATURE and task.id not in self._feature_test_changes:
@@ -101,8 +102,28 @@ class PolicyEngine:
                     "tdd.test_change_required",
                     "a feature task must change a test before observing red",
                 )
+            if task.mode is TaskMode.BUGFIX and (
+                task.bugfix_target is None or feedback.node_ids != (task.bugfix_target,)
+            ):
+                return self._deny(
+                    task,
+                    None,
+                    "tdd.bugfix_target_assertion_required",
+                    "a bugfix red result must be an assertion failure for its selected target",
+                )
             task.tdd_phase = TddPhase.RED_OBSERVED
             return self._allow(task, None, "tdd.red_recorded", "red pytest result recorded")
+        if feedback.kind is not FeedbackKind.PASSED:
+            return self._deny(
+                task,
+                None,
+                "tdd.bugfix_target_assertion_required"
+                if task.mode is TaskMode.BUGFIX
+                else "tdd.assertion_failure_required",
+                "a red result must be an assertion failure"
+                if task.mode is TaskMode.FEATURE
+                else "a bugfix red result must be an assertion failure for its selected target",
+            )
         if task.tdd_phase is TddPhase.IMPLEMENTATION:
             task.tdd_phase = TddPhase.GREEN_OBSERVED
         elif task.tdd_phase is not TddPhase.GREEN_OBSERVED:
