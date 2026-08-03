@@ -52,6 +52,13 @@ NEW_SOURCE_DIFF = """--- /dev/null
 +VALUE = "created"
 """
 
+SECOND_NEW_TEST_DIFF = """--- /dev/null
++++ b/tests/test_second_created.py
+@@ -0,0 +1,2 @@
++def test_second_created() -> None:
++    assert False
+"""
+
 
 @pytest.fixture
 def policy(tmp_path: Path) -> PolicyEngine:
@@ -191,6 +198,49 @@ def test_feature_red_requires_registered_created_test_target_and_feedback(
         ),
     )
 
+    assert matching.verdict is PolicyVerdict.ALLOW
+    assert policy.decide(feature_task, source).verdict is PolicyVerdict.ALLOW
+
+
+def test_feature_red_feedback_must_match_its_own_created_test_target(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches feedback from a second created test unlocking the first test's run."""
+    first = ApplyPatchAction(kind="apply_patch", summary="add first test", diff=NEW_TEST_DIFF)
+    second = ApplyPatchAction(kind="apply_patch", summary="add second test", diff=SECOND_NEW_TEST_DIFF)
+    policy.record_patch(feature_task, first)
+    policy.record_new_test_path(feature_task, "tests/test_created.py")
+    policy.record_patch(feature_task, second)
+    policy.record_new_test_path(feature_task, "tests/test_second_created.py")
+    target_first = RunPytestAction(
+        kind="run_pytest", summary="run first", targets=("tests/test_created.py",)
+    )
+    source = ApplyPatchAction(kind="apply_patch", summary="add source", diff=NEW_SOURCE_DIFF)
+
+    crossed = policy.record_pytest(
+        feature_task,
+        target_first,
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_second_created.py::test_second_created",),
+            "assert False",
+        ),
+    )
+
+    assert (crossed.verdict, crossed.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.created_test_required",
+    )
+    assert policy.decide(feature_task, source).rule_id == "tdd.red_required"
+    matching = policy.record_pytest(
+        feature_task,
+        target_first,
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_created.py::test_created",),
+            "assert False",
+        ),
+    )
     assert matching.verdict is PolicyVerdict.ALLOW
     assert policy.decide(feature_task, source).verdict is PolicyVerdict.ALLOW
 

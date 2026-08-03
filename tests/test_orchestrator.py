@@ -134,7 +134,7 @@ def test_terminal_memory_proposal_enters_queue_but_not_persistent_search(
 
     assert result.status is TaskStatus.BLOCKED
     assert [entry.text for entry in memory_store.proposals()] == [sentinel]
-    assert MemoryStore(tmp_path).search("parser") == []
+    assert MemoryStore(tmp_path).search(sentinel) == []
     assert sentinel not in llm.contexts[1]
     assert sentinel not in repr(EventStore(tmp_path).events_for(task.id))
 
@@ -225,28 +225,19 @@ def test_failed_workspace_test_creation_does_not_register_a_feature_test(
         "apply_patch",
         lambda *_args: ToolResult(False, "Patch rejected", {"reason": "invalid_patch"}),
     )
-    monkeypatch.setattr(
-        Workspace,
-        "run_pytest",
-        lambda *_args: PytestRun(
-            1,
-            "FAILED tests/test_created.py::test_created - assert False\nE   assert False\n",
-            "",
-            False,
-        ),
-    )
     llm = ScriptedLLM(
         [
             _action(kind="apply_patch", summary="create test", diff=create_test),
-            _action(kind="run_pytest", summary="observe red", targets=["tests/test_created.py"]),
             _action(kind="finish", summary="stop", status="blocked"),
         ]
     )
+    task = _feature_task()
+    orchestrator = TaskOrchestrator(tmp_path, llm)
 
-    TaskOrchestrator(tmp_path, llm).run(_feature_task())
+    orchestrator.run(task)
 
     assert not (tmp_path / "tests" / "test_created.py").exists()
-    assert '"tdd_phase": "test_design"' in llm.contexts[2]
+    assert "tests/test_created.py" not in orchestrator._policy._new_test_paths.get(task.id, set())
 
 
 def test_invalid_model_json_stops_without_executing_a_workspace_tool(

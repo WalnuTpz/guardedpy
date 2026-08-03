@@ -339,8 +339,8 @@ class PolicyEngine:
             for node_id in feedback.node_ids
         )
         return bool(target_paths and node_paths) and all(
-            path in created_paths for path in (*target_paths, *node_paths)
-        )
+            path in created_paths for path in target_paths
+        ) and all(path in target_paths for path in node_paths)
 
     def _path_category(self, task: TaskState, path: str) -> str:
         normalized_path = self._normalized_project_path(path)
