@@ -59,7 +59,7 @@ class _DemoOrchestrator(TaskOrchestrator):
 
 def create_demo_app() -> FastAPI:
     """Create the public, fixed-scenario surface without any local-control services."""
-    app = FastAPI()
+    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
     @app.get("/", response_class=HTMLResponse)

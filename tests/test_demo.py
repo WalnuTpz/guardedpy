@@ -53,6 +53,10 @@ def test_demo_routes_are_read_only_and_exclude_local_control_capabilities() -> N
         "/tasks/new",
         "/tasks/any/approval",
         "/memories",
+        "/openapi.json",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
         "/demo/scenarios/not-a-scenario",
     ):
         assert asyncio.run(_request(app, "GET", path)).status_code == 404
@@ -74,13 +78,19 @@ def test_demo_runs_real_governance_feedback_and_workspace_fixtures_without_comma
 
     assert dangerous.status is TaskStatus.BLOCKED
     assert dangerous.command_dispatches == ()
-    assert any(event.policy_verdict is PolicyVerdict.DENY for event in dangerous.events)
+    assert any(
+        event.policy_verdict is PolicyVerdict.DENY and event.action_summary == "run approved command"
+        for event in dangerous.events
+    )
     assert corrected.status is TaskStatus.COMPLETED
     assert corrected.source_value == "VALUE = 'fixed'\n"
     assert any(event.feedback_kind is FeedbackKind.ASSERTION_FAILURE for event in corrected.events)
     assert tdd_denied.status is TaskStatus.BLOCKED
     assert tdd_denied.source_value == "VALUE = 'broken'\n"
-    assert any(event.policy_verdict is PolicyVerdict.DENY for event in tdd_denied.events)
+    assert any(
+        event.policy_verdict is PolicyVerdict.DENY and event.action_summary == "apply source patch"
+        for event in tdd_denied.events
+    )
     assert original_state_home.exists() is False
     assert Path(os.environ["XDG_STATE_HOME"]) == original_state_home
 
