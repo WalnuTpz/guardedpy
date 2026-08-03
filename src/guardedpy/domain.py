@@ -77,6 +77,7 @@ class PolicyDecision(BaseModel):
     reason: str
     task_id: UUID | None = None
     action_hash: str | None = None
+    permanent_eligible: bool = False
 
 
 class FeedbackKind(StrEnum):

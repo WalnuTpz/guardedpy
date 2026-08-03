@@ -112,6 +112,8 @@ def approval_action_projection(action: Action) -> str | None:
         if error_rule is not None:
             return None
         return f"Paths: {', '.join(path for path, _created in operations)}"
+    if isinstance(action, RequestApprovalAction):
+        return "Approval request"
     return None
 
 
@@ -138,6 +140,7 @@ class PolicyEngine:
         self._read_paths: dict[UUID, set[str]] = {}
         self._feature_test_changes: set[UUID] = set()
         self._new_test_paths: dict[UUID, set[str]] = {}
+        self._baseline_recorded: set[UUID] = set()
         self._full_suite_green: set[UUID] = set()
         self._pending_approvals: set[tuple[UUID, str]] = set()
 
@@ -156,7 +159,12 @@ class PolicyEngine:
         if isinstance(action, ProposeMemoryAction):
             return self._memory_proposal_decision(task, action)
         if isinstance(action, RequestApprovalAction):
-            return self._allow(task, action, "approval.requested", "approval request is recorded")
+            return self._approval_required(
+                task,
+                action,
+                "approval.requested",
+                "explicit user approval is required",
+            )
         if isinstance(action, FinishAction):
             return self._finish_decision(task, action)
         raise TypeError(f"unsupported action: {type(action).__name__}")
@@ -195,6 +203,18 @@ class PolicyEngine:
             raise ValueError("created path must be a root-contained test path")
         self._new_test_paths.setdefault(task.id, set()).add(normalized_path)
 
+    def audit_feedback_node(self, task: TaskState, node_id: str) -> str | None:
+        """Project an untrusted pytest node to its root-relative configured test path."""
+        path = node_id.split("::", maxsplit=1)[0]
+        normalized_path = self._normalized_project_path(path)
+        if (
+            normalized_path is None
+            or self._path_category(task, normalized_path) != "test"
+            or not (self._project_root / normalized_path).is_file()
+        ):
+            return None
+        return normalized_path
+
     def record_delete(
         self, task: TaskState, action: DeletePathAction, decision: PolicyDecision
     ) -> PolicyDecision:
@@ -211,6 +231,8 @@ class PolicyEngine:
         decision = self.decide(task, action)
         if decision.verdict is not PolicyVerdict.ALLOW:
             return decision
+        if task.tdd_phase is TddPhase.TEST_DESIGN and task.id not in self._baseline_recorded:
+            return self._record_starting_baseline(task, action, feedback)
         if feedback.kind is FeedbackKind.ASSERTION_FAILURE:
             if task.tdd_phase is not TddPhase.TEST_DESIGN:
                 return self._deny(task, None, "tdd.red_out_of_sequence", "red result is out of sequence")
@@ -231,7 +253,9 @@ class PolicyEngine:
                     "a feature red result must target its successfully created test",
                 )
             if task.mode is TaskMode.BUGFIX and (
-                task.bugfix_target is None or feedback.node_ids != (task.bugfix_target,)
+                action.targets
+                or task.bugfix_target is None
+                or feedback.node_ids != (task.bugfix_target,)
             ):
                 return self._deny(
                     task,
@@ -259,6 +283,48 @@ class PolicyEngine:
         if not action.targets:
             self._full_suite_green.add(task.id)
         return self._allow(task, None, "tdd.green_recorded", "green pytest result recorded")
+
+    def _record_starting_baseline(
+        self, task: TaskState, action: RunPytestAction, feedback: PytestFeedback
+    ) -> PolicyDecision:
+        """Record only target-free evidence that proves the task's starting suite state."""
+        if action.targets:
+            return self._deny(
+                task,
+                None,
+                "tdd.baseline_required",
+                "a target-free configured suite run is required before changes",
+            )
+        if feedback.kind is FeedbackKind.PASSED:
+            self._baseline_recorded.add(task.id)
+            return self._allow(
+                task,
+                None,
+                "tdd.baseline_recorded",
+                "passing task-start baseline recorded",
+            )
+        if (
+            task.mode is TaskMode.BUGFIX
+            and feedback.kind is FeedbackKind.ASSERTION_FAILURE
+            and task.bugfix_target is not None
+            and feedback.node_ids == (task.bugfix_target,)
+        ):
+            self._baseline_recorded.add(task.id)
+            task.tdd_phase = TddPhase.RED_OBSERVED
+            return self._allow(task, None, "tdd.red_recorded", "red pytest result recorded")
+        if task.mode is TaskMode.BUGFIX:
+            return self._deny(
+                task,
+                None,
+                "tdd.bugfix_target_assertion_required",
+                "a bugfix baseline must pass or fail only its selected assertion target",
+            )
+        return self._deny(
+            task,
+            None,
+            "tdd.baseline_pass_required",
+            "a feature baseline must pass before tests change",
+        )
 
     def request_approval(self, task: TaskState, action: Action) -> PolicyDecision:
         """Register one pending approval when the proposed action needs one."""
@@ -290,7 +356,6 @@ class PolicyEngine:
             return self._deny(None, action, "approval.declined", "user declined the action")
         if decision == "always":
             if not isinstance(action, RunCommandAction):
-                self._pending_approvals.remove(approval_key)
                 return self._deny(
                     None,
                     action,
@@ -360,6 +425,20 @@ class PolicyEngine:
             return self._deny(task, action, "tdd.red_required", "source patch requires an observed red test")
         if category == "test" and task.tdd_phase is not TddPhase.TEST_DESIGN:
             return self._deny(task, action, "tdd.test_design_required", "test changes must start the TDD sequence")
+        if category == "test" and task.mode is TaskMode.FEATURE and task.id not in self._baseline_recorded:
+            return self._deny(
+                task,
+                action,
+                "tdd.baseline_required",
+                "feature tests require a passing task-start baseline",
+            )
+        if category == "source" and task.id not in self._baseline_recorded:
+            return self._deny(
+                task,
+                action,
+                "tdd.baseline_required",
+                "source changes require recorded task-start baseline evidence",
+            )
         if category == "source" and created_paths and not self._new_test_paths.get(task.id):
             return self._deny(
                 task,
@@ -392,8 +471,29 @@ class PolicyEngine:
         if self._is_sensitive_path(normalized_path):
             return self._deny(task, action, "path.sensitive", "credentials and harness configuration are unavailable")
         category = self._path_category(task, normalized_path)
+        if category == "test" and task.tdd_phase is not TddPhase.TEST_DESIGN:
+            return self._deny(
+                task,
+                action,
+                "tdd.test_delete_phase",
+                "tests may be deleted only during test design",
+            )
+        if category == "test" and task.mode is TaskMode.FEATURE and task.id not in self._baseline_recorded:
+            return self._deny(
+                task,
+                action,
+                "tdd.baseline_required",
+                "feature tests require a passing task-start baseline",
+            )
         if category == "source" and task.tdd_phase is not TddPhase.RED_OBSERVED:
             return self._deny(task, action, "tdd.red_required", "source deletion requires an observed red test")
+        if category == "source" and task.id not in self._baseline_recorded:
+            return self._deny(
+                task,
+                action,
+                "tdd.baseline_required",
+                "source changes require recorded task-start baseline evidence",
+            )
         return self._approval_required(task, action, "delete.approval_required", "deletion requires approval")
 
     def _command_decision(self, task: TaskState, action: RunCommandAction) -> PolicyDecision:
@@ -590,6 +690,7 @@ class PolicyEngine:
             reason=reason,
             task_id=task.id,
             action_hash=stable_hash(action),
+            permanent_eligible=isinstance(action, RunCommandAction),
         )
 
     @staticmethod

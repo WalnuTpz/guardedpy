@@ -39,9 +39,10 @@ def test_append_projects_an_action_and_feedback_without_persisting_their_text(
             action=action,
             policy_verdict=PolicyVerdict.ALLOW,
             approval_granted=True,
+            permanent_eligible=True,
             feedback=FeedbackAudit(
                 kind=FeedbackKind.ASSERTION_FAILURE,
-                node_id="tests/sk-short-key.py::test_projection",
+                node_id="tests/test_projection.py::test_projection",
             ),
             retry_count=2,
             stop_reason=StopReason.ROUND_LIMIT,
@@ -53,8 +54,10 @@ def test_append_projects_an_action_and_feedback_without_persisting_their_text(
     assert stored.action_hash == action.stable_hash()
     assert stored.policy_verdict is PolicyVerdict.ALLOW
     assert stored.approval_granted is True
+    assert stored.permanent_eligible is True
     assert stored.feedback_kind is FeedbackKind.ASSERTION_FAILURE
     assert stored.feedback_excerpt == "pytest assertion failure"
+    assert stored.feedback_node_id == "tests/test_projection.py::test_projection"
     assert stored.retry_count == 2
     assert stored.stop_reason is StopReason.ROUND_LIMIT
     assert "sk-short-key" not in repr(stored)
@@ -62,11 +65,15 @@ def test_append_projects_an_action_and_feedback_without_persisting_their_text(
 
     with sqlite3.connect(store.database_path) as connection:
         stored_feedback = connection.execute(
-            "SELECT feedback_kind, feedback_excerpt FROM events WHERE task_id = ?",
+            "SELECT feedback_kind, feedback_excerpt, feedback_node_id FROM events WHERE task_id = ?",
             (str(task_id),),
         ).fetchone()
         columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
-    assert stored_feedback == ("assertion_failure", "pytest assertion failure")
+    assert stored_feedback == (
+        "assertion_failure",
+        "pytest assertion failure",
+        "tests/test_projection.py::test_projection",
+    )
     assert columns == {
         "id",
         "task_id",
@@ -77,10 +84,79 @@ def test_append_projects_an_action_and_feedback_without_persisting_their_text(
         "approval_granted",
         "feedback_kind",
         "feedback_excerpt",
+        "feedback_node_id",
         "retry_count",
         "stop_reason",
         "created_at",
     }
+
+
+def test_feedback_audit_rejects_node_identifier_over_fixed_bound() -> None:
+    """Catches untrusted pytest node identifiers bypassing the audit size limit."""
+    with pytest.raises(ValidationError):
+        FeedbackAudit(kind=FeedbackKind.ASSERTION_FAILURE, node_id="n" * 501)
+
+
+def test_legacy_sqlite_schema_migrates_permanent_eligibility_and_feedback_node(
+    store: EventStore,
+) -> None:
+    """Catches additive audit fields making an existing local event database unusable."""
+    with sqlite3.connect(store.database_path) as connection:
+        connection.executescript(
+            """
+            DROP TABLE event_policies;
+            DROP TABLE events;
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                task_status TEXT NOT NULL,
+                action_summary TEXT,
+                action_hash TEXT,
+                policy_verdict TEXT,
+                approval_granted INTEGER,
+                feedback_kind TEXT,
+                feedback_excerpt TEXT,
+                retry_count INTEGER,
+                stop_reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE event_policies (
+                event_id INTEGER PRIMARY KEY,
+                rule_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                action_projection TEXT,
+                FOREIGN KEY(event_id) REFERENCES events(id)
+            );
+            """
+        )
+
+    migrated = EventStore(store.project_root)
+    task_id = uuid4()
+    migrated.append(
+        RunEvent(
+            task_id=task_id,
+            task_status=TaskStatus.WAITING_APPROVAL,
+            policy_verdict=PolicyVerdict.APPROVAL_REQUIRED,
+            policy_rule_id="command.approval_required",
+            policy_reason="the constrained command requires approval",
+            permanent_eligible=True,
+            feedback=FeedbackAudit(
+                kind=FeedbackKind.ASSERTION_FAILURE,
+                node_id="tests/test_projection.py::test_projection",
+            ),
+        )
+    )
+
+    stored = migrated.events_for(task_id)[0]
+    assert stored.permanent_eligible is True
+    assert stored.feedback_node_id == "tests/test_projection.py::test_projection"
+    with sqlite3.connect(store.database_path) as connection:
+        event_columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+        policy_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(event_policies)")
+        }
+    assert "feedback_node_id" in event_columns
+    assert "permanent_eligible" in policy_columns
 
 
 def test_store_database_is_created_in_external_app_state(

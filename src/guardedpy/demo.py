@@ -153,7 +153,7 @@ def _responses_for(name: str) -> list[str]:
     ]
     corrective = [
         _action(kind="read_file", summary="inspect value", path="src/value.py"),
-        _action(kind="run_pytest", summary="observe failure", targets=["tests/test_value.py"]),
+        _action(kind="run_pytest", summary="observe failure", targets=[]),
         _action(
             kind="apply_patch",
             summary="repair value",

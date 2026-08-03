@@ -78,7 +78,7 @@ def test_scripted_loop_returns_failure_feedback_then_corrects_and_completes(
     llm = ScriptedLLM(
         [
             _action(kind="read_file", summary="inspect value", path="src/value.py"),
-            _action(kind="run_pytest", summary="observe failure", targets=["tests/test_value.py"]),
+            _action(kind="run_pytest", summary="observe failure", targets=[]),
             _action(
                 kind="apply_patch",
                 summary="repair value",
@@ -148,6 +148,9 @@ def test_orchestrator_records_a_normalized_created_test_before_source_creation(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_existing.py").write_text(
+        "def test_existing() -> None:\n    assert True\n"
+    )
     create_test = """--- /dev/null
 +++ b/src/../tests/test_created.py
 @@ -0,0 +1,2 @@
@@ -161,6 +164,7 @@ def test_orchestrator_records_a_normalized_created_test_before_source_creation(
 """
     llm = ScriptedLLM(
         [
+            _action(kind="run_pytest", summary="establish baseline", targets=[]),
             _action(kind="apply_patch", summary="create test", diff=create_test),
             _action(kind="run_pytest", summary="observe red", targets=["tests/test_created.py"]),
             _action(kind="apply_patch", summary="create source", diff=create_source),
@@ -181,6 +185,9 @@ def test_source_spelled_through_tests_parent_does_not_register_as_a_test_or_cras
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "src").mkdir()
     (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_existing.py").write_text(
+        "def test_existing() -> None:\n    assert True\n"
+    )
     create_test = """--- /dev/null
 +++ b/tests/test_created.py
 @@ -0,0 +1,2 @@
@@ -195,6 +202,7 @@ def test_source_spelled_through_tests_parent_does_not_register_as_a_test_or_cras
     task = _feature_task()
     llm = ScriptedLLM(
         [
+            _action(kind="run_pytest", summary="establish baseline", targets=[]),
             _action(kind="apply_patch", summary="create test", diff=create_test),
             _action(kind="run_pytest", summary="observe red", targets=["tests/test_created.py"]),
             _action(kind="apply_patch", summary="create source", diff=create_source),
@@ -215,6 +223,9 @@ def test_failed_workspace_test_creation_does_not_register_a_feature_test(
     """Catches a failed atomic create supplying feature red evidence anyway."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_existing.py").write_text(
+        "def test_existing() -> None:\n    assert True\n"
+    )
     create_test = """--- /dev/null
 +++ b/tests/test_created.py
 @@ -0,0 +1,2 @@
@@ -229,6 +240,7 @@ def test_failed_workspace_test_creation_does_not_register_a_feature_test(
     )
     llm = ScriptedLLM(
         [
+            _action(kind="run_pytest", summary="establish baseline", targets=[]),
             _action(kind="apply_patch", summary="create test", diff=create_test),
             _action(kind="finish", summary="stop", status="blocked"),
         ]
@@ -426,6 +438,114 @@ def test_exact_approved_action_executes_once_and_keeps_full_action_out_of_event_
     assert '"kind":"delete_path"' not in audit
 
 
+def test_explicit_approval_request_pauses_with_safe_nonpermanent_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches explicit HITL being treated as ordinary feedback and exposing model reason."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    sentinel = "SENTINEL-MODEL-APPROVAL-REASON"
+    request = _action(
+        kind="request_approval",
+        summary="ask for judgment",
+        reason=sentinel,
+    )
+    llm = ScriptedLLM([request, _action(kind="finish", summary="stop", status="blocked")])
+    task = _bugfix_task()
+
+    waiting = TaskOrchestrator(tmp_path, llm).run(task)
+    pending = EventStore(tmp_path).events_for(task.id)[-1]
+
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    assert len(llm.contexts) == 1
+    assert pending.action_projection == "Approval request"
+    assert pending.permanent_eligible is False
+    assert sentinel not in repr(pending)
+
+
+def test_rejecting_explicit_approval_request_blocks_without_resuming_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches rejection consuming the pause without producing a blocked terminal state."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    llm = ScriptedLLM(
+        [
+            _action(kind="request_approval", summary="ask", reason="human judgment needed"),
+            _action(kind="finish", summary="must not resume", status="blocked"),
+        ]
+    )
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(tmp_path, llm)
+
+    waiting = orchestrator.run(task)
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+
+    accepted = orchestrator.resolve_approval(task.id, action_hash or "", decision="reject")
+
+    assert accepted is False
+    assert task.status is TaskStatus.BLOCKED
+    assert len(llm.contexts) == 1
+    assert EventStore(tmp_path).events_for(task.id)[-1].approval_granted is False
+
+
+def test_allow_once_on_explicit_approval_request_resumes_without_tool_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches consent executing a phantom tool or failing to resume the next model round."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace_calls: list[str] = []
+    monkeypatch.setattr(
+        Workspace,
+        "list_files",
+        lambda *_args: workspace_calls.append("list_files"),
+    )
+    llm = ScriptedLLM(
+        [
+            _action(kind="request_approval", summary="ask", reason="human judgment needed"),
+            _action(kind="finish", summary="stop after consent", status="blocked"),
+        ]
+    )
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(tmp_path, llm)
+
+    waiting = orchestrator.run(task)
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+
+    accepted = orchestrator.resolve_approval(task.id, action_hash or "", decision="once")
+    resumed = orchestrator.run(task)
+
+    assert accepted is True
+    assert resumed.status is TaskStatus.BLOCKED
+    assert len(llm.contexts) == 2
+    assert workspace_calls == []
+
+
+def test_forged_always_for_explicit_approval_request_keeps_exact_pending_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches invalid permanent consent consuming a non-command approval request."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(
+        tmp_path,
+        ScriptedLLM(
+            [_action(kind="request_approval", summary="ask", reason="human judgment needed")]
+        ),
+    )
+
+    waiting = orchestrator.run(task)
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+
+    forged = orchestrator.resolve_approval(task.id, action_hash or "", decision="always")
+
+    assert forged is False
+    assert task.status is TaskStatus.WAITING_APPROVAL
+    assert orchestrator.resolve_approval(task.id, action_hash or "", decision="once") is True
+    assert task.status is TaskStatus.RUNNING
+
+
 def test_once_approval_is_consumed_without_creating_a_persistent_rule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -578,7 +698,7 @@ def test_failed_patch_does_not_advance_tdd_phase_before_the_tool_succeeds(
     task.bugfix_target = "tests/test_value.py::test_stays_red"
     llm = ScriptedLLM(
         [
-            _action(kind="run_pytest", summary="observe red", targets=["tests/test_value.py"]),
+            _action(kind="run_pytest", summary="observe red", targets=[]),
             _action(kind="read_file", summary="inspect value", path="src/value.py"),
             _action(
                 kind="apply_patch",
@@ -620,6 +740,118 @@ def test_pytest_execution_error_does_not_count_as_the_required_red_observation(
     TaskOrchestrator(tmp_path, llm).run(task)
 
     assert '"tdd_phase": "test_design"' in llm.contexts[1]
+
+
+def test_pytest_audit_discards_failed_token_outside_configured_test_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches arbitrary bounded stdout tokens being persisted as pytest node IDs."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    sentinel = "sk-fake-feedback-token"
+    monkeypatch.setattr(
+        Workspace,
+        "run_pytest",
+        lambda *_args: PytestRun(
+            1,
+            f"FAILED {sentinel} - AssertionError\nE   AssertionError\n",
+            "",
+            False,
+        ),
+    )
+    task = _bugfix_task()
+    llm = ScriptedLLM(
+        [
+            _action(kind="run_pytest", summary="run configured suite", targets=[]),
+            _action(kind="finish", summary="stop", status="blocked"),
+        ]
+    )
+
+    TaskOrchestrator(tmp_path, llm).run(task)
+
+    feedback_event = next(
+        event
+        for event in EventStore(tmp_path).events_for(task.id)
+        if event.feedback_kind is not None
+    )
+    assert feedback_event.feedback_node_id is None
+    assert sentinel not in repr(feedback_event)
+
+
+def test_pytest_audit_discards_untrusted_suffix_from_rooted_test_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches parametrized or forged node suffix text entering persistent audit data."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_value.py").write_text(
+        "def test_value() -> None:\n    assert True\n"
+    )
+    sentinel = "sk-fake-node-suffix"
+    monkeypatch.setattr(
+        Workspace,
+        "run_pytest",
+        lambda *_args: PytestRun(
+            1,
+            f"FAILED tests/test_value.py::{sentinel} - AssertionError\n"
+            "E   AssertionError\n",
+            "",
+            False,
+        ),
+    )
+    task = _bugfix_task()
+    llm = ScriptedLLM(
+        [
+            _action(kind="run_pytest", summary="run configured suite", targets=[]),
+            _action(kind="finish", summary="stop", status="blocked"),
+        ]
+    )
+
+    TaskOrchestrator(tmp_path, llm).run(task)
+
+    feedback_event = next(
+        event
+        for event in EventStore(tmp_path).events_for(task.id)
+        if event.feedback_kind is not None
+    )
+    assert feedback_event.feedback_node_id == "tests/test_value.py"
+    assert sentinel not in repr(feedback_event)
+
+
+def test_pytest_audit_discards_nonexistent_path_inside_configured_test_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a forged root-looking FAILED path being treated as a real test file."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    sentinel = "tests/sk-fake-test-path.py"
+    monkeypatch.setattr(
+        Workspace,
+        "run_pytest",
+        lambda *_args: PytestRun(
+            1,
+            f"FAILED {sentinel} - AssertionError\nE   AssertionError\n",
+            "",
+            False,
+        ),
+    )
+    task = _bugfix_task()
+
+    TaskOrchestrator(
+        tmp_path,
+        ScriptedLLM(
+            [
+                _action(kind="run_pytest", summary="run configured suite", targets=[]),
+                _action(kind="finish", summary="stop", status="blocked"),
+            ]
+        ),
+    ).run(task)
+
+    feedback_event = next(
+        event
+        for event in EventStore(tmp_path).events_for(task.id)
+        if event.feedback_kind is not None
+    )
+    assert feedback_event.feedback_node_id is None
+    assert sentinel not in repr(feedback_event)
 
 
 def test_approved_action_consumes_its_original_round_budget_before_resuming(
@@ -677,11 +909,14 @@ def test_successful_approved_delete_invalidates_full_suite_green_before_finish(
     """Catches a delete succeeding after green while completed finish remains permitted."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "tests").mkdir()
-    target = tmp_path / "tests" / "test_obsolete.py"
-    target.write_text("def test_still_green() -> None:\n    assert True\n")
+    (tmp_path / "tests" / "test_still_green.py").write_text(
+        "def test_still_green() -> None:\n    assert True\n"
+    )
+    target = tmp_path / "obsolete.txt"
+    target.write_text("remove after approval\n")
     task = _bugfix_task()
     task.tdd_phase = TddPhase.IMPLEMENTATION
-    delete = _action(kind="delete_path", summary="delete obsolete test", path="tests/test_obsolete.py")
+    delete = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     llm = ScriptedLLM(
         [
             _action(kind="run_pytest", summary="run full suite", targets=[]),
@@ -739,7 +974,13 @@ def test_allowed_patch_exception_stops_and_audits_the_failed_action(
     """Catches source-patch failures escaping after a permitted read and red test."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
     (tmp_path / "src" / "value.py").write_text("VALUE = 'broken'\n")
+    (tmp_path / "tests" / "test_value.py").write_text(
+        "from pathlib import Path\n\n"
+        "def test_value_is_fixed() -> None:\n"
+        "    assert Path('src/value.py').read_text() == \"VALUE = 'fixed'\\n\"\n"
+    )
 
     def raise_patch(*_args: object, **_kwargs: object) -> object:
         raise OSError("patch failed")
@@ -751,11 +992,16 @@ def test_allowed_patch_exception_stops_and_audits_the_failed_action(
         diff="--- a/src/value.py\n+++ b/src/value.py\n@@ -1 +1 @@\n-VALUE = 'broken'\n+VALUE = 'fixed'\n",
     )
     task = _bugfix_task()
-    task.tdd_phase = TddPhase.RED_OBSERVED
 
     stopped = TaskOrchestrator(
         tmp_path,
-        ScriptedLLM([_action(kind="read_file", summary="inspect value", path="src/value.py"), patch]),
+        ScriptedLLM(
+            [
+                _action(kind="run_pytest", summary="establish broken baseline", targets=[]),
+                _action(kind="read_file", summary="inspect value", path="src/value.py"),
+                patch,
+            ]
+        ),
     ).run(task)
 
     event = EventStore(tmp_path).events_for(task.id)[-1]

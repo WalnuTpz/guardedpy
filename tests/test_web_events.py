@@ -165,7 +165,8 @@ def test_task_detail_and_events_expose_only_stored_audit_projection(
     assert payload
     assert all(set(event) == {
         "task_id", "task_status", "action_summary", "action_hash", "policy_verdict",
-        "approval_granted", "feedback_kind", "feedback_excerpt", "retry_count",
+        "approval_granted", "permanent_eligible", "feedback_kind", "feedback_excerpt",
+        "feedback_node_id", "retry_count",
         "action_projection", "affected_project", "policy_rule_id", "policy_reason",
         "stop_reason", "id", "created_at",
     } for event in payload)

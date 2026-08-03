@@ -37,7 +37,14 @@ from guardedpy.domain import (
     TaskStatus,
     is_approval_decision,
 )
-from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason, safe_action_projection
+from guardedpy.events import (
+    FEEDBACK_NODE_ID_MAX_LENGTH,
+    EventStore,
+    FeedbackAudit,
+    RunEvent,
+    StopReason,
+    safe_action_projection,
+)
 from guardedpy.feedback import FeedbackCollector, PytestFeedback
 from guardedpy.llm import LLMClient, TemporaryProviderFailure
 from guardedpy.memory import MemoryStore
@@ -135,7 +142,7 @@ class TaskOrchestrator:
             loop.next_round += 1
 
             action_hash = stable_hash(action)
-            repeat_key = self._repeat_key(action)
+            repeat_key = self._repeat_key(task, action)
             if repeat_key in loop.seen_actions:
                 with self._state_lock:
                     if self._is_cancelled(task):
@@ -253,13 +260,24 @@ class TaskOrchestrator:
             return False
         with self._state_lock:
             key = (task_id, action_hash)
-            pending = self._pending.pop(key, None)
+            pending = self._pending.get(key)
             task = self._tasks.get(task_id)
             if pending is None or task is None or task.status is not TaskStatus.WAITING_APPROVAL:
                 return False
             action, pending_decision, round_number = pending
             approval = self._policy.apply_approval(pending_decision, action, decision=decision)
             if approval.verdict is not PolicyVerdict.ALLOW:
+                if decision == "always" and not pending_decision.permanent_eligible:
+                    self._events.append(
+                        self._decision_event(
+                            task,
+                            action,
+                            approval,
+                            approval_granted=False,
+                        )
+                    )
+                    return False
+                self._pending.pop(key)
                 task.status = TaskStatus.BLOCKED
                 self._events.append(
                     self._decision_event(
@@ -273,12 +291,19 @@ class TaskOrchestrator:
                 return False
             if self._is_cancelled(task):
                 return False
+            self._pending.pop(key)
             task.status = TaskStatus.RUNNING
             self._events.append(
                 self._decision_event(
                     task, action, approval, approval_granted=True
                 )
             )
+            if isinstance(action, RequestApprovalAction):
+                self._feedback[task.id] = {
+                    "type": "approval_result",
+                    "approved": True,
+                }
+                return True
             try:
                 self._execute_allowed(task, action, approval, round_number)
             except Exception:
@@ -327,6 +352,11 @@ class TaskOrchestrator:
             feedback = self._feedback_collector.collect(run)
             self._policy.record_pytest(task, action, feedback)
             self._feedback[task.id] = self._pytest_feedback(feedback)
+            feedback_node = (
+                self._policy.audit_feedback_node(task, feedback.node_ids[0])
+                if feedback.node_ids
+                else None
+            )
             self._events.append(
                 self._decision_event(
                     task,
@@ -334,7 +364,11 @@ class TaskOrchestrator:
                     decision,
                     feedback=FeedbackAudit(
                         kind=feedback.kind,
-                        node_id=feedback.node_ids[0] if feedback.node_ids else None,
+                        node_id=(
+                            feedback_node[:FEEDBACK_NODE_ID_MAX_LENGTH]
+                            if feedback_node is not None
+                            else None
+                        ),
                     ),
                     retry_count=round_number,
                 )
@@ -343,10 +377,6 @@ class TaskOrchestrator:
         if isinstance(action, RunCommandAction):
             result = self._run_command(action)
             self._record_tool_result(task, action, decision, result, round_number)
-            return
-        if isinstance(action, RequestApprovalAction):
-            self._feedback[task.id] = {"type": "approval_request", "recorded": True}
-            self._record_decision(task, action, decision, round_number)
             return
         if isinstance(action, ProposeMemoryAction):
             self._memory_store.propose(task.id, action.text)
@@ -434,6 +464,7 @@ class TaskOrchestrator:
             action_projection=safe_action_projection(action, decision),
             policy_rule_id=decision.rule_id,
             policy_reason=decision.reason,
+            permanent_eligible=decision.permanent_eligible,
             **fields,
         )
 
@@ -454,10 +485,15 @@ class TaskOrchestrator:
         }
 
     @staticmethod
-    def _repeat_key(action: Action) -> str:
+    def _repeat_key(task: TaskState, action: Action) -> str:
         """Identify repeated operations without letting user-facing wording alter the key."""
+        repeat_identity: dict[str, object] = {
+            "action": action.model_dump(mode="json", exclude={"summary"})
+        }
+        if isinstance(action, RunPytestAction):
+            repeat_identity["tdd_phase"] = task.tdd_phase.value
         canonical = json.dumps(
-            action.model_dump(mode="json", exclude={"summary"}),
+            repeat_identity,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,

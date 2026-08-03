@@ -9,6 +9,7 @@ from guardedpy.actions import (
     FinishAction,
     ProposeMemoryAction,
     ReadFileAction,
+    RequestApprovalAction,
     RunCommandAction,
     RunPytestAction,
 )
@@ -61,6 +62,30 @@ SECOND_NEW_TEST_DIFF = """--- /dev/null
 """
 
 
+def _record_passing_baseline(policy: PolicyEngine, task: TaskState) -> None:
+    decision = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="establish baseline", targets=()),
+        PytestFeedback(FeedbackKind.PASSED, (), ""),
+    )
+    assert decision.verdict is PolicyVerdict.ALLOW
+
+
+def _record_bugfix_red_baseline(policy: PolicyEngine, task: TaskState) -> None:
+    task.tdd_phase = TddPhase.TEST_DESIGN
+    assert task.bugfix_target is not None
+    decision = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="establish broken baseline", targets=()),
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            (task.bugfix_target,),
+            "assert actual == expected",
+        ),
+    )
+    assert decision.verdict is PolicyVerdict.ALLOW
+
+
 @pytest.fixture
 def policy(tmp_path: Path) -> PolicyEngine:
     return PolicyEngine(tmp_path)
@@ -79,11 +104,64 @@ def test_feature_can_create_test_before_red_without_prior_read(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
     """Catches new tests inheriting the read requirement for existing files."""
+    _record_passing_baseline(policy, feature_task)
     result = policy.decide(
         feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
     )
 
     assert result.verdict is PolicyVerdict.ALLOW
+
+
+def test_feature_records_target_free_passing_suite_as_task_start_baseline(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches a healthy starting suite being rejected or mistaken for final green."""
+    baseline = policy.record_pytest(
+        feature_task,
+        RunPytestAction(kind="run_pytest", summary="establish baseline", targets=()),
+        PytestFeedback(FeedbackKind.PASSED, (), ""),
+    )
+
+    assert (baseline.verdict, baseline.rule_id) == (
+        PolicyVerdict.ALLOW,
+        "tdd.baseline_recorded",
+    )
+    assert feature_task.tdd_phase is TddPhase.TEST_DESIGN
+
+
+def test_feature_test_patch_requires_target_free_passing_baseline(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches feature tests changing before the configured suite is proven healthy."""
+    patch = ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
+
+    before_baseline = policy.decide(feature_task, patch)
+    policy.record_pytest(
+        feature_task,
+        RunPytestAction(
+            kind="run_pytest",
+            summary="targeted pass is not a baseline",
+            targets=("tests/test_existing.py",),
+        ),
+        PytestFeedback(FeedbackKind.PASSED, (), ""),
+    )
+    after_targeted_pass = policy.decide(feature_task, patch)
+    policy.record_pytest(
+        feature_task,
+        RunPytestAction(kind="run_pytest", summary="establish baseline", targets=()),
+        PytestFeedback(FeedbackKind.PASSED, (), ""),
+    )
+    after_full_suite_pass = policy.decide(feature_task, patch)
+
+    assert (before_baseline.verdict, before_baseline.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.baseline_required",
+    )
+    assert (after_targeted_pass.verdict, after_targeted_pass.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.baseline_required",
+    )
+    assert after_full_suite_pass.verdict is PolicyVerdict.ALLOW
 
 
 def test_new_source_file_requires_a_created_test_then_selected_red(
@@ -94,6 +172,7 @@ def test_new_source_file_requires_a_created_test_then_selected_red(
     source_patch = ApplyPatchAction(kind="apply_patch", summary="add source", diff=NEW_SOURCE_DIFF)
 
     assert policy.decide(feature_task, source_patch).rule_id == "tdd.red_required"
+    _record_passing_baseline(policy, feature_task)
     assert policy.decide(feature_task, test_patch).verdict is PolicyVerdict.ALLOW
     assert policy.record_patch(feature_task, test_patch).verdict is PolicyVerdict.ALLOW
     policy.record_new_test_path(feature_task, "tests/test_created.py")
@@ -129,6 +208,7 @@ def test_feature_task_records_red_only_after_a_test_patch(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
     """Catches a transition that accepts an unrelated failing test as feature TDD evidence."""
+    _record_passing_baseline(policy, feature_task)
     target_run = RunPytestAction(
         kind="run_pytest", summary="run new test", targets=("tests/test_created.py",)
     )
@@ -168,6 +248,7 @@ def test_feature_red_requires_registered_created_test_target_and_feedback(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
     """Catches an unrelated assertion failure unlocking a new source file."""
+    _record_passing_baseline(policy, feature_task)
     created_test = ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
     source = ApplyPatchAction(kind="apply_patch", summary="add source", diff=NEW_SOURCE_DIFF)
     policy.record_patch(feature_task, created_test)
@@ -207,6 +288,7 @@ def test_feature_red_feedback_must_match_its_own_created_test_target(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
     """Catches feedback from a second created test unlocking the first test's run."""
+    _record_passing_baseline(policy, feature_task)
     first = ApplyPatchAction(kind="apply_patch", summary="add first test", diff=NEW_TEST_DIFF)
     second = ApplyPatchAction(kind="apply_patch", summary="add second test", diff=SECOND_NEW_TEST_DIFF)
     policy.record_patch(feature_task, first)
@@ -253,7 +335,7 @@ def test_bugfix_only_selected_assertion_failure_records_red(
     feature_task.mode = TaskMode.BUGFIX
     feature_task.bugfix_target = "tests/test_parser.py::test_bad_input"
     pytest_action = RunPytestAction(
-        kind="run_pytest", summary="run selected regression", targets=(feature_task.bugfix_target,)
+        kind="run_pytest", summary="run configured suite", targets=()
     )
 
     decision = policy.record_pytest(
@@ -287,7 +369,7 @@ def test_bugfix_red_requires_exactly_the_selected_assertion_node(
     """Catches a selected bugfix target being bypassed by an unrelated assertion failure."""
     config = HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",))
     selected = "tests/test_parser.py::test_bad_input"
-    action = RunPytestAction(kind="run_pytest", summary="run regression", targets=(selected,))
+    action = RunPytestAction(kind="run_pytest", summary="run configured suite", targets=())
     target_task = TaskState(
         description="Repair parser", mode=TaskMode.BUGFIX, bugfix_target=selected, config=config
     )
@@ -315,6 +397,122 @@ def test_bugfix_red_requires_exactly_the_selected_assertion_node(
     assert unrelated_task.tdd_phase is TddPhase.TEST_DESIGN
 
 
+def test_bugfix_target_free_sole_selected_failure_records_baseline_and_red(
+    policy: PolicyEngine, tmp_path: Path
+) -> None:
+    """Catches a valid broken baseline failing to unlock bugfix implementation."""
+    selected = "tests/test_parser.py::test_bad_input"
+    unbaselined = TaskState(
+        description="Persisted red without baseline evidence",
+        mode=TaskMode.BUGFIX,
+        bugfix_target=selected,
+        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+        tdd_phase=TddPhase.RED_OBSERVED,
+    )
+    policy.record_read(
+        unbaselined,
+        ReadFileAction(kind="read_file", summary="read parser", path="src/example.py"),
+    )
+    source_patch = ApplyPatchAction(
+        kind="apply_patch", summary="repair parser", diff=SOURCE_DIFF
+    )
+
+    without_baseline = policy.decide(unbaselined, source_patch)
+
+    assert (without_baseline.verdict, without_baseline.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.baseline_required",
+    )
+
+    task = TaskState(
+        description="Repair parser",
+        mode=TaskMode.BUGFIX,
+        bugfix_target=selected,
+        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+    )
+
+    recorded = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="run configured suite", targets=()),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert actual == expected"),
+    )
+    policy.record_read(
+        task,
+        ReadFileAction(kind="read_file", summary="read parser", path="src/example.py"),
+    )
+    source = policy.decide(task, source_patch)
+
+    assert (recorded.verdict, recorded.rule_id) == (
+        PolicyVerdict.ALLOW,
+        "tdd.red_recorded",
+    )
+    assert task.tdd_phase is TddPhase.RED_OBSERVED
+    assert source.verdict is PolicyVerdict.ALLOW
+
+
+def test_bugfix_targeted_selected_failure_does_not_establish_baseline_or_red(
+    policy: PolicyEngine
+) -> None:
+    """Catches a targeted run claiming that the unrelated starting suite is healthy."""
+    selected = "tests/test_parser.py::test_bad_input"
+    task = TaskState(
+        description="Repair parser",
+        mode=TaskMode.BUGFIX,
+        bugfix_target=selected,
+        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+    )
+
+    targeted = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="run selected test", targets=(selected,)),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert actual == expected"),
+    )
+
+    assert (targeted.verdict, targeted.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.baseline_required",
+    )
+    assert task.tdd_phase is TddPhase.TEST_DESIGN
+
+
+def test_bugfix_target_free_unrelated_failure_does_not_establish_baseline_or_red(
+    policy: PolicyEngine
+) -> None:
+    """Catches an unrelated broken baseline authorizing changes outside the selected bug."""
+    selected = "tests/test_parser.py::test_bad_input"
+    task = TaskState(
+        description="Repair parser",
+        mode=TaskMode.BUGFIX,
+        bugfix_target=selected,
+        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+    )
+
+    unrelated = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="run configured suite", targets=()),
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_parser.py::test_other_input",),
+            "assert actual == expected",
+        ),
+    )
+    targeted_retry = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="retry selected target", targets=(selected,)),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert actual == expected"),
+    )
+
+    assert (unrelated.verdict, unrelated.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.bugfix_target_assertion_required",
+    )
+    assert task.tdd_phase is TddPhase.TEST_DESIGN
+    assert (targeted_retry.verdict, targeted_retry.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.baseline_required",
+    )
+
+
 def test_bugfix_policy_refuses_runtime_feedback_with_a_source_assert_line(
     policy: PolicyEngine
 ) -> None:
@@ -338,7 +536,7 @@ def test_bugfix_policy_refuses_runtime_feedback_with_a_source_assert_line(
     )
     decision = policy.record_pytest(
         task,
-        RunPytestAction(kind="run_pytest", summary="run regression", targets=(target,)),
+        RunPytestAction(kind="run_pytest", summary="run configured suite", targets=()),
         feedback,
     )
 
@@ -351,6 +549,7 @@ def test_source_patch_requires_a_current_read_after_red(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
     """Catches a read-before-patch bypass for a production file."""
+    _record_bugfix_red_baseline(policy, ready_bugfix_task)
     result = policy.decide(
         ready_bugfix_task, ApplyPatchAction(kind="apply_patch", summary="change", diff=SOURCE_DIFF)
     )
@@ -362,6 +561,7 @@ def test_deciding_source_patch_does_not_transition_to_implementation(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
     """Catches decide() treating an unexecuted patch as a successful write."""
+    _record_bugfix_red_baseline(policy, ready_bugfix_task)
     policy.record_read(
         ready_bugfix_task, ReadFileAction(kind="read_file", summary="read source", path="src/example.py")
     )
@@ -382,6 +582,7 @@ def test_passing_target_pytest_does_not_allow_completed_finish(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
     """Catches finish.completed accepting target-only green test evidence."""
+    _record_bugfix_red_baseline(policy, ready_bugfix_task)
     policy.record_read(
         ready_bugfix_task, ReadFileAction(kind="read_file", summary="read source", path="src/example.py")
     )
@@ -439,7 +640,7 @@ def test_delete_approval_is_exact_and_single_use(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
     """Catches an approval replay that authorizes a dangerous delete more than once."""
-    action = DeletePathAction(kind="delete_path", summary="remove test", path="tests/test_example.py")
+    action = DeletePathAction(kind="delete_path", summary="remove file", path="obsolete.txt")
     pending = policy.request_approval(ready_bugfix_task, action)
 
     accepted = policy.apply_approval(pending, action, decision="once")
@@ -449,6 +650,45 @@ def test_delete_approval_is_exact_and_single_use(
     assert (replayed.verdict, replayed.rule_id) == (PolicyVerdict.DENY, "approval.already_used")
 
 
+@pytest.mark.parametrize("phase", [TddPhase.IMPLEMENTATION, TddPhase.GREEN_OBSERVED])
+def test_test_deletion_is_directly_denied_after_test_design(
+    policy: PolicyEngine, ready_bugfix_task: TaskState, phase: TddPhase
+) -> None:
+    """Catches approval bypassing the TDD phase boundary for deleting tests."""
+    ready_bugfix_task.tdd_phase = phase
+
+    result = policy.decide(
+        ready_bugfix_task,
+        DeletePathAction(
+            kind="delete_path",
+            summary="remove regression",
+            path="tests/test_example.py",
+        ),
+    )
+
+    assert (result.verdict, result.rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.test_delete_phase",
+    )
+
+
+def test_explicit_approval_request_is_exact_hitl_and_not_permanent_eligible(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches a non-executable model request being recorded as ordinary allowed work."""
+    action = RequestApprovalAction(
+        kind="request_approval",
+        summary="ask user",
+        reason="model-controlled reason must not become policy evidence",
+    )
+
+    pending = policy.request_approval(feature_task, action)
+
+    assert pending.verdict is PolicyVerdict.APPROVAL_REQUIRED
+    assert pending.action_hash == action.stable_hash()
+    assert pending.permanent_eligible is False
+
+
 @pytest.mark.parametrize("invalid_decision", ["invalid", True])
 def test_invalid_approval_decision_is_denied_without_consuming_pending_action(
     policy: PolicyEngine,
@@ -456,7 +696,7 @@ def test_invalid_approval_decision_is_denied_without_consuming_pending_action(
     invalid_decision: object,
 ) -> None:
     """Catches unknown or wrong-type decisions falling through as one-time approval."""
-    action = DeletePathAction(kind="delete_path", summary="remove test", path="tests/test_example.py")
+    action = DeletePathAction(kind="delete_path", summary="remove file", path="obsolete.txt")
     pending = policy.request_approval(ready_bugfix_task, action)
 
     invalid = policy.apply_approval(
@@ -479,12 +719,12 @@ def test_approval_does_not_match_a_different_action(
     """Catches an approval binding that ignores the exact proposed action hash."""
     pending = policy.request_approval(
         ready_bugfix_task,
-        DeletePathAction(kind="delete_path", summary="test", path="tests/test_example.py"),
+        DeletePathAction(kind="delete_path", summary="first", path="obsolete.txt"),
     )
 
     result = policy.apply_approval(
         pending,
-        DeletePathAction(kind="delete_path", summary="source", path="src/example.py"),
+        DeletePathAction(kind="delete_path", summary="other", path="other.txt"),
         decision="once",
     )
 
@@ -531,6 +771,7 @@ def test_only_exact_read_only_git_diff_can_wait_for_approval(
         PolicyVerdict.APPROVAL_REQUIRED,
         "command.read_only_approval_required",
     )
+    assert result.permanent_eligible is True
 
 
 @pytest.mark.parametrize(
@@ -748,6 +989,7 @@ def test_read_and_patch_equivalent_source_paths_share_a_normalized_identity(
     policy: PolicyEngine, ready_bugfix_task: TaskState
 ) -> None:
     """Catches read records and patches treating one root-internal source as different paths."""
+    _record_bugfix_red_baseline(policy, ready_bugfix_task)
     policy.record_read(
         ready_bugfix_task,
         ReadFileAction(kind="read_file", summary="read source", path="src/example.py"),

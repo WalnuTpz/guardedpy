@@ -48,6 +48,8 @@ _FEEDBACK_TEMPLATES = {
     FeedbackKind.EXECUTION_ERROR: "pytest execution error",
     FeedbackKind.TIMEOUT: "pytest timed out",
 }
+FEEDBACK_NODE_ID_MAX_LENGTH = 500
+
 
 class FeedbackAudit(BaseModel):
     """The narrow, structured feedback input allowed to reach audit storage."""
@@ -55,7 +57,7 @@ class FeedbackAudit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: FeedbackKind
-    node_id: str | None = None
+    node_id: str | None = Field(default=None, max_length=FEEDBACK_NODE_ID_MAX_LENGTH)
 
 
 class RunEvent(BaseModel):
@@ -73,6 +75,7 @@ class RunEvent(BaseModel):
     )
     policy_reason: str | None = Field(default=None, max_length=300)
     approval_granted: bool | None = None
+    permanent_eligible: bool | None = None
     feedback: FeedbackAudit | None = None
     retry_count: int | None = None
     stop_reason: StopReason | None = None
@@ -89,8 +92,12 @@ class StoredRunEvent(BaseModel):
     action_hash: str | None = None
     policy_verdict: PolicyVerdict | None = None
     approval_granted: bool | None = None
+    permanent_eligible: bool | None = None
     feedback_kind: FeedbackKind | None = None
     feedback_excerpt: str | None = None
+    feedback_node_id: str | None = Field(
+        default=None, max_length=FEEDBACK_NODE_ID_MAX_LENGTH
+    )
     retry_count: int | None = None
     action_projection: str | None = None
     affected_project: str | None = None
@@ -107,10 +114,12 @@ def _project_action(action: Action | None) -> tuple[str | None, str | None]:
     return _ACTION_SUMMARIES[action.kind], stable_hash(action)
 
 
-def _project_feedback(feedback: FeedbackAudit | None) -> tuple[FeedbackKind | None, str | None]:
+def _project_feedback(
+    feedback: FeedbackAudit | None,
+) -> tuple[FeedbackKind | None, str | None, str | None]:
     if feedback is None:
-        return None, None
-    return feedback.kind, _FEEDBACK_TEMPLATES[feedback.kind]
+        return None, None, None
+    return feedback.kind, _FEEDBACK_TEMPLATES[feedback.kind], feedback.node_id
 
 
 def safe_action_projection(action: Action, decision: PolicyDecision) -> str | None:
@@ -121,6 +130,8 @@ def safe_action_projection(action: Action, decision: PolicyDecision) -> str | No
         "approval.declined",
         "approval.granted",
         "approval.granted_always",
+        "approval.permanent_command_only",
+        "approval.requested",
         "command.approval_required",
         "command.persistent_rule",
         "command.read_only_approval_required",
@@ -147,7 +158,7 @@ class EventStore:
     def append(self, event: RunEvent) -> StoredRunEvent:
         """Persist one fixed-format audit projection and update the task's state."""
         action_summary, action_hash = _project_action(event.action)
-        feedback_kind, feedback_excerpt = _project_feedback(event.feedback)
+        feedback_kind, feedback_excerpt, feedback_node_id = _project_feedback(event.feedback)
         created_at = datetime.now(timezone.utc)
         with closing(sqlite3.connect(self.database_path)) as connection:
             cursor = connection.execute(
@@ -155,8 +166,8 @@ class EventStore:
                 INSERT INTO events (
                     task_id, task_status, action_summary, action_hash,
                     policy_verdict, approval_granted, feedback_kind,
-                    feedback_excerpt, retry_count, stop_reason, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    feedback_excerpt, feedback_node_id, retry_count, stop_reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(event.task_id),
@@ -167,6 +178,7 @@ class EventStore:
                     event.approval_granted,
                     feedback_kind.value if feedback_kind else None,
                     feedback_excerpt,
+                    feedback_node_id,
                     event.retry_count,
                     event.stop_reason,
                     created_at.isoformat(),
@@ -182,14 +194,16 @@ class EventStore:
             if event.policy_rule_id is not None and event.policy_reason is not None:
                 connection.execute(
                     """
-                    INSERT INTO event_policies (event_id, rule_id, reason, action_projection)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO event_policies (
+                        event_id, rule_id, reason, action_projection, permanent_eligible
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         cursor.lastrowid,
                         event.policy_rule_id,
                         event.policy_reason,
                         event.action_projection,
+                        event.permanent_eligible,
                     ),
                 )
             connection.commit()
@@ -200,8 +214,10 @@ class EventStore:
                 action_hash=action_hash,
                 policy_verdict=event.policy_verdict,
                 approval_granted=event.approval_granted,
+                permanent_eligible=event.permanent_eligible,
                 feedback_kind=feedback_kind,
                 feedback_excerpt=feedback_excerpt,
+                feedback_node_id=feedback_node_id,
                 retry_count=event.retry_count,
                 action_projection=event.action_projection,
                 affected_project=str(self.project_root),
@@ -217,8 +233,13 @@ class EventStore:
         with closing(sqlite3.connect(self.database_path)) as connection:
             rows = connection.execute(
                 """
-                SELECT events.*, event_policies.rule_id, event_policies.reason,
-                       event_policies.action_projection
+                SELECT events.id, events.task_id, events.task_status,
+                       events.action_summary, events.action_hash, events.policy_verdict,
+                       events.approval_granted, events.feedback_kind,
+                       events.feedback_excerpt, events.feedback_node_id,
+                       events.retry_count, events.stop_reason, events.created_at,
+                       event_policies.rule_id, event_policies.reason,
+                       event_policies.action_projection, event_policies.permanent_eligible
                 FROM events
                 LEFT JOIN event_policies ON event_policies.event_id = events.id
                 WHERE events.task_id = ?
@@ -237,12 +258,14 @@ class EventStore:
                 approval_granted=bool(row[6]) if row[6] is not None else None,
                 feedback_kind=FeedbackKind(row[7]) if row[7] else None,
                 feedback_excerpt=row[8],
-                retry_count=row[9],
-                stop_reason=StopReason(row[10]) if row[10] else None,
-                created_at=datetime.fromisoformat(row[11]),
-                policy_rule_id=row[12],
-                policy_reason=row[13],
-                action_projection=row[14],
+                feedback_node_id=row[9],
+                retry_count=row[10],
+                stop_reason=StopReason(row[11]) if row[11] else None,
+                created_at=datetime.fromisoformat(row[12]),
+                policy_rule_id=row[13],
+                policy_reason=row[14],
+                action_projection=row[15],
+                permanent_eligible=bool(row[16]) if row[16] is not None else None,
                 affected_project=str(self.project_root),
             )
             for row in rows
@@ -290,6 +313,7 @@ class EventStore:
                     approval_granted INTEGER,
                     feedback_kind TEXT,
                     feedback_excerpt TEXT,
+                    feedback_node_id TEXT,
                     retry_count INTEGER,
                     stop_reason TEXT,
                     created_at TEXT NOT NULL
@@ -303,6 +327,7 @@ class EventStore:
                     rule_id TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     action_projection TEXT,
+                    permanent_eligible INTEGER,
                     FOREIGN KEY(event_id) REFERENCES events(id)
                 );
                 """
@@ -314,4 +339,13 @@ class EventStore:
                 connection.execute(
                     "ALTER TABLE event_policies ADD COLUMN action_projection TEXT"
                 )
+            if "permanent_eligible" not in policy_columns:
+                connection.execute(
+                    "ALTER TABLE event_policies ADD COLUMN permanent_eligible INTEGER"
+                )
+            event_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(events)")
+            }
+            if "feedback_node_id" not in event_columns:
+                connection.execute("ALTER TABLE events ADD COLUMN feedback_node_id TEXT")
             connection.commit()
