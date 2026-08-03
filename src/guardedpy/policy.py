@@ -75,6 +75,15 @@ class PolicyEngine:
         self._invalidate_reads(task, normalized_paths)
         return decision
 
+    def record_delete(
+        self, task: TaskState, action: DeletePathAction, decision: PolicyDecision
+    ) -> PolicyDecision:
+        """Invalidate green-suite evidence only after an allowed deletion has succeeded."""
+        if decision.verdict is not PolicyVerdict.ALLOW or decision.action_hash != stable_hash(action):
+            return decision
+        self._full_suite_green.discard(task.id)
+        return decision
+
     def record_pytest(
         self, task: TaskState, action: RunPytestAction, *, passed: bool
     ) -> PolicyDecision:

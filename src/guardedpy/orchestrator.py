@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 from pathlib import Path, PurePosixPath
@@ -32,6 +33,14 @@ from guardedpy.policy import PolicyEngine
 from guardedpy.workspace import ToolResult, Workspace
 
 
+@dataclass
+class _LoopState:
+    """In-process control state that must survive an approval pause."""
+
+    seen_actions: set[str] = field(default_factory=set)
+    next_round: int = 0
+
+
 class TaskOrchestrator:
     """Run one-action LLM rounds through deterministic policy and workspace tools."""
 
@@ -43,13 +52,15 @@ class TaskOrchestrator:
         self._workspace_by_task: dict[UUID, Workspace] = {}
         self._tasks: dict[UUID, TaskState] = {}
         self._feedback: dict[UUID, dict[str, Any] | None] = {}
-        self._pending: dict[tuple[UUID, str], tuple[Action, PolicyDecision]] = {}
+        self._loop_by_task: dict[UUID, _LoopState] = {}
+        self._pending: dict[tuple[UUID, str], tuple[Action, PolicyDecision, int]] = {}
         self._events = EventStore(self._project_root)
         self._events.mark_unfinished_interrupted()
         self._feedback_collector = FeedbackCollector()
 
     def run(self, task: TaskState) -> TaskState:
         """Advance a task until it reaches a terminal, approval, or bounded stop state."""
+        self._reject_second_active_task(task)
         self._tasks[task.id] = task
         if task.status in {
             TaskStatus.COMPLETED,
@@ -61,23 +72,26 @@ class TaskOrchestrator:
         if task.status is TaskStatus.WAITING_APPROVAL:
             return task
         self._workspace_by_task.setdefault(task.id, Workspace(self._project_root, task.config))
-        task.status = TaskStatus.RUNNING
-        self._events.append(RunEvent(task_id=task.id, task_status=task.status))
-        seen_actions: set[str] = set()
+        if task.status is not TaskStatus.RUNNING:
+            task.status = TaskStatus.RUNNING
+            self._events.append(RunEvent(task_id=task.id, task_status=task.status))
+        loop = self._loop_by_task.setdefault(task.id, _LoopState())
 
-        for round_number in range(self._max_rounds):
+        while loop.next_round < self._max_rounds:
             if task.status is TaskStatus.CANCELLED:
                 return task
+            round_number = loop.next_round
             try:
                 action = parse_action(self._llm.complete(self._context(task)))
             except (ValidationError, ValueError, json.JSONDecodeError):
                 return self._stop(task, StopReason.INVALID_MODEL_OUTPUT, round_number)
             except Exception:
                 return self._stop(task, StopReason.UNRECOVERABLE_ERROR, round_number)
+            loop.next_round += 1
 
             action_hash = stable_hash(action)
             repeat_key = self._repeat_key(action)
-            if repeat_key in seen_actions:
+            if repeat_key in loop.seen_actions:
                 self._events.append(
                     RunEvent(
                         task_id=task.id,
@@ -89,7 +103,7 @@ class TaskOrchestrator:
                 )
                 task.status = TaskStatus.BLOCKED
                 return task
-            seen_actions.add(repeat_key)
+            loop.seen_actions.add(repeat_key)
 
             decision = self._policy.decide(task, action)
             if decision.verdict is PolicyVerdict.DENY:
@@ -102,7 +116,7 @@ class TaskOrchestrator:
                 continue
             if decision.verdict is PolicyVerdict.APPROVAL_REQUIRED:
                 self._policy.request_approval(task, action)
-                self._pending[(task.id, action_hash)] = (action, decision)
+                self._pending[(task.id, action_hash)] = (action, decision, round_number)
                 task.status = TaskStatus.WAITING_APPROVAL
                 self._events.append(
                     RunEvent(
@@ -126,11 +140,20 @@ class TaskOrchestrator:
                     decision=decision,
                 )
 
-            self._execute_allowed(task, action, decision, round_number)
+            try:
+                self._execute_allowed(task, action, decision, round_number)
+            except Exception:
+                return self._stop(
+                    task,
+                    StopReason.UNRECOVERABLE_ERROR,
+                    round_number,
+                    action=action,
+                    decision=decision,
+                )
             if task.status is not TaskStatus.RUNNING:
                 return task
 
-        return self._stop(task, StopReason.ROUND_LIMIT, self._max_rounds)
+        return self._stop(task, StopReason.ROUND_LIMIT, loop.next_round)
 
     def cancel(self, task_id: UUID) -> TaskState:
         """Cancel one known non-terminal task and discard its in-memory pending action."""
@@ -160,7 +183,7 @@ class TaskOrchestrator:
         task = self._tasks.get(task_id)
         if pending is None or task is None or task.status is not TaskStatus.WAITING_APPROVAL:
             return False
-        action, decision = pending
+        action, decision, round_number = pending
         approval = self._policy.apply_approval(decision, action, approved)
         if approval.verdict is not PolicyVerdict.ALLOW:
             task.status = TaskStatus.BLOCKED
@@ -185,7 +208,16 @@ class TaskOrchestrator:
                 approval_granted=True,
             )
         )
-        self._execute_allowed(task, action, approval, 0)
+        try:
+            self._execute_allowed(task, action, approval, round_number)
+        except Exception:
+            self._stop(
+                task,
+                StopReason.UNRECOVERABLE_ERROR,
+                round_number,
+                action=action,
+                decision=approval,
+            )
         return True
 
     def _execute_allowed(
@@ -210,14 +242,12 @@ class TaskOrchestrator:
             return
         if isinstance(action, DeletePathAction):
             result = workspace.delete_path(PurePosixPath(action.path))
+            if result.ok:
+                self._policy.record_delete(task, action, decision)
             self._record_tool_result(task, action, decision, result, round_number)
             return
         if isinstance(action, RunPytestAction):
-            try:
-                run = workspace.run_pytest(action.targets)
-            except Exception:
-                self._record_tool_error(task, action, decision, round_number)
-                return
+            run = workspace.run_pytest(action.targets)
             feedback = self._feedback_collector.collect(run)
             if feedback.kind in {FeedbackKind.PASSED, FeedbackKind.ASSERTION_FAILURE}:
                 self._policy.record_pytest(task, action, passed=feedback.kind is FeedbackKind.PASSED)
@@ -260,12 +290,6 @@ class TaskOrchestrator:
             "summary": result.summary,
             "data": result.data,
         }
-        self._record_decision(task, action, decision, round_number)
-
-    def _record_tool_error(
-        self, task: TaskState, action: Action, decision: PolicyDecision, round_number: int
-    ) -> None:
-        self._feedback[task.id] = {"type": "tool_error", "reason": "tool_execution_failed"}
         self._record_decision(task, action, decision, round_number)
 
     def _record_decision(
@@ -344,6 +368,16 @@ class TaskOrchestrator:
         for key in tuple(self._pending):
             if key[0] == task_id:
                 self._pending.pop(key)
+
+    def _reject_second_active_task(self, task: TaskState) -> None:
+        """Keep one task's unsafe pause and control state isolated from every other task."""
+        if task.id in self._tasks:
+            return
+        active_statuses = {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL}
+        if task.status in active_statuses and any(
+            current.status in active_statuses for current in self._tasks.values()
+        ):
+            raise ValueError("another task is already active")
 
     def _run_command(self, action: RunCommandAction) -> ToolResult:
         try:
