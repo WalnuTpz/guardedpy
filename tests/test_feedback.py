@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -107,6 +109,22 @@ def test_run_pytest_returns_a_structured_timeout_result(tmp_path: Path) -> None:
 
     assert result.exit_code == -1
     assert result.timed_out is True
+
+
+def test_run_pytest_explicitly_disables_shell_execution(tmp_path: Path) -> None:
+    """Catches a runner that relies on subprocess's default shell setting."""
+    config = HarnessConfig(
+        source_dirs=("src",),
+        test_dirs=("tests",),
+        pytest_command=("pytest",),
+    )
+    completed = subprocess.CompletedProcess(("pytest",), 0, "1 passed\n", "")
+
+    with patch("guardedpy.workspace.subprocess.run", return_value=completed) as run:
+        result = Workspace(tmp_path, config).run_pytest(("tests/test_a.py",))
+
+    assert result.exit_code == 0
+    assert run.call_args.kwargs["shell"] is False
 
 
 def test_run_pytest_rejects_a_target_outside_configured_test_directories(

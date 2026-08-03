@@ -144,6 +144,7 @@ class Workspace:
                 text=True,
                 timeout=self.config.timeout_seconds,
                 check=False,
+                shell=False,
             )
         except subprocess.TimeoutExpired as error:
             return PytestRun(
