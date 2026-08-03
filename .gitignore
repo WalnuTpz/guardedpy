@@ -1,2 +1,4 @@
 .agents/
 .worktrees/
+__pycache__/
+.venv/
