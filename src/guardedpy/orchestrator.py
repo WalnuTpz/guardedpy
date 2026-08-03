@@ -25,6 +25,7 @@ from guardedpy.actions import (
     parse_action,
     stable_hash,
 )
+from guardedpy.context import ContextBuilder, LlmContext
 from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskState, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 from guardedpy.feedback import FeedbackCollector, PytestFeedback
@@ -334,15 +335,8 @@ class TaskOrchestrator:
         )
         return task
 
-    def _context(self, task: TaskState) -> str:
-        return json.dumps(
-            {
-                "task": {"description": task.description, "mode": task.mode.value},
-                "tdd_phase": task.tdd_phase.value,
-                "last_feedback": self._feedback.get(task.id),
-            },
-            sort_keys=True,
-        )
+    def _context(self, task: TaskState) -> LlmContext:
+        return ContextBuilder(self._project_root).build(task, self._feedback.get(task.id), [])
 
     @staticmethod
     def _pytest_feedback(feedback: PytestFeedback) -> dict[str, object]:
