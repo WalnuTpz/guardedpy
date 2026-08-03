@@ -7,9 +7,11 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
 
+from guardedpy.actions import parse_action
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskStatus
-from guardedpy.events import EventStore, RunEvent
+from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 
 
 @pytest.fixture
@@ -21,35 +23,42 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> EventStore:
     return EventStore(project_root)
 
 
-def test_append_persists_only_the_allowed_audit_fields(store: EventStore) -> None:
-    """Catches storing a full action body instead of its safe summary and hash."""
+def test_append_projects_an_action_and_feedback_without_persisting_their_text(
+    store: EventStore,
+) -> None:
+    """Catches audit storage using untrusted action or pytest text directly."""
     task_id = uuid4()
+    action = parse_action(
+        '{"kind":"apply_patch","summary":"replace every secret","diff":"--- a/key.py +++ b/key.py +sk-short-key"}'
+    )
 
-    store.append(
+    stored = store.append(
         RunEvent(
             task_id=task_id,
             task_status=TaskStatus.RUNNING,
-            action_summary="patch source",
-            action_hash="abc123",
+            action=action,
             policy_verdict=PolicyVerdict.ALLOW,
             approval_granted=True,
-            feedback_kind=FeedbackKind.ASSERTION_FAILURE,
-            feedback_excerpt="assertion failed",
+            feedback=FeedbackAudit(
+                kind=FeedbackKind.ASSERTION_FAILURE,
+                node_id="tests/test_events.py::test_projection",
+            ),
             retry_count=2,
-            stop_reason="round_limit",
+            stop_reason=StopReason.ROUND_LIMIT,
         )
     )
 
-    event = store.events_for(task_id)[0]
-    assert event.task_status is TaskStatus.RUNNING
-    assert event.action_summary == "patch source"
-    assert event.action_hash == "abc123"
-    assert event.policy_verdict is PolicyVerdict.ALLOW
-    assert event.approval_granted is True
-    assert event.feedback_kind is FeedbackKind.ASSERTION_FAILURE
-    assert event.feedback_excerpt == "assertion failed"
-    assert event.retry_count == 2
-    assert event.stop_reason == "round_limit"
+    assert stored.task_status is TaskStatus.RUNNING
+    assert stored.action_summary == "apply source patch"
+    assert stored.action_hash == action.stable_hash()
+    assert stored.policy_verdict is PolicyVerdict.ALLOW
+    assert stored.approval_granted is True
+    assert stored.feedback_kind is FeedbackKind.ASSERTION_FAILURE
+    assert stored.feedback_excerpt == "pytest assertion failure at tests/test_events.py::test_projection"
+    assert stored.retry_count == 2
+    assert stored.stop_reason is StopReason.ROUND_LIMIT
+    assert "sk-short-key" not in repr(stored)
+    assert "replace every secret" not in repr(stored)
 
     with sqlite3.connect(store.database_path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
@@ -83,31 +92,35 @@ def test_store_database_is_created_in_external_app_state(
 @pytest.mark.parametrize(
     ("field_name", "unsafe_content"),
     [
-        ("action_summary", "--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-old\n+new"),
-        ("feedback_excerpt", "task context:\nsource tree and prior model output"),
-        (
-            "action_summary",
-            '{"kind":"delete_path","path":"src/guardedpy/events.py"}',
-        ),
-        ("feedback_excerpt", "sk-" + "x" * 501),
+        ("action_summary", "sk-short-key"),
+        ("action_summary", "--- a/source.py +++ b/source.py @@ -1 +1 @@ -old +new"),
+        ("feedback_excerpt", "context: prior model output and source tree"),
+        ("action_summary", "delete_path src/guardedpy/events.py"),
+        ("action_hash", "sk-short-key"),
+        ("stop_reason", "untrusted arbitrary reason"),
     ],
 )
-def test_append_rejects_content_that_is_not_a_bounded_audit_fragment(
+def test_run_event_rejects_all_direct_audit_text_before_any_event_is_written(
     store: EventStore, field_name: str, unsafe_content: str
 ) -> None:
-    """Catches persisting a full diff, context, pending action, or opaque long value."""
+    """Catches short secrets, minified payloads, and context entering audit fields."""
     task_id = uuid4()
 
-    with pytest.raises(ValueError, match="audit"):
-        store.append(
-            RunEvent(
-                task_id=task_id,
-                task_status=TaskStatus.RUNNING,
-                **{field_name: unsafe_content},
-            )
+    with pytest.raises(ValidationError):
+        RunEvent(
+            task_id=task_id,
+            task_status=TaskStatus.RUNNING,
+            **{field_name: unsafe_content},
         )
 
     assert store.events_for(task_id) == []
+
+
+def test_feedback_audit_rejects_a_node_that_could_carry_arbitrary_text() -> None:
+    """Catches a feedback template interpolating arbitrary pytest output into SQLite."""
+
+    with pytest.raises(ValidationError, match="feedback node"):
+        FeedbackAudit(kind=FeedbackKind.ASSERTION_FAILURE, node_id="sk-short-key")
 
 
 def test_mark_unfinished_interrupted_adds_terminal_event_only_for_active_tasks(
