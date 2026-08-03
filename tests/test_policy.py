@@ -556,6 +556,51 @@ def test_each_exact_command_family_requires_approval_without_a_rule(
     assert result.verdict is PolicyVerdict.APPROVAL_REQUIRED
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        RunCommandAction(
+            kind="run_command",
+            summary="long but valid package install",
+            args=(
+                "python",
+                "-m",
+                "pip",
+                "install",
+                *(f"package{index}==1.2.3" for index in range(40)),
+            ),
+        ),
+        DeletePathAction(
+            kind="delete_path",
+            summary="long but root-contained delete",
+            path="/".join(("directory",) * 60) + "/obsolete.txt",
+        ),
+        ApplyPatchAction(
+            kind="apply_patch",
+            summary="long but valid non-code patch",
+            diff=(
+                "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n".format(
+                    path="/".join(("directory",) * 60) + "/README.md"
+                )
+            ),
+        ),
+    ],
+    ids=("pip", "delete", "patch"),
+)
+def test_action_that_cannot_be_fully_projected_is_denied_before_approval(
+    policy: PolicyEngine,
+    feature_task: TaskState,
+    action: RunCommandAction | DeletePathAction | ApplyPatchAction,
+) -> None:
+    """Catches approval of an action whose decision inputs would be truncated in the UI."""
+    result = policy.decide(feature_task, action)
+
+    assert (result.verdict, result.rule_id) == (
+        PolicyVerdict.DENY,
+        "approval.projection_too_long",
+    )
+
+
 def test_matching_always_allowed_git_push_rule_bypasses_new_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_task: TaskState
 ) -> None:

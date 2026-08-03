@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePath
+import re
 from uuid import UUID
 
 from guardedpy.actions import (
@@ -32,6 +33,91 @@ from guardedpy.domain import (
     is_approval_decision,
 )
 from guardedpy.feedback import PytestFeedback
+
+
+APPROVAL_ACTION_PROJECTION_MAX_LENGTH = 500
+_HUNK_HEADER = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
+)
+
+
+def patch_operations(diff: str) -> tuple[tuple[tuple[str, bool], ...], str | None]:
+    """Return file operations from complete unified-diff header and hunk boundaries."""
+    lines = diff.splitlines()
+    if any(line.startswith(("rename from ", "rename to ", "similarity index ")) for line in lines):
+        return (), "patch.rename_unsupported"
+
+    operations: list[tuple[str, bool]] = []
+    index = 0
+    while index < len(lines):
+        old_header = lines[index]
+        if not old_header.startswith("--- ") or index + 1 >= len(lines):
+            return (), "patch.invalid"
+        new_header = lines[index + 1]
+        if not new_header.startswith("+++ "):
+            return (), "patch.invalid"
+        old_path = _diff_path(old_header, "--- a/")
+        new_path = _diff_path(new_header, "+++ b/")
+        if old_header == "--- /dev/null":
+            if new_path is None:
+                return (), "patch.invalid"
+            operations.append((new_path, True))
+        elif new_header == "+++ /dev/null":
+            return (), "patch.delete_unsupported"
+        elif old_path is None or new_path is None:
+            return (), "patch.invalid"
+        elif old_path != new_path:
+            return (), "patch.rename_unsupported"
+        else:
+            operations.append((old_path, False))
+        index += 2
+
+        parsed_hunk = False
+        while index < len(lines) and lines[index].startswith("@@ "):
+            match = _HUNK_HEADER.fullmatch(lines[index])
+            if match is None:
+                return (), "patch.invalid"
+            _old_start, old_count, _new_start, new_count = match.groups()
+            expected_old = int(old_count) if old_count is not None else 1
+            expected_new = int(new_count) if new_count is not None else 1
+            observed_old = 0
+            observed_new = 0
+            index += 1
+            while observed_old < expected_old or observed_new < expected_new:
+                if index >= len(lines) or not lines[index].startswith((" ", "+", "-")):
+                    return (), "patch.invalid"
+                marker = lines[index][0]
+                if marker != "+":
+                    observed_old += 1
+                if marker != "-":
+                    observed_new += 1
+                if observed_old > expected_old or observed_new > expected_new:
+                    return (), "patch.invalid"
+                index += 1
+            parsed_hunk = True
+        if not parsed_hunk or (index < len(lines) and not lines[index].startswith("--- ")):
+            return (), "patch.invalid"
+
+    return (tuple(operations), None) if operations else ((), "patch.invalid")
+
+
+def approval_action_projection(action: Action) -> str | None:
+    """Return the complete deterministic command or path projection for approval."""
+    if isinstance(action, RunCommandAction):
+        return f"Command: {' '.join(action.args)}"
+    if isinstance(action, DeletePathAction):
+        return f"Path: {action.path}"
+    if isinstance(action, ApplyPatchAction):
+        operations, error_rule = patch_operations(action.diff)
+        if error_rule is not None:
+            return None
+        return f"Paths: {', '.join(path for path, _created in operations)}"
+    return None
+
+
+def _diff_path(header: str, prefix: str) -> str | None:
+    path = header.removeprefix(prefix).split("\t", maxsplit=1)[0]
+    return path if header.startswith(prefix) and path else None
 
 
 class PolicyEngine:
@@ -346,6 +432,9 @@ class PolicyEngine:
                 "command.not_allowed",
                 "command does not match an exact approvable family",
             )
+        projection_denial = self._approval_projection_denial(task, action)
+        if projection_denial is not None:
+            return projection_denial
         if self._command_rules.matches(action, self._current_branch):
             return self._allow(
                 task,
@@ -447,43 +536,11 @@ class PolicyEngine:
     @staticmethod
     def _patch_operations(diff: str) -> tuple[tuple[tuple[str, bool], ...], str | None]:
         """Return unified-diff paths and whether each operation creates a new path."""
-        lines = diff.splitlines()
-        if any(line.startswith(("rename from ", "rename to ", "similarity index ")) for line in lines):
-            return (), "patch.rename_unsupported"
-
-        operations: list[tuple[str, bool]] = []
-        index = 0
-        while index < len(lines):
-            line = lines[index]
-            if not line.startswith("--- "):
-                index += 1
-                continue
-            if index + 1 >= len(lines) or not lines[index + 1].startswith("+++ "):
-                return (), "patch.invalid"
-            old_path = PolicyEngine._diff_path(line, "--- a/")
-            new_path = PolicyEngine._diff_path(lines[index + 1], "+++ b/")
-            if line == "--- /dev/null":
-                if new_path is None:
-                    return (), "patch.invalid"
-                operations.append((new_path, True))
-            elif lines[index + 1] == "+++ /dev/null":
-                return (), "patch.delete_unsupported"
-            elif old_path is None or new_path is None:
-                return (), "patch.invalid"
-            elif old_path != new_path:
-                return (), "patch.rename_unsupported"
-            else:
-                operations.append((old_path, False))
-            index += 2
-
-        if not operations:
-            return (), "patch.invalid"
-        return tuple(operations), None
+        return patch_operations(diff)
 
     @staticmethod
     def _diff_path(header: str, prefix: str) -> str | None:
-        path = header.removeprefix(prefix).split("\t", maxsplit=1)[0]
-        return path if header.startswith(prefix) and path else None
+        return _diff_path(header, prefix)
 
     def _normalized_project_path(self, path: str) -> str | None:
         candidate = (self._project_root / path).resolve(strict=False)
@@ -520,8 +577,13 @@ class PolicyEngine:
             action_hash=stable_hash(action) if action is not None else None,
         )
 
-    @staticmethod
-    def _approval_required(task: TaskState, action: Action, rule_id: str, reason: str) -> PolicyDecision:
+    @classmethod
+    def _approval_required(
+        cls, task: TaskState, action: Action, rule_id: str, reason: str
+    ) -> PolicyDecision:
+        projection_denial = cls._approval_projection_denial(task, action)
+        if projection_denial is not None:
+            return projection_denial
         return PolicyDecision(
             verdict=PolicyVerdict.APPROVAL_REQUIRED,
             rule_id=rule_id,
@@ -529,6 +591,27 @@ class PolicyEngine:
             task_id=task.id,
             action_hash=stable_hash(action),
         )
+
+    @staticmethod
+    def _approval_projection_denial(
+        task: TaskState, action: Action
+    ) -> PolicyDecision | None:
+        projection = approval_action_projection(action)
+        if projection is None:
+            return PolicyEngine._deny(
+                task,
+                action,
+                "approval.projection_unavailable",
+                "action cannot be represented safely for approval",
+            )
+        if len(projection) > APPROVAL_ACTION_PROJECTION_MAX_LENGTH:
+            return PolicyEngine._deny(
+                task,
+                action,
+                "approval.projection_too_long",
+                "action is too long to represent completely for approval",
+            )
+        return None
 
     @staticmethod
     def _deny(

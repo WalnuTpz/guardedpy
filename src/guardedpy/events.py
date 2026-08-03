@@ -11,9 +11,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from guardedpy.actions import Action, ApplyPatchAction, DeletePathAction, RunCommandAction, stable_hash
+from guardedpy.actions import Action, stable_hash
 from guardedpy.config import app_state_dir
 from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskStatus
+from guardedpy.policy import APPROVAL_ACTION_PROJECTION_MAX_LENGTH, approval_action_projection
 
 
 class StopReason(StrEnum):
@@ -128,20 +129,10 @@ def safe_action_projection(action: Action, decision: PolicyDecision) -> str | No
     }
     if decision.rule_id not in approval_rules:
         return None
-    if isinstance(action, RunCommandAction):
-        projection = f"Command: {' '.join(action.args)}"
-    elif isinstance(action, DeletePathAction):
-        projection = f"Path: {action.path}"
-    elif isinstance(action, ApplyPatchAction):
-        paths = tuple(
-            line.removeprefix("+++ b/").split("\t", maxsplit=1)[0]
-            for line in action.diff.splitlines()
-            if line.startswith("+++ b/")
-        )
-        projection = f"Paths: {', '.join(paths)}"
-    else:
-        return None
-    return projection if len(projection) <= 500 else f"{projection[:497]}..."
+    projection = approval_action_projection(action)
+    if projection is None or len(projection) > APPROVAL_ACTION_PROJECTION_MAX_LENGTH:
+        raise ValueError("approval action cannot be projected completely")
+    return projection
 
 
 class EventStore:

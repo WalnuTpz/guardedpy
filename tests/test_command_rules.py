@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -162,3 +163,58 @@ def test_persisted_rule_omits_raw_action_summary_and_unsafe_values(
     assert summary_secret not in persisted
     assert '"summary"' not in persisted
     assert '"args"' not in persisted
+
+
+def test_concurrent_store_mutations_do_not_resurrect_a_revoked_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches two store instances losing a completed revocation during read-modify-write."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    initial = CommandRuleStore(tmp_path)
+    revoked_action = _command("git", "diff", "--no-ext-diff", "--check")
+    revoked_rule = initial.add_from(revoked_action, None)
+    added_action = _command("python", "-m", "pip", "install", "ruff==1.0.0")
+    adding_store = CommandRuleStore(tmp_path)
+    deleting_store = CommandRuleStore(tmp_path)
+    add_reached_save = Event()
+    delete_finished = Event()
+    thread_errors: list[BaseException] = []
+    original_save = adding_store._save
+
+    def paused_add_save() -> None:
+        add_reached_save.set()
+        delete_finished.wait(timeout=2)
+        original_save()
+
+    def add_rule() -> None:
+        try:
+            adding_store.add_from(added_action, None)
+        except BaseException as error:
+            thread_errors.append(error)
+
+    delete_results: list[bool] = []
+
+    def delete_rule() -> None:
+        try:
+            delete_results.append(deleting_store.delete(revoked_rule.id))
+        except BaseException as error:
+            thread_errors.append(error)
+        finally:
+            delete_finished.set()
+
+    monkeypatch.setattr(adding_store, "_save", paused_add_save)
+    add_thread = Thread(target=add_rule)
+    add_thread.start()
+    assert add_reached_save.wait(timeout=2)
+    delete_thread = Thread(target=delete_rule)
+    delete_thread.start()
+    add_thread.join(timeout=5)
+    delete_thread.join(timeout=5)
+
+    assert add_thread.is_alive() is False
+    assert delete_thread.is_alive() is False
+    assert thread_errors == []
+    assert delete_results == [True]
+    rules = CommandRuleStore(tmp_path).list_rules()
+    assert [rule.kind for rule in rules] == [CommandRuleKind.PIP_INSTALL]
+    assert CommandRuleStore(tmp_path).matches(revoked_action, None) is False

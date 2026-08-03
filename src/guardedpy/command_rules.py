@@ -39,6 +39,7 @@ _ARCHIVE_SUFFIXES = (
     ".egg",
 )
 _SHELL_METACHARACTERS = frozenset(";&|<>$`(){}*?[]\n\r\0\\")
+_RULE_STORE_LOCK = RLock()
 
 
 def has_shell_metacharacter(arguments: tuple[str, ...]) -> bool:
@@ -84,12 +85,12 @@ class CommandRuleStore:
         self._project_root = project_root.resolve()
         self._project_hash = sha256(str(self._project_root).encode()).hexdigest()
         self._path = app_state_dir(self._project_root) / "command-rules.json"
-        self._lock = RLock()
-        self._rules = self._load()
+        with _RULE_STORE_LOCK:
+            self._rules = self._load()
 
     def list_rules(self) -> list[CommandApprovalRule]:
         """Return durable rules in deterministic identifier order."""
-        with self._lock:
+        with _RULE_STORE_LOCK:
             self._rules = self._load()
             return sorted(self._rules.values(), key=lambda rule: rule.id)
 
@@ -105,7 +106,7 @@ class CommandRuleStore:
         rule = self._derive(action, current_branch)
         if rule is None:
             raise ValueError("action is not an eligible command family")
-        with self._lock:
+        with _RULE_STORE_LOCK:
             self._rules = self._load()
             if rule.id not in self._rules:
                 self._rules[rule.id] = rule
@@ -117,13 +118,13 @@ class CommandRuleStore:
         candidate = self._derive(action, current_branch)
         if candidate is None:
             return False
-        with self._lock:
+        with _RULE_STORE_LOCK:
             self._rules = self._load()
             return self._rules.get(candidate.id) == candidate
 
     def delete(self, rule_id: str) -> bool:
         """Revoke one rule by its opaque identifier."""
-        with self._lock:
+        with _RULE_STORE_LOCK:
             self._rules = self._load()
             if rule_id not in self._rules:
                 return False

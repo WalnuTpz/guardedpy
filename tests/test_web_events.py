@@ -296,11 +296,11 @@ def test_approval_page_shows_safe_rule_reason_and_three_decisions(
                 summary="MODEL-SUMMARY-PATCH",
                 diff=(
                     "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n"
-                    "-old\n+RAW-PATCH-SECRET\n"
+                    "-old\n+++ b/RAW-PATCH-DATA\n"
                 ),
             ),
             "Paths: README.md",
-            "RAW-PATCH-SECRET",
+            "RAW-PATCH-DATA",
             id="patch-path",
         ),
     ],
