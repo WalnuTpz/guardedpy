@@ -28,6 +28,13 @@ TEST_DIFF = """--- a/tests/test_example.py
 +def test_after(): pass
 """
 
+ROOT_INTERNAL_SOURCE_DIFF = """--- a/tests/../src/example.py
++++ b/tests/../src/example.py
+@@ -1 +1 @@
+-before
++after
+"""
+
 
 @pytest.fixture
 def policy(tmp_path: Path) -> PolicyEngine:
@@ -279,6 +286,39 @@ def test_pytest_rejects_non_test_targets_and_options(
     )
 
     assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, rule_id)
+
+
+def test_pytest_rejects_source_hidden_behind_test_parent(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches path classification that treats a normalized source target as a test."""
+    result = policy.decide(
+        feature_task,
+        RunPytestAction(
+            kind="run_pytest",
+            summary="run disguised source",
+            targets=("tests/../src/example.py",),
+        ),
+    )
+
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "pytest.target_not_test")
+
+
+def test_read_and_patch_equivalent_source_paths_share_a_normalized_identity(
+    policy: PolicyEngine, ready_bugfix_task: TaskState
+) -> None:
+    """Catches read records and patches treating one root-internal source as different paths."""
+    policy.record_read(
+        ready_bugfix_task,
+        ReadFileAction(kind="read_file", summary="read source", path="src/example.py"),
+    )
+
+    result = policy.decide(
+        ready_bugfix_task,
+        ApplyPatchAction(kind="apply_patch", summary="change", diff=ROOT_INTERNAL_SOURCE_DIFF),
+    )
+
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.ALLOW, "patch.source_allowed")
 
 
 def test_patch_rejects_deletion_hidden_beside_a_valid_test_change(
