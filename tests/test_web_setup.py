@@ -62,6 +62,18 @@ class UnavailableCredentials:
 
 
 @dataclass
+class SetUnavailableCredentials(FakeCredentials):
+    def set_key(self, key: str) -> None:
+        raise CredentialBackendUnavailableError(f"backend rejected {key}")
+
+
+@dataclass
+class UnexpectedSetFailureCredentials(FakeCredentials):
+    def set_key(self, key: str) -> None:
+        raise RuntimeError(f"unexpected failure for {key}")
+
+
+@dataclass
 class FakeOrchestrator:
     timeline: list[str]
     submitted: list[TaskState] = field(default_factory=list)
@@ -221,6 +233,56 @@ def test_snapshot_write_failure_does_not_store_the_submitted_key(tmp_path: Path)
     assert credentials.set_calls == []
 
 
+@pytest.mark.parametrize("existing_snapshot", [None, b"original snapshot bytes\n"])
+def test_setup_keyring_failure_restores_the_previous_snapshot_and_uses_safe_error(
+    tmp_path: Path, existing_snapshot: bytes | None
+) -> None:
+    """Catches partial setup committing a new snapshot after keyring mutation fails."""
+    root = _project_root(tmp_path)
+    snapshot = root / "harness.yaml"
+    if existing_snapshot is not None:
+        snapshot.write_bytes(existing_snapshot)
+    app = _app(SetUnavailableCredentials(), FakeOrchestrator([]))
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/setup",
+            data=_setup_data(root, api_key="never-render-this-key"),
+        )
+    )
+
+    assert response.status_code == 503
+    assert response.text.count("Credential store is unavailable.") == 1
+    assert "never-render-this-key" not in response.text
+    assert "backend rejected" not in response.text
+    if existing_snapshot is None:
+        assert snapshot.exists() is False
+    else:
+        assert snapshot.read_bytes() == existing_snapshot
+
+
+def test_unexpected_setup_key_failure_is_not_misreported_as_keyring_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Catches unrelated setup exceptions being relabelled as a credential backend outage."""
+    root = _project_root(tmp_path)
+    snapshot = root / "harness.yaml"
+    snapshot.write_bytes(b"keep this exact snapshot\n")
+    app = _app(UnexpectedSetFailureCredentials(), FakeOrchestrator([]))
+
+    response = asyncio.run(
+        _request(app, "POST", "/setup", data=_setup_data(root, api_key="hidden-key"))
+    )
+
+    assert response.status_code == 422
+    assert response.text.count("Setup could not be saved.") == 1
+    assert "Credential store is unavailable." not in response.text
+    assert "hidden-key" not in response.text
+    assert snapshot.read_bytes() == b"keep this exact snapshot\n"
+
+
 def test_active_task_rejects_setup_replacement_before_any_side_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -259,6 +321,64 @@ def test_active_task_rejects_setup_replacement_before_any_side_effect(
     assert credentials.set_calls == ["secret-key"]
     assert not (second_root / "harness.yaml").exists()
     assert "second-secret" not in replaced.text
+
+
+def test_setup_rechecks_active_task_after_form_parse_races_with_task_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches setup passing its active check before a concurrent task is registered."""
+    first_root = _project_root(tmp_path / "first")
+    second_root = _project_root(tmp_path / "second")
+    credentials = FakeCredentials()
+    orchestrator = FakeOrchestrator([])
+    app = _app(credentials, orchestrator)
+    web = _web_module()
+
+    class DormantThread:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(web, "Thread", DormantThread)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(first_root))).status_code == 303
+
+    async def exercise_race() -> tuple[httpx.Response, httpx.Response]:
+        setup_is_parsing = asyncio.Event()
+        resume_setup = asyncio.Event()
+        original_form = web.Request.form
+
+        async def controlled_form(request: Any) -> Any:
+            if request.url.path == "/setup":
+                setup_is_parsing.set()
+                await resume_setup.wait()
+            return await original_form(request)
+
+        monkeypatch.setattr(web.Request, "form", controlled_form)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            setup_request = asyncio.create_task(
+                client.post(
+                    "/setup",
+                    data=_setup_data(second_root, api_key="racing-secret"),
+                )
+            )
+            await setup_is_parsing.wait()
+            task_response = await client.post(
+                "/tasks", data={"mode": "feature", "description": "Win setup race"}
+            )
+            resume_setup.set()
+            return await setup_request, task_response
+
+    setup_response, task_response = asyncio.run(exercise_race())
+
+    assert task_response.status_code == 303
+    assert setup_response.status_code == 409
+    assert app.state.local.project_root == first_root.resolve()
+    assert credentials.set_calls == ["secret-key"]
+    assert not (second_root / "harness.yaml").exists()
+    assert "racing-secret" not in setup_response.text
 
 
 def test_task_creation_submits_before_starting_one_daemon_thread_and_rejects_a_second_active_task(

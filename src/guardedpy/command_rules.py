@@ -90,6 +90,7 @@ class CommandRuleStore:
     def list_rules(self) -> list[CommandApprovalRule]:
         """Return durable rules in deterministic identifier order."""
         with self._lock:
+            self._rules = self._load()
             return sorted(self._rules.values(), key=lambda rule: rule.id)
 
     @property
@@ -105,6 +106,7 @@ class CommandRuleStore:
         if rule is None:
             raise ValueError("action is not an eligible command family")
         with self._lock:
+            self._rules = self._load()
             if rule.id not in self._rules:
                 self._rules[rule.id] = rule
                 self._save()
@@ -116,11 +118,13 @@ class CommandRuleStore:
         if candidate is None:
             return False
         with self._lock:
+            self._rules = self._load()
             return self._rules.get(candidate.id) == candidate
 
     def delete(self, rule_id: str) -> bool:
         """Revoke one rule by its opaque identifier."""
         with self._lock:
+            self._rules = self._load()
             if rule_id not in self._rules:
                 return False
             del self._rules[rule_id]
@@ -181,7 +185,7 @@ class CommandRuleStore:
                 "branch": rule.branch,
                 "package_specs": rule.package_specs,
             }
-            for rule in self.list_rules()
+            for rule in sorted(self._rules.values(), key=lambda item: item.id)
         ]
         temporary_path: Path | None = None
         try:

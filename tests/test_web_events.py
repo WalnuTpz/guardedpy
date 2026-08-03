@@ -19,6 +19,7 @@ from guardedpy.domain import PolicyVerdict, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 from guardedpy.llm import ScriptedLLM
 from guardedpy.orchestrator import TaskOrchestrator
+from guardedpy.workspace import ToolResult
 
 
 async def _request(app: Any, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -165,7 +166,8 @@ def test_task_detail_and_events_expose_only_stored_audit_projection(
     assert all(set(event) == {
         "task_id", "task_status", "action_summary", "action_hash", "policy_verdict",
         "approval_granted", "feedback_kind", "feedback_excerpt", "retry_count",
-        "policy_rule_id", "policy_reason", "stop_reason", "id", "created_at",
+        "action_projection", "affected_project", "policy_rule_id", "policy_reason",
+        "stop_reason", "id", "created_at",
     } for event in payload)
     assert "--- a/secret.py" not in events.text
     assert "clearInterval(interval)" in script
@@ -255,6 +257,167 @@ def test_approval_page_shows_safe_rule_reason_and_three_decisions(
     assert "hidden context" not in page.text
 
 
+@pytest.mark.parametrize(
+    ("pending_action", "expected_projection", "unsafe_text"),
+    [
+        pytest.param(
+            _action(
+                kind="run_command",
+                summary="MODEL-SUMMARY-PIP",
+                args=["python", "-m", "pip", "install", "example-package==1.2.3"],
+            ),
+            "Command: python -m pip install example-package==1.2.3",
+            "MODEL-SUMMARY-PIP",
+            id="pip",
+        ),
+        pytest.param(
+            _action(
+                kind="run_command",
+                summary="MODEL-SUMMARY-GIT",
+                args=["git", "diff", "--no-ext-diff", "--check"],
+            ),
+            "Command: git diff --no-ext-diff --check",
+            "MODEL-SUMMARY-GIT",
+            id="git",
+        ),
+        pytest.param(
+            _action(
+                kind="delete_path",
+                summary="MODEL-SUMMARY-PATH",
+                path="obsolete.txt",
+            ),
+            "Path: obsolete.txt",
+            "MODEL-SUMMARY-PATH",
+            id="path",
+        ),
+        pytest.param(
+            _action(
+                kind="apply_patch",
+                summary="MODEL-SUMMARY-PATCH",
+                diff=(
+                    "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n"
+                    "-old\n+RAW-PATCH-SECRET\n"
+                ),
+            ),
+            "Paths: README.md",
+            "RAW-PATCH-SECRET",
+            id="patch-path",
+        ),
+    ],
+)
+def test_approval_page_projects_only_validated_command_or_path_and_affected_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_action: str,
+    expected_projection: str,
+    unsafe_text: str,
+) -> None:
+    """Catches an approval card hiding decision inputs or rendering model-controlled text."""
+    app, root, _ = _waiting_app(tmp_path, monkeypatch, [pending_action])
+    task = app.state.local.task
+    assert task is not None
+
+    page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
+
+    assert expected_projection in page.text
+    assert f"Project: {root.resolve()}" in page.text
+    assert unsafe_text not in page.text
+    assert unsafe_text not in feed.text
+    waiting = feed.json()[-1]
+    assert waiting["action_projection"] == expected_projection
+    assert waiting["affected_project"] == str(root.resolve())
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_rule", "expected_reason", "granted", "approval_text"),
+    [
+        pytest.param(
+            "once",
+            "approval.granted",
+            "user approved this exact action once",
+            True,
+            "approval: granted",
+            id="once",
+        ),
+        pytest.param(
+            "always",
+            "approval.granted_always",
+            "user approved a constrained persistent command rule",
+            True,
+            "approval: granted",
+            id="always",
+        ),
+        pytest.param(
+            "reject",
+            "approval.declined",
+            "user declined the action",
+            False,
+            "approval: rejected",
+            id="reject",
+        ),
+    ],
+)
+def test_waiting_and_resolved_approval_timeline_persists_actual_decision_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+    expected_rule: str,
+    expected_reason: str,
+    granted: bool,
+    approval_text: str,
+) -> None:
+    """Catches inferred or dropped policy metadata after once/always/reject resolution."""
+    command = _action(
+        kind="run_command",
+        summary="MODEL-SUMMARY-MUST-STAY-HIDDEN",
+        args=["git", "diff", "--no-ext-diff", "--check"],
+    )
+    finish = _action(kind="finish", summary="stop", status="blocked")
+    monkeypatch.setattr(
+        TaskOrchestrator,
+        "_run_command",
+        lambda _self, _action: ToolResult(True, "simulated command", {}),
+    )
+    app, root, _ = _waiting_app(tmp_path, monkeypatch, [command, finish])
+    task = app.state.local.task
+    assert task is not None
+    action_hash = _waiting_hash(root, task.id)
+
+    resolved_response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            f"/tasks/{task.id}/approval",
+            data={"action_hash": action_hash, "decision": decision},
+        )
+    )
+    feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
+    page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+
+    assert resolved_response.status_code == 303
+    events = feed.json()
+    waiting = next(event for event in events if event["task_status"] == "waiting_approval")
+    resolved = next(event for event in events if event["approval_granted"] is granted)
+    assert waiting["policy_rule_id"] == "command.read_only_approval_required"
+    assert waiting["policy_reason"] == "the read-only Git whitespace check requires approval"
+    assert resolved["policy_rule_id"] == expected_rule
+    assert resolved["policy_reason"] == expected_reason
+    assert resolved["action_projection"] == "Command: git diff --no-ext-diff --check"
+    assert resolved["affected_project"] == str(root.resolve())
+    assert approval_text in page.text
+    assert expected_rule in page.text
+    assert expected_reason in page.text
+    assert "MODEL-SUMMARY-MUST-STAY-HIDDEN" not in page.text + feed.text
+
+    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    assert "approval_granted" in script
+    assert "action_projection" in script
+    assert "affected_project" in script
+    assert "policy_rule_id" in script
+    assert "policy_reason" in script
+
+
 def test_terminal_task_page_does_not_load_polling_script(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -302,6 +465,45 @@ def test_command_rules_are_project_scoped_listable_and_revocable(
     assert revoked.status_code == 303
     assert CommandRuleStore(root).list_rules() == []
     assert missing.status_code == 404
+
+
+def test_terminal_task_keeps_its_original_event_root_after_reconfiguration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches old task detail reading the newly configured project's event database."""
+    delete = _action(kind="delete_path", summary="remove obsolete file", path="obsolete.txt")
+    app, original_root, _ = _waiting_app(tmp_path, monkeypatch, [delete])
+    task = app.state.local.task
+    assert task is not None
+    action_hash = _waiting_hash(original_root, task.id)
+    assert asyncio.run(
+        _request(
+            app,
+            "POST",
+            f"/tasks/{task.id}/approval",
+            data={"action_hash": action_hash, "decision": "reject"},
+        )
+    ).status_code == 303
+
+    replacement_root = _project_root(tmp_path / "replacement")
+    EventStore(replacement_root).append(
+        RunEvent(task_id=task.id, task_status=TaskStatus.COMPLETED)
+    )
+    replaced = asyncio.run(
+        _request(app, "POST", "/setup", data=_setup_data(replacement_root))
+    )
+    detail = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
+
+    assert replaced.status_code == 303
+    assert detail.status_code == 200
+    assert f"Project: {original_root.resolve()}" in detail.text
+    assert "delete.approval_required" in detail.text
+    assert feed.status_code == 200
+    events = feed.json()
+    assert events
+    assert all(event["affected_project"] == str(original_root.resolve()) for event in events)
+    assert all(event["task_status"] != "completed" for event in events)
 
 
 def test_memory_controls_keep_proposals_pending_until_approval_and_404_unknown_ids(

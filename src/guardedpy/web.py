@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
 import shlex
 from threading import Thread
@@ -88,6 +89,8 @@ class _LocalState:
     task: TaskState | None = None
     orchestrator: OrchestratorPort | None = None
     thread: Thread | None = None
+    task_roots: dict[UUID, Path] = field(default_factory=dict)
+    mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 _ACTIVE_STATUSES = {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL}
@@ -167,9 +170,10 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
 
     def task_events(task_id: UUID) -> list[StoredRunEvent]:
         state: _LocalState = app.state.local
-        if state.project_root is None:
+        project_root = state.task_roots.get(task_id)
+        if project_root is None:
             raise HTTPException(status_code=404, detail="Task was not found.")
-        return EventStore(state.project_root).events_for(task_id)
+        return EventStore(project_root).events_for(task_id)
 
     @app.get("/", response_class=HTMLResponse)
     async def home(request: Request) -> HTMLResponse:
@@ -180,25 +184,36 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
 
     @app.post("/setup", response_class=HTMLResponse)
     async def setup(request: Request) -> Response:
-        state: _LocalState = app.state.local
-        if state.task is not None and state.task.status in _ACTIVE_STATUSES:
-            return render_task(request, error="Another task is active.", status_code=409)
         form = await request.form()
         try:
             project_root, config, api_key = _validated_setup(form)
         except (TypeError, ValueError, ValidationError):
             return render_setup(request, error="Setup could not be saved.", status_code=422)
 
-        try:
-            memory_store = MemoryStore(project_root)
-            _write_snapshot(project_root, config)
-            services.credentials.set_key(api_key)
-        except Exception:
-            return render_setup(request, error="Setup could not be saved.", status_code=422)
+        state: _LocalState = app.state.local
+        async with state.mutation_lock:
+            if state.task is not None and state.task.status in _ACTIVE_STATUSES:
+                return render_task(request, error="Another task is active.", status_code=409)
+            try:
+                memory_store = MemoryStore(project_root)
+                snapshot = project_root / "harness.yaml"
+                had_snapshot = snapshot.is_file()
+                previous_snapshot = snapshot.read_bytes() if had_snapshot else None
+                _write_snapshot(project_root, config)
+            except Exception:
+                return render_setup(request, error="Setup could not be saved.", status_code=422)
+            try:
+                services.credentials.set_key(api_key)
+            except CredentialBackendUnavailableError:
+                _restore_snapshot(snapshot, had_snapshot, previous_snapshot)
+                return render_setup(request, error=_CREDENTIAL_ERROR, status_code=503)
+            except Exception:
+                _restore_snapshot(snapshot, had_snapshot, previous_snapshot)
+                return render_setup(request, error="Setup could not be saved.", status_code=422)
 
-        state.project_root = project_root
-        state.config = config
-        state.memory_store = memory_store
+            state.project_root = project_root
+            state.config = config
+            state.memory_store = memory_store
         return RedirectResponse("/tasks/new", status_code=303)
 
     @app.get("/tasks/new", response_class=HTMLResponse)
@@ -210,8 +225,6 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     @app.post("/tasks", response_class=HTMLResponse)
     async def create_task(request: Request) -> Response:
         state: _LocalState = app.state.local
-        if state.config is None or state.project_root is None or state.memory_store is None:
-            return render_setup(request, error="Setup could not be saved.", status_code=422)
         form = await request.form()
         description = str(form.get("description", "")).strip()
         bugfix_target = str(form.get("bugfix_target", "")).strip()
@@ -223,24 +236,30 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             return render_task(request, error="Task could not be started.", status_code=422)
         if task_mode is TaskMode.BUGFIX and not bugfix_target:
             return render_task(request, error="Task could not be started.", status_code=422)
-        if state.task is not None and state.task.status in _ACTIVE_STATUSES:
-            return render_task(request, error="Another task is active.", status_code=409)
+        async with state.mutation_lock:
+            if state.config is None or state.project_root is None or state.memory_store is None:
+                return render_setup(request, error="Setup could not be saved.", status_code=422)
+            if state.task is not None and state.task.status in _ACTIVE_STATUSES:
+                return render_task(request, error="Another task is active.", status_code=409)
 
-        task = TaskState(
-            description=description,
-            mode=task_mode,
-            bugfix_target=bugfix_target if task_mode is TaskMode.BUGFIX else None,
-            config=state.config,
-        )
-        orchestrator = services.orchestrator_factory(state.project_root, state.config, state.memory_store)
-        try:
-            orchestrator.submit(task)
-        except ValueError:
-            return render_task(request, error="Another task is active.", status_code=409)
-        state.task = task
-        state.orchestrator = orchestrator
-        thread = Thread(target=orchestrator.run, args=(task,), daemon=True)
-        state.thread = thread
+            task = TaskState(
+                description=description,
+                mode=task_mode,
+                bugfix_target=bugfix_target if task_mode is TaskMode.BUGFIX else None,
+                config=state.config,
+            )
+            orchestrator = services.orchestrator_factory(
+                state.project_root, state.config, state.memory_store
+            )
+            try:
+                orchestrator.submit(task)
+            except ValueError:
+                return render_task(request, error="Another task is active.", status_code=409)
+            state.task = task
+            state.orchestrator = orchestrator
+            state.task_roots[task.id] = state.project_root
+            thread = Thread(target=orchestrator.run, args=(task,), daemon=True)
+            state.thread = thread
         thread.start()
         return RedirectResponse("/tasks/new", status_code=303)
 
@@ -442,6 +461,15 @@ def _write_snapshot(project_root: Path, config: HarnessConfig) -> None:
         "timeout_seconds": config.timeout_seconds,
     }
     (project_root / "harness.yaml").write_text(yaml.safe_dump(snapshot, sort_keys=False))
+
+
+def _restore_snapshot(path: Path, existed: bool, content: bytes | None) -> None:
+    """Restore the exact pre-setup snapshot after a later credential mutation fails."""
+    if existed:
+        assert content is not None
+        path.write_bytes(content)
+        return
+    path.unlink(missing_ok=True)
 
 
 def _system_keyring() -> KeyringBackend:

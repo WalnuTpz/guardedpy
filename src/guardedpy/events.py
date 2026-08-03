@@ -9,11 +9,11 @@ from pathlib import Path
 import sqlite3
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from guardedpy.actions import Action, ApplyPatchAction, DeletePathAction, RunCommandAction, stable_hash
 from guardedpy.config import app_state_dir
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskStatus
+from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskStatus
 
 
 class StopReason(StrEnum):
@@ -66,6 +66,11 @@ class RunEvent(BaseModel):
     task_status: TaskStatus
     action: Action | None = None
     policy_verdict: PolicyVerdict | None = None
+    action_projection: str | None = Field(default=None, max_length=500)
+    policy_rule_id: str | None = Field(
+        default=None, max_length=128, pattern=r"^[a-z0-9_.]+$"
+    )
+    policy_reason: str | None = Field(default=None, max_length=300)
     approval_granted: bool | None = None
     feedback: FeedbackAudit | None = None
     retry_count: int | None = None
@@ -86,6 +91,8 @@ class StoredRunEvent(BaseModel):
     feedback_kind: FeedbackKind | None = None
     feedback_excerpt: str | None = None
     retry_count: int | None = None
+    action_projection: str | None = None
+    affected_project: str | None = None
     policy_rule_id: str | None = None
     policy_reason: str | None = None
     stop_reason: StopReason | None = None
@@ -105,29 +112,44 @@ def _project_feedback(feedback: FeedbackAudit | None) -> tuple[FeedbackKind | No
     return feedback.kind, _FEEDBACK_TEMPLATES[feedback.kind]
 
 
-def _project_approval_policy(event: RunEvent) -> tuple[str | None, str | None]:
-    """Project only fixed policy metadata for an already validated approval event."""
-    if event.policy_verdict is not PolicyVerdict.APPROVAL_REQUIRED:
-        return None, None
-    if isinstance(event.action, DeletePathAction):
-        return "delete.approval_required", "deletion requires approval"
-    if isinstance(event.action, ApplyPatchAction):
-        return "patch.non_code", "non-code files require approval"
-    if isinstance(event.action, RunCommandAction):
-        if event.action.args == ("git", "diff", "--no-ext-diff", "--check"):
-            return (
-                "command.read_only_approval_required",
-                "the read-only Git whitespace check requires approval",
-            )
-        return "command.approval_required", "the constrained command requires approval"
-    return None, None
+def safe_action_projection(action: Action, decision: PolicyDecision) -> str | None:
+    """Project decision inputs only after a real policy result binds the action hash."""
+    if decision.action_hash != stable_hash(action):
+        raise ValueError("policy decision does not bind the projected action")
+    approval_rules = {
+        "approval.declined",
+        "approval.granted",
+        "approval.granted_always",
+        "command.approval_required",
+        "command.persistent_rule",
+        "command.read_only_approval_required",
+        "delete.approval_required",
+        "patch.non_code",
+    }
+    if decision.rule_id not in approval_rules:
+        return None
+    if isinstance(action, RunCommandAction):
+        projection = f"Command: {' '.join(action.args)}"
+    elif isinstance(action, DeletePathAction):
+        projection = f"Path: {action.path}"
+    elif isinstance(action, ApplyPatchAction):
+        paths = tuple(
+            line.removeprefix("+++ b/").split("\t", maxsplit=1)[0]
+            for line in action.diff.splitlines()
+            if line.startswith("+++ b/")
+        )
+        projection = f"Paths: {', '.join(paths)}"
+    else:
+        return None
+    return projection if len(projection) <= 500 else f"{projection[:497]}..."
 
 
 class EventStore:
     """Append-only task events with a separate current-state index."""
 
     def __init__(self, project_root: Path) -> None:
-        self.database_path = app_state_dir(project_root) / "events.sqlite3"
+        self.project_root = project_root.resolve()
+        self.database_path = app_state_dir(self.project_root) / "events.sqlite3"
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -135,7 +157,6 @@ class EventStore:
         """Persist one fixed-format audit projection and update the task's state."""
         action_summary, action_hash = _project_action(event.action)
         feedback_kind, feedback_excerpt = _project_feedback(event.feedback)
-        policy_rule_id, policy_reason = _project_approval_policy(event)
         created_at = datetime.now(timezone.utc)
         with closing(sqlite3.connect(self.database_path)) as connection:
             cursor = connection.execute(
@@ -167,10 +188,18 @@ class EventStore:
                 """,
                 (str(event.task_id), event.task_status.value),
             )
-            if policy_rule_id is not None and policy_reason is not None:
+            if event.policy_rule_id is not None and event.policy_reason is not None:
                 connection.execute(
-                    "INSERT INTO event_policies (event_id, rule_id, reason) VALUES (?, ?, ?)",
-                    (cursor.lastrowid, policy_rule_id, policy_reason),
+                    """
+                    INSERT INTO event_policies (event_id, rule_id, reason, action_projection)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        cursor.lastrowid,
+                        event.policy_rule_id,
+                        event.policy_reason,
+                        event.action_projection,
+                    ),
                 )
             connection.commit()
             return StoredRunEvent(
@@ -183,8 +212,10 @@ class EventStore:
                 feedback_kind=feedback_kind,
                 feedback_excerpt=feedback_excerpt,
                 retry_count=event.retry_count,
-                policy_rule_id=policy_rule_id,
-                policy_reason=policy_reason,
+                action_projection=event.action_projection,
+                affected_project=str(self.project_root),
+                policy_rule_id=event.policy_rule_id,
+                policy_reason=event.policy_reason,
                 stop_reason=event.stop_reason,
                 id=cursor.lastrowid,
                 created_at=created_at,
@@ -195,7 +226,8 @@ class EventStore:
         with closing(sqlite3.connect(self.database_path)) as connection:
             rows = connection.execute(
                 """
-                SELECT events.*, event_policies.rule_id, event_policies.reason
+                SELECT events.*, event_policies.rule_id, event_policies.reason,
+                       event_policies.action_projection
                 FROM events
                 LEFT JOIN event_policies ON event_policies.event_id = events.id
                 WHERE events.task_id = ?
@@ -219,6 +251,8 @@ class EventStore:
                 created_at=datetime.fromisoformat(row[11]),
                 policy_rule_id=row[12],
                 policy_reason=row[13],
+                action_projection=row[14],
+                affected_project=str(self.project_root),
             )
             for row in rows
         ]
@@ -277,8 +311,16 @@ class EventStore:
                     event_id INTEGER PRIMARY KEY,
                     rule_id TEXT NOT NULL,
                     reason TEXT NOT NULL,
+                    action_projection TEXT,
                     FOREIGN KEY(event_id) REFERENCES events(id)
                 );
                 """
             )
+            policy_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(event_policies)")
+            }
+            if "action_projection" not in policy_columns:
+                connection.execute(
+                    "ALTER TABLE event_policies ADD COLUMN action_projection TEXT"
+                )
             connection.commit()

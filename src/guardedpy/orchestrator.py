@@ -37,7 +37,7 @@ from guardedpy.domain import (
     TaskStatus,
     is_approval_decision,
 )
-from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
+from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason, safe_action_projection
 from guardedpy.feedback import FeedbackCollector, PytestFeedback
 from guardedpy.llm import LLMClient, TemporaryProviderFailure
 from guardedpy.memory import MemoryStore
@@ -170,13 +170,7 @@ class TaskOrchestrator:
                     self._pending[(task.id, action_hash)] = (action, decision, round_number)
                     task.status = TaskStatus.WAITING_APPROVAL
                     self._events.append(
-                        RunEvent(
-                            task_id=task.id,
-                            task_status=task.status,
-                            action=action,
-                            policy_verdict=decision.verdict,
-                            retry_count=round_number,
-                        )
+                        self._decision_event(task, action, decision, retry_count=round_number)
                     )
                 return task
             if isinstance(action, FinishAction):
@@ -268,11 +262,10 @@ class TaskOrchestrator:
             if approval.verdict is not PolicyVerdict.ALLOW:
                 task.status = TaskStatus.BLOCKED
                 self._events.append(
-                    RunEvent(
-                        task_id=task.id,
-                        task_status=task.status,
-                        action=action,
-                        policy_verdict=approval.verdict,
+                    self._decision_event(
+                        task,
+                        action,
+                        approval,
                         approval_granted=False,
                         stop_reason=StopReason.BLOCKED,
                     )
@@ -282,12 +275,8 @@ class TaskOrchestrator:
                 return False
             task.status = TaskStatus.RUNNING
             self._events.append(
-                RunEvent(
-                    task_id=task.id,
-                    task_status=task.status,
-                    action=action,
-                    policy_verdict=approval.verdict,
-                    approval_granted=True,
+                self._decision_event(
+                    task, action, approval, approval_granted=True
                 )
             )
             try:
@@ -339,11 +328,10 @@ class TaskOrchestrator:
             self._policy.record_pytest(task, action, feedback)
             self._feedback[task.id] = self._pytest_feedback(feedback)
             self._events.append(
-                RunEvent(
-                    task_id=task.id,
-                    task_status=task.status,
-                    action=action,
-                    policy_verdict=decision.verdict,
+                self._decision_event(
+                    task,
+                    action,
+                    decision,
                     feedback=FeedbackAudit(
                         kind=feedback.kind,
                         node_id=feedback.node_ids[0] if feedback.node_ids else None,
@@ -387,13 +375,7 @@ class TaskOrchestrator:
         self, task: TaskState, action: Action, decision: PolicyDecision, round_number: int
     ) -> None:
         self._events.append(
-            RunEvent(
-                task_id=task.id,
-                task_status=task.status,
-                action=action,
-                policy_verdict=decision.verdict,
-                retry_count=round_number,
-            )
+            self._decision_event(task, action, decision, retry_count=round_number)
         )
 
     def _stop(
@@ -418,16 +400,42 @@ class TaskOrchestrator:
             }:
                 task.status = TaskStatus.BLOCKED
             self._events.append(
-                RunEvent(
+                self._decision_event(
+                    task,
+                    action,
+                    decision,
+                    retry_count=round_number,
+                    stop_reason=reason,
+                )
+                if action is not None and decision is not None
+                else RunEvent(
                     task_id=task.id,
                     task_status=task.status,
                     action=action,
-                    policy_verdict=decision.verdict if decision else None,
                     retry_count=round_number,
                     stop_reason=reason,
                 )
             )
         return task
+
+    @staticmethod
+    def _decision_event(
+        task: TaskState,
+        action: Action,
+        decision: PolicyDecision,
+        **fields: Any,
+    ) -> RunEvent:
+        """Persist the actual bounded policy result and its safe action projection."""
+        return RunEvent(
+            task_id=task.id,
+            task_status=task.status,
+            action=action,
+            policy_verdict=decision.verdict,
+            action_projection=safe_action_projection(action, decision),
+            policy_rule_id=decision.rule_id,
+            policy_reason=decision.reason,
+            **fields,
+        )
 
     def _context(self, task: TaskState) -> LlmContext:
         return ContextBuilder(self._project_root).build(

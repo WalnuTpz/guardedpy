@@ -420,7 +420,10 @@ def test_exact_approved_action_executes_once_and_keeps_full_action_out_of_event_
     assert target.exists() is False
     assert again is False
     assert task.status is TaskStatus.RUNNING
-    assert "obsolete.txt" not in repr(EventStore(tmp_path).events_for(task.id))
+    audit = repr(EventStore(tmp_path).events_for(task.id))
+    assert "Path: obsolete.txt" in audit
+    assert "delete obsolete file" not in audit
+    assert '"kind":"delete_path"' not in audit
 
 
 def test_once_approval_is_consumed_without_creating_a_persistent_rule(
@@ -512,6 +515,38 @@ def test_always_approval_survives_store_restart_without_raw_pending_action(
 
     assert orchestrator.resolve_approval(task.id, action_hash or "", decision="always") is True
     assert CommandRuleStore(tmp_path).matches(pending, None) is True
+
+
+def test_external_rule_revocation_is_seen_by_the_same_long_lived_orchestrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an orchestrator retaining a stale in-memory rule after WebUI revocation."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    command = RunCommandAction(
+        kind="run_command",
+        summary="safe whitespace check",
+        args=("git", "diff", "--no-ext-diff", "--check"),
+    )
+    store = CommandRuleStore(tmp_path)
+    rule = store.add_from(command, None)
+    finish = _action(kind="finish", summary="stop first task", status="blocked")
+    llm = ScriptedLLM([command.model_dump_json(), finish, command.model_dump_json()])
+    monkeypatch.setattr(
+        TaskOrchestrator,
+        "_run_command",
+        lambda _self, _action: ToolResult(True, "simulated command", {}),
+    )
+    orchestrator = TaskOrchestrator(tmp_path, llm, command_rules=store)
+
+    first = orchestrator.run(_bugfix_task())
+    assert first.status is TaskStatus.BLOCKED
+    assert CommandRuleStore(tmp_path).delete(rule.id) is True
+
+    second = orchestrator.run(_bugfix_task())
+
+    assert second.status is TaskStatus.WAITING_APPROVAL
+    pending = EventStore(tmp_path).events_for(second.id)[-1]
+    assert pending.policy_rule_id == "command.read_only_approval_required"
 
 
 def test_orchestrator_marks_previously_active_persisted_tasks_interrupted_on_startup(

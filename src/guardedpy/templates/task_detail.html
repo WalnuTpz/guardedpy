@@ -11,6 +11,8 @@
 <section class="card approval-card">
   <p class="eyebrow">ACTION APPROVAL REQUIRED</p>
   <h2>{{ approval_event.action_summary }}</h2>
+  {% if approval_event.action_projection %}<p>{{ approval_event.action_projection }}</p>{% endif %}
+  {% if approval_event.affected_project %}<p>Project: {{ approval_event.affected_project }}</p>{% endif %}
   <p>Policy: <span class="badge badge-amber">{{ approval_event.policy_verdict }}</span></p>
   {% if approval_event.policy_rule_id %}<p>Policy rule: {{ approval_event.policy_rule_id }}</p>{% endif %}
   {% if approval_event.policy_reason %}<p>Policy reason: {{ approval_event.policy_reason }}</p>{% endif %}
@@ -30,7 +32,12 @@
     <li>
       <span class="badge {% if event.task_status in ['completed', 'cancelled'] %}badge-green{% elif event.task_status in ['blocked', 'interrupted'] %}badge-red{% else %}badge-amber{% endif %}">{{ event.task_status }}</span>
       {% if event.action_summary %}<span>{{ event.action_summary }}</span>{% endif %}
+      {% if event.action_projection %}<span>{{ event.action_projection }}</span>{% endif %}
+      {% if event.affected_project %}<span>Project: {{ event.affected_project }}</span>{% endif %}
       {% if event.policy_verdict %}<span>policy: {{ event.policy_verdict }}</span>{% endif %}
+      {% if event.policy_rule_id %}<span>rule: {{ event.policy_rule_id }}</span>{% endif %}
+      {% if event.policy_reason %}<span>{{ event.policy_reason }}</span>{% endif %}
+      {% if event.approval_granted is sameas true %}<span>approval: granted</span>{% elif event.approval_granted is sameas false %}<span>approval: rejected</span>{% endif %}
       {% if event.feedback_excerpt %}<span>{{ event.feedback_excerpt }}</span>{% endif %}
       {% if event.stop_reason %}<span>stop: {{ event.stop_reason }}</span>{% endif %}
     </li>
