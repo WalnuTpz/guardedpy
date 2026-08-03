@@ -80,21 +80,57 @@ def test_store_database_is_created_in_external_app_state(
     assert not store.database_path.is_relative_to(tmp_path / "project")
 
 
+@pytest.mark.parametrize(
+    ("field_name", "unsafe_content"),
+    [
+        ("action_summary", "--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-old\n+new"),
+        ("feedback_excerpt", "task context:\nsource tree and prior model output"),
+        (
+            "action_summary",
+            '{"kind":"delete_path","path":"src/guardedpy/events.py"}',
+        ),
+        ("feedback_excerpt", "sk-" + "x" * 501),
+    ],
+)
+def test_append_rejects_content_that_is_not_a_bounded_audit_fragment(
+    store: EventStore, field_name: str, unsafe_content: str
+) -> None:
+    """Catches persisting a full diff, context, pending action, or opaque long value."""
+    task_id = uuid4()
+
+    with pytest.raises(ValueError, match="audit"):
+        store.append(
+            RunEvent(
+                task_id=task_id,
+                task_status=TaskStatus.RUNNING,
+                **{field_name: unsafe_content},
+            )
+        )
+
+    assert store.events_for(task_id) == []
+
+
 def test_mark_unfinished_interrupted_adds_terminal_event_only_for_active_tasks(
     store: EventStore,
 ) -> None:
     """Catches service restart recovery that resumes or mutates completed tasks."""
-    active_task_id = uuid4()
+    active_task_ids = (uuid4(), uuid4(), uuid4())
     completed_task_id = uuid4()
-    store.append(RunEvent(task_id=active_task_id, task_status=TaskStatus.RUNNING))
+    for task_id, status in zip(
+        active_task_ids,
+        (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL),
+        strict=True,
+    ):
+        store.append(RunEvent(task_id=task_id, task_status=status))
     store.append(RunEvent(task_id=completed_task_id, task_status=TaskStatus.COMPLETED))
 
     interrupted = store.mark_unfinished_interrupted()
 
-    assert interrupted == (active_task_id,)
-    active_events = store.events_for(active_task_id)
-    assert active_events[-1].task_status is TaskStatus.INTERRUPTED
-    assert active_events[-1].stop_reason == "service_restarted"
+    assert set(interrupted) == set(active_task_ids)
+    for task_id in active_task_ids:
+        active_events = store.events_for(task_id)
+        assert active_events[-1].task_status is TaskStatus.INTERRUPTED
+        assert active_events[-1].stop_reason == "service_restarted"
     assert [event.task_status for event in store.events_for(completed_task_id)] == [
         TaskStatus.COMPLETED
     ]

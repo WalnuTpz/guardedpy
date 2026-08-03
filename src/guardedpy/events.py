@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import sqlite3
 from uuid import UUID
@@ -12,6 +13,9 @@ from pydantic import BaseModel
 
 from guardedpy.config import app_state_dir
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskStatus
+
+
+MAX_AUDIT_TEXT_LENGTH = 500
 
 
 class RunEvent(BaseModel):
@@ -31,6 +35,23 @@ class RunEvent(BaseModel):
     created_at: datetime | None = None
 
 
+def _validate_audit_fragment(value: str | None) -> str | None:
+    """Accept only a short, single-line human-readable audit fragment."""
+    if value is None:
+        return None
+    if len(value) > MAX_AUDIT_TEXT_LENGTH:
+        raise ValueError("audit text exceeds the persistent fragment limit")
+    if "\n" in value or "\r" in value:
+        raise ValueError("audit text must be a single-line fragment")
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return value
+    if isinstance(decoded, (dict, list)):
+        raise ValueError("audit text must not contain a structured action payload")
+    return value
+
+
 class EventStore:
     """Append-only task events with a separate current-state index."""
 
@@ -41,6 +62,8 @@ class EventStore:
 
     def append(self, event: RunEvent) -> RunEvent:
         """Persist one minimal audit event and update the task's current state."""
+        action_summary = _validate_audit_fragment(event.action_summary)
+        feedback_excerpt = _validate_audit_fragment(event.feedback_excerpt)
         created_at = datetime.now(timezone.utc)
         with closing(sqlite3.connect(self.database_path)) as connection:
             cursor = connection.execute(
@@ -54,12 +77,12 @@ class EventStore:
                 (
                     str(event.task_id),
                     event.task_status.value,
-                    event.action_summary,
+                    action_summary,
                     event.action_hash,
                     event.policy_verdict.value if event.policy_verdict else None,
                     event.approval_granted,
                     event.feedback_kind.value if event.feedback_kind else None,
-                    event.feedback_excerpt,
+                    feedback_excerpt,
                     event.retry_count,
                     event.stop_reason,
                     created_at.isoformat(),
