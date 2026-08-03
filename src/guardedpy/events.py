@@ -25,6 +25,7 @@ class StopReason(StrEnum):
     ROUND_LIMIT = "round_limit"
     REPEATED_ACTION = "repeated_action"
     INVALID_MODEL_OUTPUT = "invalid_model_output"
+    PROVIDER_TEMPORARY_FAILURE = "provider_temporary_failure"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
 
 

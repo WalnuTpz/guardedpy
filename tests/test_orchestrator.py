@@ -13,6 +13,7 @@ from guardedpy.config import HarnessConfig
 from guardedpy.domain import TaskMode, TaskState, TaskStatus, TddPhase
 from guardedpy.events import EventStore, RunEvent, StopReason
 from guardedpy.llm import ScriptedLLM
+from guardedpy.memory import MemoryStore
 from guardedpy.orchestrator import TaskOrchestrator
 from guardedpy.workspace import Workspace
 
@@ -69,6 +70,26 @@ def test_scripted_loop_returns_failure_feedback_then_corrects_and_completes(
     events = EventStore(tmp_path).events_for(task.id)
     assert any(event.feedback_kind and event.feedback_kind.value == "assertion_failure" for event in events)
     assert events[-1].stop_reason is StopReason.COMPLETED
+
+
+def test_orchestrator_injects_relevant_approved_memories_into_the_llm_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches approved memories being accepted by a builder but never reaching a real loop call."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    task = _bugfix_task()
+    memories = MemoryStore(tmp_path)
+    for number in range(6):
+        memories.approve(memories.propose(task.id, f"repair selected failure memory {number}").id)
+    llm = ScriptedLLM([_action(kind="finish", summary="stop", status="blocked")])
+
+    TaskOrchestrator(tmp_path, llm, memory_store=memories).run(task)
+
+    context = json.loads(llm.contexts[0])
+    approved_memories = context["context"]["approved_memories"]
+    assert len(approved_memories) == 5
+    assert "repair selected failure memory 0" not in approved_memories
+    assert all(memory.startswith("repair selected failure memory") for memory in approved_memories)
 
 
 def test_invalid_model_json_stops_without_executing_a_workspace_tool(
