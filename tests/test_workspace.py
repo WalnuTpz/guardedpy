@@ -109,6 +109,41 @@ def test_patch_can_create_a_file_from_an_empty_hunk(tmp_path: Path) -> None:
     assert (tmp_path / "src" / "new.py").read_text() == "created\n"
 
 
+def test_patch_rejects_out_of_range_zero_line_hunk_without_writing(tmp_path: Path) -> None:
+    """Catches a zero-line hunk silently appending at a different location."""
+    target = tmp_path / "notes.txt"
+    target.write_text("one\n")
+
+    result = Workspace(tmp_path, safe_config(tmp_path)).apply_patch(
+        """--- a/notes.txt
++++ b/notes.txt
+@@ -999,0 +999 @@
++late
+"""
+    )
+
+    assert result.ok is False
+    assert result.data["reason"] == "hunk_mismatch"
+    assert target.read_text() == "one\n"
+
+
+def test_patch_allows_zero_line_hunk_at_end_of_file(tmp_path: Path) -> None:
+    """Catches a boundary check that rejects the valid insertion position after EOF."""
+    target = tmp_path / "notes.txt"
+    target.write_text("one\n")
+
+    result = Workspace(tmp_path, safe_config(tmp_path)).apply_patch(
+        """--- a/notes.txt
++++ b/notes.txt
+@@ -2,0 +3 @@
++two
+"""
+    )
+
+    assert result.ok is True
+    assert target.read_text() == "one\ntwo\n"
+
+
 def test_patch_rejects_a_path_outside_the_project(tmp_path: Path) -> None:
     """Catches a diff header that lets a patch write outside the selected root."""
     result = Workspace(tmp_path, safe_config(tmp_path)).apply_patch(

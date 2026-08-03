@@ -216,7 +216,7 @@ class Workspace:
         line_delta = 0
         for hunk in hunks:
             position = (hunk.old_start - 1 if hunk.old_start else 0) + line_delta
-            if position < 0:
+            if position < 0 or position > len(lines):
                 return None
             expected = [line[1:] for line in hunk.lines if line[0] in " -"]
             replacement = [line[1:] for line in hunk.lines if line[0] in " +"]
