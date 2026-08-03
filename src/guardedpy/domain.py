@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal, TypeAlias
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
@@ -37,6 +39,28 @@ class PolicyVerdict(StrEnum):
     ALLOW = "allow"
     APPROVAL_REQUIRED = "approval_required"
     DENY = "deny"
+
+
+ApprovalDecision: TypeAlias = Literal["reject", "once", "always"]
+
+
+class CommandRuleKind(StrEnum):
+    """The only command families eligible for durable approval."""
+
+    GIT_DIFF_CHECK = "git_diff_check"
+    GIT_PUSH = "git_push"
+    PIP_INSTALL = "pip_install"
+
+
+@dataclass(frozen=True, slots=True)
+class CommandApprovalRule:
+    """An immutable, structured permission without a raw pending action."""
+
+    id: str
+    kind: CommandRuleKind
+    project_hash: str
+    branch: str | None = None
+    package_specs: tuple[str, ...] = ()
 
 
 class PolicyDecision(BaseModel):

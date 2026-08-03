@@ -10,6 +10,8 @@ from uuid import uuid4
 import pytest
 
 import guardedpy.orchestrator as orchestrator_module
+from guardedpy.actions import RunCommandAction
+from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
 from guardedpy.domain import TaskMode, TaskState, TaskStatus, TddPhase
 from guardedpy.events import EventStore, RunEvent, StopReason
@@ -419,6 +421,61 @@ def test_exact_approved_action_executes_once_and_keeps_full_action_out_of_event_
     assert again is False
     assert task.status is TaskStatus.RUNNING
     assert "obsolete.txt" not in repr(EventStore(tmp_path).events_for(task.id))
+
+
+def test_once_approval_is_consumed_without_creating_a_persistent_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a one-time command decision silently becoming reusable permission."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    action = _action(
+        kind="run_command",
+        summary="install approved package once",
+        args=["python", "-m", "pip", "install", "ruff"],
+    )
+    monkeypatch.setattr(
+        TaskOrchestrator,
+        "_run_command",
+        lambda _self, _action: ToolResult(True, "simulated command", {}),
+    )
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
+
+    waiting = orchestrator.run(task)
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+    accepted = orchestrator.resolve_approval(task.id, action_hash or "", decision="once")
+    replayed = orchestrator.resolve_approval(task.id, action_hash or "", decision="once")
+
+    assert accepted is True
+    assert replayed is False
+    assert task.status is TaskStatus.RUNNING
+    assert CommandRuleStore(tmp_path).list_rules() == []
+
+
+def test_always_approval_survives_store_restart_without_raw_pending_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches permanent approval failing to derive durable constrained permission."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    pending = RunCommandAction(
+        kind="run_command",
+        summary="do not persist this pending action",
+        args=("python", "-m", "pip", "install", "ruff"),
+    )
+    monkeypatch.setattr(
+        TaskOrchestrator,
+        "_run_command",
+        lambda _self, _action: ToolResult(True, "simulated command", {}),
+    )
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([pending.model_dump_json()]))
+
+    orchestrator.run(task)
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+
+    assert orchestrator.resolve_approval(task.id, action_hash or "", decision="always") is True
+    assert CommandRuleStore(tmp_path).matches(pending, None) is True
 
 
 def test_orchestrator_marks_previously_active_persisted_tasks_interrupted_on_startup(

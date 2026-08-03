@@ -12,6 +12,7 @@ from guardedpy.actions import (
     RunCommandAction,
     RunPytestAction,
 )
+from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TddPhase
 from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
@@ -441,8 +442,8 @@ def test_delete_approval_is_exact_and_single_use(
     action = DeletePathAction(kind="delete_path", summary="remove test", path="tests/test_example.py")
     pending = policy.request_approval(ready_bugfix_task, action)
 
-    accepted = policy.apply_approval(pending, action, approved=True)
-    replayed = policy.apply_approval(pending, action, approved=True)
+    accepted = policy.apply_approval(pending, action, decision="once")
+    replayed = policy.apply_approval(pending, action, decision="once")
 
     assert accepted.verdict is PolicyVerdict.ALLOW
     assert (replayed.verdict, replayed.rule_id) == (PolicyVerdict.DENY, "approval.already_used")
@@ -460,7 +461,7 @@ def test_approval_does_not_match_a_different_action(
     result = policy.apply_approval(
         pending,
         DeletePathAction(kind="delete_path", summary="source", path="src/example.py"),
-        approved=True,
+        decision="once",
     )
 
     assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "approval.action_mismatch")
@@ -473,7 +474,7 @@ def test_approval_cannot_override_a_direct_denial(
     action = ApplyPatchAction(kind="apply_patch", summary="change", diff=SOURCE_DIFF)
     pending = policy.request_approval(feature_task, action)
 
-    result = policy.apply_approval(pending, action, approved=True)
+    result = policy.apply_approval(pending, action, decision="once")
 
     assert (pending.verdict, pending.rule_id) == (PolicyVerdict.DENY, "tdd.red_required")
     assert result.verdict is PolicyVerdict.DENY
@@ -506,6 +507,113 @@ def test_only_exact_read_only_git_diff_can_wait_for_approval(
         PolicyVerdict.APPROVAL_REQUIRED,
         "command.read_only_approval_required",
     )
+
+
+@pytest.mark.parametrize(
+    ("args", "current_branch"),
+    [
+        (("git", "diff", "--no-ext-diff", "--check"), None),
+        (("git", "push", "origin", "main"), "main"),
+        (("python", "-m", "pip", "install", "ruff", "httpx>=0.27"), None),
+    ],
+)
+def test_each_exact_command_family_requires_approval_without_a_rule(
+    tmp_path: Path,
+    feature_task: TaskState,
+    args: tuple[str, ...],
+    current_branch: str | None,
+) -> None:
+    """Catches an eligible command family executing before any human decision."""
+    result = PolicyEngine(tmp_path, current_branch=current_branch).decide(
+        feature_task,
+        RunCommandAction(kind="run_command", summary="eligible command", args=args),
+    )
+
+    assert result.verdict is PolicyVerdict.APPROVAL_REQUIRED
+
+
+def test_matching_always_allowed_git_push_rule_bypasses_new_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_task: TaskState
+) -> None:
+    """Catches a valid permanent push rule being ignored on the same branch and root."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    store = CommandRuleStore(tmp_path)
+    approved = RunCommandAction(
+        kind="run_command", summary="first wording", args=("git", "push", "origin", "main")
+    )
+    store.add_from(approved, "main")
+    same_push = RunCommandAction(
+        kind="run_command", summary="new wording", args=("git", "push", "origin", "main")
+    )
+
+    result = PolicyEngine(tmp_path, current_branch="main", command_rules=store).decide(
+        feature_task, same_push
+    )
+
+    assert (result.verdict, result.rule_id) == (
+        PolicyVerdict.ALLOW,
+        "command.persistent_rule",
+    )
+
+
+def test_policy_rejects_a_rule_store_injected_from_another_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches dependency injection moving durable permission across project roots."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    first_store = CommandRuleStore(first)
+    first_store.add_from(
+        RunCommandAction(
+            kind="run_command",
+            summary="check first project",
+            args=("git", "diff", "--no-ext-diff", "--check"),
+        ),
+        None,
+    )
+
+    with pytest.raises(ValueError, match="project root"):
+        PolicyEngine(second, command_rules=first_store)
+
+
+@pytest.mark.parametrize(
+    ("args", "rule_id"),
+    [
+        (("git", "push", "origin", "feature"), "command.not_allowed"),
+        (("git", "push", "--force", "origin", "main"), "command.not_allowed"),
+        (("python", "-m", "pip", "install", "https://example.invalid/pkg.whl"), "command.not_allowed"),
+        (("python", "-m", "pip", "install", ".env"), "command.credentials"),
+        (("python", "-m", "pip", "install", "../local-package"), "path.outside_root"),
+        (("python", "-m", "pip", "install", "ruff;id"), "command.metacharacter"),
+        (("git", "push", "origin", "main>release"), "command.metacharacter"),
+    ],
+)
+def test_branch_url_force_and_direct_denies_run_before_persistent_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    feature_task: TaskState,
+    args: tuple[str, ...],
+    rule_id: str,
+) -> None:
+    """Catches stored approval weakening branch, grammar, credential, path, or shell checks."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    store = CommandRuleStore(tmp_path)
+    store.add_from(
+        RunCommandAction(
+            kind="run_command", summary="approved push", args=("git", "push", "origin", "main")
+        ),
+        "main",
+    )
+
+    result = PolicyEngine(tmp_path, current_branch="main", command_rules=store).decide(
+        feature_task,
+        RunCommandAction(kind="run_command", summary="unsafe variant", args=args),
+    )
+
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, rule_id)
 
 
 @pytest.mark.parametrize(

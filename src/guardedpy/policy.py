@@ -19,15 +19,35 @@ from guardedpy.actions import (
     RunPytestAction,
     stable_hash,
 )
-from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskMode, TaskState, TddPhase
+from guardedpy.command_rules import CommandRuleStore, command_rule_kind, has_shell_metacharacter
+from guardedpy.domain import (
+    ApprovalDecision,
+    CommandRuleKind,
+    FeedbackKind,
+    PolicyDecision,
+    PolicyVerdict,
+    TaskMode,
+    TaskState,
+    TddPhase,
+)
 from guardedpy.feedback import PytestFeedback
 
 
 class PolicyEngine:
-    """Evaluate actions without executing them or retaining approval details on disk."""
+    """Evaluate actions without executing them or persisting raw pending actions."""
 
-    def __init__(self, project_root: Path) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        current_branch: str | None = None,
+        command_rules: CommandRuleStore | None = None,
+    ) -> None:
         self._project_root = project_root.resolve()
+        if command_rules is not None and command_rules.project_root != self._project_root:
+            raise ValueError("command rule store belongs to another project root")
+        self._current_branch = current_branch
+        self._command_rules = command_rules or CommandRuleStore(self._project_root)
         self._read_paths: dict[UUID, set[str]] = {}
         self._feature_test_changes: set[UUID] = set()
         self._new_test_paths: dict[UUID, set[str]] = {}
@@ -161,9 +181,9 @@ class PolicyEngine:
         return decision
 
     def apply_approval(
-        self, pending: PolicyDecision, action: Action, approved: bool
+        self, pending: PolicyDecision, action: Action, decision: ApprovalDecision
     ) -> PolicyDecision:
-        """Apply one user decision to the exact pending action and consume it on acceptance."""
+        """Consume an exact pending approval as rejection, one-time, or constrained durable access."""
         if pending.verdict is not PolicyVerdict.APPROVAL_REQUIRED or pending.task_id is None:
             return self._deny(None, action, "approval.not_pending", "action has no pending approval")
         if pending.action_hash != stable_hash(action):
@@ -171,14 +191,37 @@ class PolicyEngine:
         approval_key = (pending.task_id, pending.action_hash)
         if approval_key not in self._pending_approvals:
             return self._deny(None, action, "approval.already_used", "approval was already consumed")
-        if not approved:
+        if decision == "reject":
             self._pending_approvals.remove(approval_key)
             return self._deny(None, action, "approval.declined", "user declined the action")
+        if decision == "always":
+            if not isinstance(action, RunCommandAction):
+                self._pending_approvals.remove(approval_key)
+                return self._deny(
+                    None,
+                    action,
+                    "approval.permanent_command_only",
+                    "only constrained command families support permanent approval",
+                )
+            try:
+                self._command_rules.add_from(action, self._current_branch)
+            except ValueError:
+                self._pending_approvals.remove(approval_key)
+                return self._deny(
+                    None,
+                    action,
+                    "approval.permanent_rule_invalid",
+                    "action cannot derive a constrained permanent rule",
+                )
         self._pending_approvals.remove(approval_key)
         return PolicyDecision(
             verdict=PolicyVerdict.ALLOW,
-            rule_id="approval.granted",
-            reason="user approved this exact action once",
+            rule_id="approval.granted_always" if decision == "always" else "approval.granted",
+            reason=(
+                "user approved a constrained persistent command rule"
+                if decision == "always"
+                else "user approved this exact action once"
+            ),
             task_id=pending.task_id,
             action_hash=pending.action_hash,
         )
@@ -265,6 +308,15 @@ class PolicyEngine:
             return self._deny(task, action, "command.privilege", "privilege escalation is forbidden")
         if command == "keyring" or any(".env" in argument for argument in action.args):
             return self._deny(task, action, "command.credentials", "credential access is forbidden")
+        if any(self._argument_escapes_root(argument) for argument in action.args):
+            return self._deny(task, action, "path.outside_root", "command path must stay inside root")
+        if has_shell_metacharacter(action.args):
+            return self._deny(
+                task,
+                action,
+                "command.metacharacter",
+                "shell metacharacters are forbidden in command arguments",
+            )
         for argument in action.args:
             normalized_path = self._normalized_project_path(argument)
             if normalized_path is not None and self._is_sensitive_path(normalized_path):
@@ -278,19 +330,39 @@ class PolicyEngine:
                 "command.source_or_test_write",
                 "generic commands cannot target source or test directories",
             )
-        if action.args == ("git", "diff", "--no-ext-diff", "--check"):
+        kind = command_rule_kind(action, self._current_branch)
+        if kind is None:
+            return self._deny(
+                task,
+                action,
+                "command.not_allowed",
+                "command does not match an exact approvable family",
+            )
+        if self._command_rules.matches(action, self._current_branch):
+            return self._allow(
+                task,
+                action,
+                "command.persistent_rule",
+                "a matching constrained project rule allows this command",
+            )
+        if kind is CommandRuleKind.GIT_DIFF_CHECK:
             return self._approval_required(
                 task,
                 action,
                 "command.read_only_approval_required",
                 "the read-only Git whitespace check requires approval",
             )
-        return self._deny(
+        return self._approval_required(
             task,
             action,
-            "command.not_allowed",
-            "only the fixed read-only Git diff check may request approval",
+            "command.approval_required",
+            "the constrained command requires approval",
         )
+
+    @staticmethod
+    def _argument_escapes_root(argument: str) -> bool:
+        path = PurePath(argument)
+        return path.is_absolute() or ".." in path.parts or argument.startswith("~")
 
     def _memory_proposal_decision(
         self, task: TaskState, action: ProposeMemoryAction

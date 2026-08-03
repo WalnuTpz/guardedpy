@@ -28,7 +28,8 @@ from guardedpy.actions import (
     stable_hash,
 )
 from guardedpy.context import ContextBuilder, LlmContext
-from guardedpy.domain import PolicyDecision, PolicyVerdict, TaskState, TaskStatus
+from guardedpy.command_rules import CommandRuleStore
+from guardedpy.domain import ApprovalDecision, PolicyDecision, PolicyVerdict, TaskState, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 from guardedpy.feedback import FeedbackCollector, PytestFeedback
 from guardedpy.llm import LLMClient, TemporaryProviderFailure
@@ -55,12 +56,18 @@ class TaskOrchestrator:
         *,
         max_rounds: int = 20,
         memory_store: MemoryStore | None = None,
+        current_branch: str | None = None,
+        command_rules: CommandRuleStore | None = None,
     ) -> None:
         self._project_root = project_root.resolve()
         self._llm = llm
         self._max_rounds = max_rounds
         self._memory_store = memory_store or MemoryStore(self._project_root)
-        self._policy = PolicyEngine(self._project_root)
+        self._policy = PolicyEngine(
+            self._project_root,
+            current_branch=current_branch,
+            command_rules=command_rules,
+        )
         self._workspace_by_task: dict[UUID, Workspace] = {}
         self._tasks: dict[UUID, TaskState] = {}
         self._feedback: dict[UUID, dict[str, Any] | None] = {}
@@ -228,16 +235,29 @@ class TaskOrchestrator:
             )
         return task
 
-    def resolve_approval(self, task_id: UUID, action_hash: str, *, approved: bool) -> bool:
-        """Consume exactly one in-memory approval and execute only its exact allowed action."""
+    def resolve_approval(
+        self,
+        task_id: UUID,
+        action_hash: str,
+        *,
+        decision: ApprovalDecision | None = None,
+        approved: bool | None = None,
+    ) -> bool:
+        """Consume an exact approval decision and execute only the bound allowed action."""
+        if decision is None:
+            if approved is None:
+                return False
+            decision = "once" if approved else "reject"
+        elif approved is not None:
+            return False
         with self._state_lock:
             key = (task_id, action_hash)
             pending = self._pending.pop(key, None)
             task = self._tasks.get(task_id)
             if pending is None or task is None or task.status is not TaskStatus.WAITING_APPROVAL:
                 return False
-            action, decision, round_number = pending
-            approval = self._policy.apply_approval(decision, action, approved)
+            action, pending_decision, round_number = pending
+            approval = self._policy.apply_approval(pending_decision, action, decision=decision)
             if approval.verdict is not PolicyVerdict.ALLOW:
                 task.status = TaskStatus.BLOCKED
                 self._events.append(
