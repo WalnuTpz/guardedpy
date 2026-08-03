@@ -6,11 +6,10 @@ from contextlib import closing
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-import re
 import sqlite3
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict
 
 from guardedpy.actions import Action, stable_hash
 from guardedpy.config import app_state_dir
@@ -47,11 +46,6 @@ _FEEDBACK_TEMPLATES = {
     FeedbackKind.TIMEOUT: "pytest timed out",
 }
 
-_NODE_ID_PATTERN = re.compile(
-    r"^tests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::[A-Za-z_][A-Za-z0-9_]*$"
-)
-
-
 class FeedbackAudit(BaseModel):
     """The narrow, structured feedback input allowed to reach audit storage."""
 
@@ -59,13 +53,6 @@ class FeedbackAudit(BaseModel):
 
     kind: FeedbackKind
     node_id: str | None = None
-
-    @field_validator("node_id")
-    @classmethod
-    def require_a_plain_test_node(cls, value: str | None) -> str | None:
-        if value is not None and not _NODE_ID_PATTERN.fullmatch(value):
-            raise ValueError("feedback node must be a plain tests/<file>::<test> identifier")
-        return value
 
 
 class RunEvent(BaseModel):
@@ -111,10 +98,7 @@ def _project_action(action: Action | None) -> tuple[str | None, str | None]:
 def _project_feedback(feedback: FeedbackAudit | None) -> tuple[FeedbackKind | None, str | None]:
     if feedback is None:
         return None, None
-    excerpt = _FEEDBACK_TEMPLATES[feedback.kind]
-    if feedback.node_id is not None:
-        excerpt = f"{excerpt} at {feedback.node_id}"
-    return feedback.kind, excerpt
+    return feedback.kind, _FEEDBACK_TEMPLATES[feedback.kind]
 
 
 class EventStore:

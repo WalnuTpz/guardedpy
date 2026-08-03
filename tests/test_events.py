@@ -41,7 +41,7 @@ def test_append_projects_an_action_and_feedback_without_persisting_their_text(
             approval_granted=True,
             feedback=FeedbackAudit(
                 kind=FeedbackKind.ASSERTION_FAILURE,
-                node_id="tests/test_events.py::test_projection",
+                node_id="tests/sk-short-key.py::test_projection",
             ),
             retry_count=2,
             stop_reason=StopReason.ROUND_LIMIT,
@@ -54,14 +54,19 @@ def test_append_projects_an_action_and_feedback_without_persisting_their_text(
     assert stored.policy_verdict is PolicyVerdict.ALLOW
     assert stored.approval_granted is True
     assert stored.feedback_kind is FeedbackKind.ASSERTION_FAILURE
-    assert stored.feedback_excerpt == "pytest assertion failure at tests/test_events.py::test_projection"
+    assert stored.feedback_excerpt == "pytest assertion failure"
     assert stored.retry_count == 2
     assert stored.stop_reason is StopReason.ROUND_LIMIT
     assert "sk-short-key" not in repr(stored)
     assert "replace every secret" not in repr(stored)
 
     with sqlite3.connect(store.database_path) as connection:
+        stored_feedback = connection.execute(
+            "SELECT feedback_kind, feedback_excerpt FROM events WHERE task_id = ?",
+            (str(task_id),),
+        ).fetchone()
         columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+    assert stored_feedback == ("assertion_failure", "pytest assertion failure")
     assert columns == {
         "id",
         "task_id",
@@ -114,13 +119,6 @@ def test_run_event_rejects_all_direct_audit_text_before_any_event_is_written(
         )
 
     assert store.events_for(task_id) == []
-
-
-def test_feedback_audit_rejects_a_node_that_could_carry_arbitrary_text() -> None:
-    """Catches a feedback template interpolating arbitrary pytest output into SQLite."""
-
-    with pytest.raises(ValidationError, match="feedback node"):
-        FeedbackAudit(kind=FeedbackKind.ASSERTION_FAILURE, node_id="sk-short-key")
 
 
 def test_mark_unfinished_interrupted_adds_terminal_event_only_for_active_tasks(
