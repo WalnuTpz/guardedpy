@@ -113,6 +113,25 @@ def test_orchestrator_injects_relevant_approved_memories_into_the_llm_context(
     assert all(memory.startswith("repair selected failure memory") for memory in approved_memories)
 
 
+def test_terminal_memory_proposal_enters_queue_but_not_persistent_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a model proposal being persisted or ignored before human approval."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    task = _bugfix_task()
+    memory_store = MemoryStore(tmp_path)
+    proposal = _action(
+        kind="propose_memory", summary="save parser note", text="Use parser fixtures"
+    )
+    finish = _action(kind="finish", summary="stop", status="blocked")
+
+    result = TaskOrchestrator(tmp_path, ScriptedLLM([proposal, finish]), memory_store=memory_store).run(task)
+
+    assert result.status is TaskStatus.BLOCKED
+    assert [entry.text for entry in memory_store.proposals()] == ["Use parser fixtures"]
+    assert MemoryStore(tmp_path).search("parser") == []
+
+
 def test_invalid_model_json_stops_without_executing_a_workspace_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

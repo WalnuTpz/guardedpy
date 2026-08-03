@@ -9,6 +9,9 @@ from typing import Annotated, Literal, TypeAlias
 from pydantic import BaseModel, Field, TypeAdapter
 
 
+MEMORY_PROPOSAL_TEXT_MAX_LENGTH = 500
+
+
 class _ActionBase(BaseModel):
     summary: str
 
@@ -53,6 +56,11 @@ class RequestApprovalAction(_ActionBase):
     reason: str
 
 
+class ProposeMemoryAction(_ActionBase):
+    kind: Literal["propose_memory"]
+    text: str = Field(min_length=1, max_length=MEMORY_PROPOSAL_TEXT_MAX_LENGTH)
+
+
 class FinishAction(_ActionBase):
     kind: Literal["finish"]
     status: Literal["completed", "blocked"]
@@ -66,6 +74,7 @@ Action: TypeAlias = Annotated[
     | RunPytestAction
     | RunCommandAction
     | RequestApprovalAction
+    | ProposeMemoryAction
     | FinishAction,
     Field(discriminator="kind"),
 ]

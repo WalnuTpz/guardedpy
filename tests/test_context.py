@@ -87,5 +87,6 @@ def test_context_marks_pytest_excerpt_untrusted_and_exposes_action_kinds() -> No
         "run_pytest",
         "run_command",
         "request_approval",
+        "propose_memory",
         "finish",
     }

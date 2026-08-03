@@ -7,6 +7,7 @@ from guardedpy.actions import (
     ApplyPatchAction,
     DeletePathAction,
     FinishAction,
+    ProposeMemoryAction,
     ReadFileAction,
     RunCommandAction,
     RunPytestAction,
@@ -38,6 +39,19 @@ ROOT_INTERNAL_SOURCE_DIFF = """--- a/tests/../src/example.py
 +after
 """
 
+NEW_TEST_DIFF = """--- /dev/null
++++ b/tests/test_created.py
+@@ -0,0 +1,2 @@
++def test_created() -> None:
++    assert False
+"""
+
+NEW_SOURCE_DIFF = """--- /dev/null
++++ b/src/created.py
+@@ -0,0 +1 @@
++VALUE = "created"
+"""
+
 
 @pytest.fixture
 def policy(tmp_path: Path) -> PolicyEngine:
@@ -51,6 +65,56 @@ def test_source_patch_before_red_is_denied(policy: PolicyEngine, feature_task: T
     )
 
     assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "tdd.red_required")
+
+
+def test_feature_can_create_test_before_red_without_prior_read(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches new tests inheriting the read requirement for existing files."""
+    result = policy.decide(
+        feature_task, ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
+    )
+
+    assert result.verdict is PolicyVerdict.ALLOW
+
+
+def test_new_source_file_requires_a_created_test_then_selected_red(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches source creation skipping the successful new-test and red gates."""
+    test_patch = ApplyPatchAction(kind="apply_patch", summary="add test", diff=NEW_TEST_DIFF)
+    source_patch = ApplyPatchAction(kind="apply_patch", summary="add source", diff=NEW_SOURCE_DIFF)
+
+    assert policy.decide(feature_task, source_patch).rule_id == "tdd.red_required"
+    assert policy.decide(feature_task, test_patch).verdict is PolicyVerdict.ALLOW
+    assert policy.record_patch(feature_task, test_patch).verdict is PolicyVerdict.ALLOW
+    policy.record_new_test_path(feature_task, "tests/test_created.py")
+    assert (
+        policy.record_pytest(
+            feature_task,
+            RunPytestAction(kind="run_pytest", summary="observe red", targets=("tests/test_created.py",)),
+            PytestFeedback(
+                FeedbackKind.ASSERTION_FAILURE,
+                ("tests/test_created.py",),
+                "assert False",
+            ),
+        ).verdict
+        is PolicyVerdict.ALLOW
+    )
+
+    assert policy.decide(feature_task, source_patch).verdict is PolicyVerdict.ALLOW
+
+
+def test_memory_proposal_requires_nonblank_text(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches whitespace-only model memory becoming a user-review candidate."""
+    result = policy.decide(
+        feature_task,
+        ProposeMemoryAction(kind="propose_memory", summary="remember", text="   "),
+    )
+
+    assert (result.verdict, result.rule_id) == (PolicyVerdict.DENY, "memory.text_required")
 
 
 def test_feature_task_records_red_only_after_a_test_patch(

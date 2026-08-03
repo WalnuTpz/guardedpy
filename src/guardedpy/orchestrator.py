@@ -19,6 +19,7 @@ from guardedpy.actions import (
     DeletePathAction,
     FinishAction,
     ListFilesAction,
+    ProposeMemoryAction,
     ReadFileAction,
     RequestApprovalAction,
     RunCommandAction,
@@ -294,6 +295,8 @@ class TaskOrchestrator:
             result = workspace.apply_patch(action.diff)
             if result.ok:
                 self._policy.record_patch(task, action)
+                for path in self._created_test_paths(task, action):
+                    self._policy.record_new_test_path(task, path)
             self._record_tool_result(task, action, decision, result, round_number)
             return
         if isinstance(action, DeletePathAction):
@@ -327,6 +330,11 @@ class TaskOrchestrator:
             return
         if isinstance(action, RequestApprovalAction):
             self._feedback[task.id] = {"type": "approval_request", "recorded": True}
+            self._record_decision(task, action, decision, round_number)
+            return
+        if isinstance(action, ProposeMemoryAction):
+            self._memory_store.propose(task.id, action.text)
+            self._feedback[task.id] = {"type": "memory_proposal", "recorded": True}
             self._record_decision(task, action, decision, round_number)
             return
         raise TypeError(f"unsupported allowed action: {type(action).__name__}")
@@ -419,6 +427,21 @@ class TaskOrchestrator:
             sort_keys=True,
         )
         return sha256(canonical.encode()).hexdigest()
+
+    @staticmethod
+    def _created_test_paths(task: TaskState, action: ApplyPatchAction) -> tuple[str, ...]:
+        operations, error_rule = PolicyEngine._patch_operations(action.diff)
+        assert error_rule is None
+        return tuple(
+            path
+            for path, created in operations
+            if created
+            and any(
+                PurePosixPath(directory) in PurePosixPath(path).parents
+                or PurePosixPath(path) == PurePosixPath(directory)
+                for directory in task.config.test_dirs
+            )
+        )
 
     def _discard_pending(self, task_id: UUID) -> None:
         for key in tuple(self._pending):

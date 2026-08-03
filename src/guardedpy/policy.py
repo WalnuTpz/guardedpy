@@ -11,6 +11,8 @@ from guardedpy.actions import (
     DeletePathAction,
     FinishAction,
     ListFilesAction,
+    MEMORY_PROPOSAL_TEXT_MAX_LENGTH,
+    ProposeMemoryAction,
     ReadFileAction,
     RequestApprovalAction,
     RunCommandAction,
@@ -28,6 +30,7 @@ class PolicyEngine:
         self._project_root = project_root.resolve()
         self._read_paths: dict[UUID, set[str]] = {}
         self._feature_test_changes: set[UUID] = set()
+        self._new_test_paths: dict[UUID, set[str]] = {}
         self._full_suite_green: set[UUID] = set()
         self._pending_approvals: set[tuple[UUID, str]] = set()
 
@@ -43,6 +46,8 @@ class PolicyEngine:
             return self._pytest_decision(task, action)
         if isinstance(action, RunCommandAction):
             return self._command_decision(task, action)
+        if isinstance(action, ProposeMemoryAction):
+            return self._memory_proposal_decision(task, action)
         if isinstance(action, RequestApprovalAction):
             return self._allow(task, action, "approval.requested", "approval request is recorded")
         if isinstance(action, FinishAction):
@@ -75,6 +80,13 @@ class PolicyEngine:
             task.tdd_phase = TddPhase.IMPLEMENTATION
         self._invalidate_reads(task, normalized_paths)
         return decision
+
+    def record_new_test_path(self, task: TaskState, path: str) -> None:
+        """Record a test created by a successful atomic workspace patch."""
+        normalized_path = self._normalized_project_path(path)
+        if normalized_path is None or self._path_category(task, normalized_path) != "test":
+            raise ValueError("created path must be a root-contained test path")
+        self._new_test_paths.setdefault(task.id, set()).add(normalized_path)
 
     def record_delete(
         self, task: TaskState, action: DeletePathAction, decision: PolicyDecision
@@ -171,9 +183,10 @@ class PolicyEngine:
         return self._allow(task, action, "read.allowed", "project read is allowed")
 
     def _patch_decision(self, task: TaskState, action: ApplyPatchAction) -> PolicyDecision:
-        paths, error_rule = self._patch_paths(action.diff)
+        operations, error_rule = self._patch_operations(action.diff)
         if error_rule is not None:
             return self._deny(task, action, error_rule, "patch file operation is not supported")
+        paths = tuple(path for path, _created in operations)
         normalized_paths = self._normalized_paths(paths)
         if normalized_paths is None:
             return self._deny(task, action, "path.outside_root", "patch path must stay inside the project root")
@@ -187,11 +200,28 @@ class PolicyEngine:
             return self._deny(task, action, "patch.mixed_code_and_test", "source and tests must change in separate TDD actions")
 
         category = categories.pop()
+        created_paths = tuple(
+            normalized_path
+            for (_path, created), normalized_path in zip(operations, normalized_paths, strict=True)
+            if created
+        )
+        modified_paths = tuple(
+            normalized_path
+            for (_path, created), normalized_path in zip(operations, normalized_paths, strict=True)
+            if not created
+        )
         if category == "source" and task.tdd_phase is not TddPhase.RED_OBSERVED:
             return self._deny(task, action, "tdd.red_required", "source patch requires an observed red test")
         if category == "test" and task.tdd_phase is not TddPhase.TEST_DESIGN:
             return self._deny(task, action, "tdd.test_design_required", "test changes must start the TDD sequence")
-        if not self._all_paths_were_read(task, normalized_paths):
+        if category == "source" and created_paths and not self._new_test_paths.get(task.id):
+            return self._deny(
+                task,
+                action,
+                "tdd.test_creation_required",
+                "new source files require a successfully created test",
+            )
+        if not self._all_paths_were_read(task, modified_paths):
             return self._deny(task, action, "patch.read_required", "each patched file must first be read")
         if category == "test":
             return self._allow(task, action, "patch.test_allowed", "test patch is allowed before red")
@@ -241,6 +271,15 @@ class PolicyEngine:
             "only the fixed read-only Git diff check may request approval",
         )
 
+    def _memory_proposal_decision(
+        self, task: TaskState, action: ProposeMemoryAction
+    ) -> PolicyDecision:
+        if not action.text.strip():
+            return self._deny(task, action, "memory.text_required", "memory proposal text must be nonblank")
+        if len(action.text) > MEMORY_PROPOSAL_TEXT_MAX_LENGTH:
+            return self._deny(task, action, "memory.text_too_long", "memory proposal text is too long")
+        return self._allow(task, action, "memory.proposal_allowed", "memory proposal is queued for user review")
+
     def _finish_decision(self, task: TaskState, action: FinishAction) -> PolicyDecision:
         if action.status == "completed" and task.tdd_phase is not TddPhase.GREEN_OBSERVED:
             return self._deny(task, action, "tdd.green_required", "completed finish requires observed green")
@@ -285,11 +324,17 @@ class PolicyEngine:
     @staticmethod
     def _patch_paths(diff: str) -> tuple[tuple[str, ...], str | None]:
         """Return modified or added paths, rejecting unsupported file operations."""
+        operations, error_rule = PolicyEngine._patch_operations(diff)
+        return tuple(path for path, _created in operations), error_rule
+
+    @staticmethod
+    def _patch_operations(diff: str) -> tuple[tuple[tuple[str, bool], ...], str | None]:
+        """Return unified-diff paths and whether each operation creates a new path."""
         lines = diff.splitlines()
         if any(line.startswith(("rename from ", "rename to ", "similarity index ")) for line in lines):
             return (), "patch.rename_unsupported"
 
-        paths: list[str] = []
+        operations: list[tuple[str, bool]] = []
         index = 0
         while index < len(lines):
             line = lines[index]
@@ -303,7 +348,7 @@ class PolicyEngine:
             if line == "--- /dev/null":
                 if new_path is None:
                     return (), "patch.invalid"
-                paths.append(new_path)
+                operations.append((new_path, True))
             elif lines[index + 1] == "+++ /dev/null":
                 return (), "patch.delete_unsupported"
             elif old_path is None or new_path is None:
@@ -311,12 +356,12 @@ class PolicyEngine:
             elif old_path != new_path:
                 return (), "patch.rename_unsupported"
             else:
-                paths.append(old_path)
+                operations.append((old_path, False))
             index += 2
 
-        if not paths:
+        if not operations:
             return (), "patch.invalid"
-        return tuple(paths), None
+        return tuple(operations), None
 
     @staticmethod
     def _diff_path(header: str, prefix: str) -> str | None:

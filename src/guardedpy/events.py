@@ -37,6 +37,7 @@ _ACTION_SUMMARIES = {
     "run_pytest": "run configured tests",
     "run_command": "run approved command",
     "request_approval": "request action approval",
+    "propose_memory": "propose memory for user review",
     "finish": "finish task",
 }
 _FEEDBACK_TEMPLATES = {
