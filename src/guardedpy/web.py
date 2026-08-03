@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
-import sys
 from threading import Thread
 from typing import Any, Callable, Protocol
 from uuid import UUID
@@ -365,7 +365,10 @@ def local_services(
 
 def serve() -> None:
     """Run local controls by default or the separately composed public demo."""
-    if sys.argv[1:] == ["demo"]:
+    parser = argparse.ArgumentParser(prog="guardedpy")
+    parser.add_argument("mode", choices=("serve", "demo"), default="serve", nargs="?")
+    arguments = parser.parse_args()
+    if arguments.mode == "demo":
         uvicorn.run(create_demo_app(), host="127.0.0.1")
         return
     uvicorn.run(create_app("local", local_services()), host="127.0.0.1")
