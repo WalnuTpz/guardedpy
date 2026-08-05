@@ -60,7 +60,7 @@ make build
 
 ## CI evidence
 
-The [GitHub Actions workflow](.github/workflows/ci.yml) and [.gitlab-ci.yml](.gitlab-ci.yml) install the same development dependencies and run `make test`, `make demo`, and `make build`; the GitLab job is named exactly `unit-test`. These remote workflows have not been run from this task, so this repository makes no remote CI pass claim. After a user-authorized push, inspect the actual GitHub Actions and GitLab job results before recording evidence.
+The [GitHub Actions workflow](.github/workflows/ci.yml) and [.gitlab-ci.yml](.gitlab-ci.yml) install the same development dependencies and run `make test`, `make demo`, and `make build`; the GitLab job is named exactly `unit-test`. GitHub Actions has recorded successful validation runs during the reconstructed PR sequence; the repository Actions and PR pages are the authoritative current evidence. The GitLab workflow has not yet been executed, so no GitLab pass is claimed.
 
 ## Open Design attribution
 
@@ -72,4 +72,4 @@ The local templates and CSS follow the selected [Open Design Agentic direction](
 - The public demo is evidence of fixed mechanisms, not a hosted version of the local coding harness.
 - Local mode needs a functioning OS keyring. The current WebUI lacks a visible credential update/clear control, as noted above.
 - The Render blueprint is deployment preparation only: it has not been deployed, and no public URL is available yet.
-- Neither a remote CI execution nor a Render deployment has been run from this task.
+- GitHub Actions has been exercised; GitLab CI and the Render deployment have not.
