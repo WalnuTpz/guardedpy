@@ -64,6 +64,9 @@
     if (!latest) {
       return;
     }
+    if (terminal.has(latest.task_status)) {
+      clearInterval(interval);
+    }
     if (timeline.dataset.currentStatus !== latest.task_status) {
       window.location.reload();
       return;
@@ -74,9 +77,6 @@
     }
     if (list) {
       list.replaceChildren(...events.map(renderEvent));
-    }
-    if (terminal.has(latest.task_status)) {
-      clearInterval(interval);
     }
   };
 

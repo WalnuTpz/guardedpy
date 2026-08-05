@@ -142,6 +142,21 @@ class _TaskDetailDom(HTMLParser):
         return None
 
 
+def _javascript_block(source: str, marker: str) -> str:
+    """Return one balanced JavaScript block so ordering checks stay branch-scoped."""
+    start = source.index(marker)
+    opening = source.index("{", start)
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1:index]
+    raise AssertionError(f"unterminated block after {marker!r}")
+
+
 def _project_root(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     (root / "src").mkdir(parents=True)
@@ -478,6 +493,19 @@ def test_polling_protocol_reloads_running_page_when_latest_event_requires_approv
     assert feed.json()[-1]["task_status"] == "waiting_approval"
     assert "timeline.dataset.currentStatus !== latest.task_status" in script
     assert "window.location.reload()" in script
+
+
+def test_terminal_event_cleanup_precedes_the_status_change_reload_branch() -> None:
+    """Catches a terminal status change returning from reload before interval cleanup."""
+    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    poll = _javascript_block(script, "const poll = async () =>")
+    cleanup = _javascript_block(poll, "if (terminal.has(latest.task_status))")
+
+    assert "clearInterval(interval)" in cleanup
+    assert poll.index("if (terminal.has(latest.task_status))") < poll.index(
+        "if (timeline.dataset.currentStatus !== latest.task_status)"
+    )
+    assert poll.index("clearInterval(interval)") < poll.index("window.location.reload()")
 
 
 def test_task_detail_renders_bounded_feedback_node_id_without_raw_output(
