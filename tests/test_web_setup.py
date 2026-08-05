@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 import importlib
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any
@@ -107,6 +109,46 @@ class FakeOrchestrator:
         return task
 
 
+class _NavigationDom(HTMLParser):
+    """Parse rendered navigation links instead of searching template strings."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._inside_navigation = 0
+        self.navigation_hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "nav":
+            self._inside_navigation += 1
+        if tag == "a" and self._inside_navigation and attributes.get("href"):
+            self.navigation_hrefs.append(attributes["href"])
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "nav":
+            self._inside_navigation -= 1
+
+
+def _media_hides_navigation(stylesheet: str) -> bool:
+    """Parse media rules enough to reject a hidden nav selector independent of whitespace."""
+    media_contents = re.findall(r"@media[^{}]*\{((?:[^{}]|\{[^{}]*\})*)\}", stylesheet)
+    for content in media_contents:
+        for selector_text, declaration_text in re.findall(r"([^{}]+)\{([^{}]*)\}", content):
+            selectors = [selector.strip().lower() for selector in selector_text.split(",")]
+            declarations = {
+                name.strip().lower(): value.strip().lower().replace(" ", "")
+                for name, value in (
+                    declaration.split(":", 1)
+                    for declaration in declaration_text.split(";")
+                    if ":" in declaration
+                )
+            }
+            if declarations.get("display", "").removeprefix("none").removeprefix("!important") == "":
+                if any(re.search(r"(^|[\s>+~])nav(?=$|[.:#\[])", selector) for selector in selectors):
+                    return True
+    return False
+
+
 def _project_root(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     (root / "src").mkdir(parents=True)
@@ -147,6 +189,31 @@ def test_ui_credential_protocol_exposes_only_nonsecret_operations() -> None:
     }
 
     assert public_operations == {"status", "set_key", "clear_key"}
+
+
+def test_narrow_layout_keeps_all_navigation_destinations_as_real_links(tmp_path: Path) -> None:
+    """Catches a mobile-only pseudo-menu replacing the five primary navigation links."""
+    root = _project_root(tmp_path)
+    app = _app(FakeCredentials(), FakeOrchestrator([]))
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+
+    page = asyncio.run(_request(app, "GET", "/tasks/new"))
+    navigation = _NavigationDom()
+    navigation.feed(page.text)
+    stylesheet = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.css").read_text()
+
+    assert page.status_code == 200
+    assert navigation.navigation_hrefs == [
+        "/",
+        "/tasks/new",
+        "/memories",
+        "/settings/command-rules",
+        "/settings/credentials",
+    ]
+    assert _media_hides_navigation("@media (max-width: 36rem) { nav { display: none; } }")
+    assert _media_hides_navigation("@media(max-width:36rem){ header > nav, .topbar { display : none !important } }")
+    assert not _media_hides_navigation(stylesheet)
+    assert ".narrow-menu" not in stylesheet
 
 
 def test_setup_saves_a_nonsecret_validated_snapshot_without_echoing_the_key(tmp_path: Path) -> None:

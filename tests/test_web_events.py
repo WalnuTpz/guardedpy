@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from guardedpy.actions import RunCommandAction, parse_action
 from guardedpy.command_rules import CommandRuleStore
@@ -57,6 +59,50 @@ class ImmediateThread:
     def start(self) -> None:
         self.started.append(self)
         self.target(*self.args)
+
+
+class _TaskDetailDom(HTMLParser):
+    """Record actual parsed ancestor relationships in a rendered task detail page."""
+
+    _VOID_TAGS = frozenset(
+        {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_element_id = 0
+        self._ancestors: list[tuple[int, str, dict[str, str]]] = []
+        self.event_list_polling_root_id: int | None = None
+        self.status_polling_root_id: int | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {name: value or "" for name, value in attrs}
+        element_id = self._next_element_id
+        self._next_element_id += 1
+        if "data-event-list" in attributes:
+            self.event_list_polling_root_id = self._polling_root_id()
+        if "data-task-status" in attributes:
+            self.status_polling_root_id = self._polling_root_id()
+        if tag not in self._VOID_TAGS:
+            self._ancestors.append((element_id, tag, attributes))
+
+    def handle_startendtag(self, _tag: str, _attrs: list[tuple[str, str | None]]) -> None:
+        return
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self._ancestors) - 1, -1, -1):
+            if self._ancestors[index][1] == tag:
+                del self._ancestors[index:]
+                return
+
+    def _polling_root_id(self) -> int | None:
+        for element_id, _tag, attributes in reversed(self._ancestors):
+            if "data-events-url" in attributes:
+                return element_id
+        return None
 
 
 def _project_root(tmp_path: Path) -> Path:
@@ -233,7 +279,7 @@ def test_rejected_approval_blocks_without_starting_a_background_loop(
     assert stale.status_code == 409
 
 
-def test_approval_page_shows_safe_rule_reason_and_three_decisions(
+def test_command_approval_page_shows_safe_rule_reason_and_all_decisions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Catches approval controls omitting permanent scope or exposing raw action details."""
@@ -257,6 +303,147 @@ def test_approval_page_shows_safe_rule_reason_and_three_decisions(
     assert "Allow once" in page.text
     assert "Always allow this rule" in page.text
     assert "hidden context" not in page.text
+
+
+@pytest.mark.parametrize(
+    ("pending_action", "final_decision"),
+    [
+        pytest.param(
+            _action(kind="delete_path", summary="remove file", path="obsolete.txt"),
+            "once",
+            id="delete-once",
+        ),
+        pytest.param(
+            _action(
+                kind="apply_patch",
+                summary="edit non-code file",
+                diff="--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n",
+            ),
+            "reject",
+            id="patch-reject",
+        ),
+        pytest.param(
+            _action(kind="request_approval", summary="ask", reason="model-controlled reason"),
+            "once",
+            id="explicit-request-once",
+        ),
+    ],
+)
+def test_non_command_approval_hides_always_and_keeps_pending_after_forgery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_action: str,
+    final_decision: str,
+) -> None:
+    """Catches UI or routing treating non-command approval as permanently eligible."""
+    app, root, _ = _waiting_app(tmp_path, monkeypatch, [pending_action])
+    task = app.state.local.task
+    assert task is not None
+    action_hash = _waiting_hash(root, task.id)
+
+    page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    forged = asyncio.run(
+        _request(
+            app,
+            "POST",
+            f"/tasks/{task.id}/approval",
+            data={"action_hash": action_hash, "decision": "always"},
+        )
+    )
+    assert forged.status_code == 409
+    assert task.status is TaskStatus.WAITING_APPROVAL
+    resolved = asyncio.run(
+        _request(
+            app,
+            "POST",
+            f"/tasks/{task.id}/approval",
+            data={"action_hash": action_hash, "decision": final_decision},
+        )
+    )
+
+    assert page.status_code == 200
+    assert 'value="always"' not in page.text
+    assert resolved.status_code == 303
+
+
+def test_task_detail_polling_root_owns_status_and_event_list_in_parsed_dom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches polling queries targeting siblings instead of descendants of their root."""
+    delete = _action(kind="delete_path", summary="remove obsolete file", path="obsolete.txt")
+    app, _, _ = _waiting_app(tmp_path, monkeypatch, [delete])
+    task = app.state.local.task
+    assert task is not None
+
+    page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    document = _TaskDetailDom()
+    document.feed(page.text)
+
+    assert page.status_code == 200
+    assert document.status_polling_root_id is not None
+    assert document.event_list_polling_root_id is not None
+    assert document.status_polling_root_id == document.event_list_polling_root_id
+
+
+def test_polling_protocol_reloads_running_page_when_latest_event_requires_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a live approval event leaving a running page without a server-rendered card."""
+    delete = _action(kind="delete_path", summary="remove obsolete file", path="obsolete.txt")
+    app, root, _ = _waiting_app(tmp_path, monkeypatch, [delete])
+    task = app.state.local.task
+    assert task is not None
+    task.status = TaskStatus.RUNNING
+    EventStore(root).append(RunEvent(task_id=task.id, task_status=TaskStatus.RUNNING))
+
+    running_page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    EventStore(root).append(
+        RunEvent(task_id=task.id, task_status=TaskStatus.WAITING_APPROVAL)
+    )
+    feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
+    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+
+    assert running_page.status_code == 200
+    assert 'data-current-status="running"' in running_page.text
+    assert "ACTION APPROVAL REQUIRED" not in running_page.text
+    assert feed.json()[-1]["task_status"] == "waiting_approval"
+    assert "timeline.dataset.currentStatus !== latest.task_status" in script
+    assert "window.location.reload()" in script
+
+
+def test_task_detail_renders_bounded_feedback_node_id_without_raw_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches raw feedback data crossing the fixed audit schema into the timeline."""
+    delete = _action(kind="delete_path", summary="remove obsolete file", path="obsolete.txt")
+    app, root, _ = _waiting_app(tmp_path, monkeypatch, [delete])
+    task = app.state.local.task
+    assert task is not None
+    raw_output = "RAW-PYTEST-OUTPUT-MUST-NOT-RENDER"
+    with pytest.raises(ValidationError):
+        FeedbackAudit(
+            kind="assertion_failure",
+            node_id="tests/test_value.py",
+            raw_output=raw_output,
+        )
+    EventStore(root).append(
+        RunEvent(
+            task_id=task.id,
+            task_status=TaskStatus.WAITING_APPROVAL,
+            feedback=FeedbackAudit(
+                kind="assertion_failure",
+                node_id="tests/test_value.py",
+            ),
+        )
+    )
+
+    page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
+
+    assert page.status_code == 200
+    assert "tests/test_value.py" in page.text
+    assert "tests/test_value.py" in feed.text
+    assert raw_output not in page.text + feed.text
 
 
 @pytest.mark.parametrize(

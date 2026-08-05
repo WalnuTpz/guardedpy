@@ -25,6 +25,7 @@
       event.policy_reason,
       approval,
       event.feedback_excerpt,
+      event.feedback_node_id,
       event.stop_reason,
     ]
       .filter(Boolean);
@@ -40,6 +41,10 @@
     const events = await response.json();
     const latest = events.at(-1);
     if (!latest) {
+      return;
+    }
+    if (timeline.dataset.currentStatus !== latest.task_status) {
+      window.location.reload();
       return;
     }
     if (status) {

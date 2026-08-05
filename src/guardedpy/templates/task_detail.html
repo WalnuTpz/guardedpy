@@ -1,14 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="card task-detail" data-events-url="/tasks/{{ task.id }}/events" data-terminal="{{ 'true' if terminal else 'false' }}">
+<section class="card task-detail" data-events-url="/tasks/{{ task.id }}/events" data-current-status="{{ task.status }}" data-terminal="{{ 'true' if terminal else 'false' }}">
   <p class="eyebrow">GOVERNED TASK TIMELINE</p>
   <h1>Task activity</h1>
   <p>Task status: <span class="badge {% if task.status in ['completed', 'cancelled'] %}badge-green{% elif task.status in ['blocked', 'interrupted'] %}badge-red{% else %}badge-amber{% endif %}" data-task-status>{{ task.status }}</span></p>
   <p class="muted">Events show fixed audit summaries only.</p>
-</section>
 
 {% if approval_event and task.status == 'waiting_approval' %}
-<section class="card approval-card">
+<section class="approval-card">
   <p class="eyebrow">ACTION APPROVAL REQUIRED</p>
   <h2>{{ approval_event.action_summary }}</h2>
   {% if approval_event.action_projection %}<p>{{ approval_event.action_projection }}</p>{% endif %}
@@ -20,12 +19,14 @@
     <input type="hidden" name="action_hash" value="{{ approval_event.action_hash }}">
     <button class="secondary" type="submit" name="decision" value="reject">Reject action</button>
     <button type="submit" name="decision" value="once">Allow once</button>
+    {% if approval_event.permanent_eligible %}
     <button type="submit" name="decision" value="always">Always allow this rule</button>
+    {% endif %}
   </form>
 </section>
 {% endif %}
 
-<section class="card timeline-card">
+<section class="timeline-card">
   <h2>Audit timeline</h2>
   <ol class="timeline" data-event-list>
     {% for event in events %}
@@ -39,10 +40,12 @@
       {% if event.policy_reason %}<span>{{ event.policy_reason }}</span>{% endif %}
       {% if event.approval_granted is sameas true %}<span>approval: granted</span>{% elif event.approval_granted is sameas false %}<span>approval: rejected</span>{% endif %}
       {% if event.feedback_excerpt %}<span>{{ event.feedback_excerpt }}</span>{% endif %}
+      {% if event.feedback_node_id %}<span>{{ event.feedback_node_id }}</span>{% endif %}
       {% if event.stop_reason %}<span>stop: {{ event.stop_reason }}</span>{% endif %}
     </li>
     {% endfor %}
   </ol>
+</section>
 </section>
 {% if not terminal %}<script defer src="{{ url_for('static', path='app.js') }}"></script>{% endif %}
 {% endblock %}

@@ -29,5 +29,4 @@ button.secondary { background: white; color: #303846; margin-top: 1rem; }
 .timeline li { display: flex; flex-wrap: wrap; gap: .45rem; }
 .memory-list li { border-top: 1px solid #dfe3e8; padding-top: .75rem; }
 .memory-list p { flex-basis: 100%; margin: 0; }
-.narrow-menu { display: none; color: #4e5661; font-size: .85rem; }
-@media (max-width: 36rem) { nav { display: none; } .narrow-menu { display: inline; } .topbar { align-items: flex-start; } }
+@media (max-width: 36rem) { .topbar { align-items: flex-start; } }
