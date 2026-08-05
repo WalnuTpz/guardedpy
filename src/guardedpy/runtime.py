@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import tempfile
+from threading import RLock
 from typing import Callable, Protocol
 from uuid import UUID
 
@@ -16,7 +17,7 @@ from guardedpy.config import HarnessConfig, app_state_dir, local_state_path, pro
 from guardedpy.credentials import CredentialStatus
 from guardedpy.domain import ApprovalDecision, CommandApprovalRule, TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore, StoredRunEvent
-from guardedpy.lease import ExecutionLease, GlobalStateLease
+from guardedpy.lease import ExecutionLease, GlobalExecutionLease, GlobalStateLease
 from guardedpy.memory import MemoryEntry, MemoryStore
 
 
@@ -108,6 +109,8 @@ class LocalRuntime:
         self._config: HarnessConfig | None = None
         self._memory_store: MemoryStore | None = None
         self._lease: ExecutionLease | None = None
+        self._execution_lease: GlobalExecutionLease | None = None
+        self._lifecycle_lock = RLock()
         self._tasks: dict[UUID, TaskState] = {}
         self._orchestrators: dict[UUID, OrchestratorPort] = {}
         self._task_roots: dict[UUID, Path] = {}
@@ -125,43 +128,56 @@ class LocalRuntime:
 
     def setup(self, project_root: Path, config: HarnessConfig, api_key: str | None) -> None:
         """Atomically save non-secret setup state and optionally write the keyring key."""
-        root = project_root.resolve()
-        if self._has_active_task():
-            raise RuntimeBusyError()
-        lease = ExecutionLease(root)
-        if not lease.try_acquire():
-            raise RuntimeBusyError()
-        global_lease: GlobalStateLease | None = None
-        try:
-            global_lease = self._acquire_global_state_lease()
-            task_roots = _read_local_state()[1] if local_state_path().exists() else {}
-            config_path = project_config_path(root)
-            index_path = local_state_path()
-            previous_config = _snapshot_file(config_path)
-            previous_index = _snapshot_file(index_path)
+        with self._lifecycle_lock:
+            root = project_root.resolve()
+            if self._has_active_task():
+                raise RuntimeBusyError()
+            execution_lease = GlobalExecutionLease()
+            if not execution_lease.try_acquire():
+                raise RuntimeBusyError()
+            lease = ExecutionLease(root)
+            if not lease.try_acquire():
+                execution_lease.release()
+                raise RuntimeBusyError()
+            global_lease: GlobalStateLease | None = None
             try:
-                _write_snapshot(root, config)
-                _write_local_state(root, task_roots)
-                if api_key is not None and api_key.strip():
-                    self._services.credentials.set_key(api_key)
-            except Exception:
-                _restore_file(config_path, previous_config)
-                _restore_file(index_path, previous_index)
-                raise
-            self._project_root = root
-            self._config = config
-            self._memory_store = MemoryStore(root)
-            self._lease = lease
-            self._task_roots = task_roots
-        finally:
-            if global_lease is not None:
-                global_lease.release()
-            lease.release()
+                global_lease = self._acquire_global_state_lease()
+                task_roots = _read_local_state()[1] if local_state_path().exists() else {}
+                config_path = project_config_path(root)
+                index_path = local_state_path()
+                previous_config = _snapshot_file(config_path)
+                previous_index = _snapshot_file(index_path)
+                try:
+                    _write_snapshot(root, config)
+                    _write_local_state(root, task_roots)
+                    if api_key is not None and api_key.strip():
+                        self._services.credentials.set_key(api_key)
+                except Exception:
+                    _restore_file(config_path, previous_config)
+                    _restore_file(index_path, previous_index)
+                    raise
+                self._project_root = root
+                self._config = config
+                self._memory_store = MemoryStore(root)
+                self._lease = lease
+                self._execution_lease = execution_lease
+                self._task_roots = task_roots
+            finally:
+                if global_lease is not None:
+                    global_lease.release()
+                lease.release()
+                execution_lease.release()
 
     def create_task(
         self, description: str, mode: TaskMode, bugfix_target: str | None
     ) -> TaskState:
         """Register one pending task and retain the execution lease for its lifecycle."""
+        with self._lifecycle_lock:
+            return self._create_task(description, mode, bugfix_target)
+
+    def _create_task(
+        self, description: str, mode: TaskMode, bugfix_target: str | None
+    ) -> TaskState:
         root, config, memory_store = self._configured()
         description = description.strip()
         if not description:
@@ -218,6 +234,10 @@ class LocalRuntime:
 
     def run(self, task_id: UUID) -> TaskState:
         """Advance one locally-owned task, releasing its lease when it becomes terminal."""
+        with self._lifecycle_lock:
+            return self._run(task_id)
+
+    def _run(self, task_id: UUID) -> TaskState:
         task, orchestrator = self._owned_task(task_id)
         if not self._acquire_lease():
             raise RuntimeBusyError()
@@ -234,6 +254,12 @@ class LocalRuntime:
         self, task_id: UUID, action_hash: str, decision: ApprovalDecision
     ) -> bool:
         """Resolve one exact pending approval through the owning orchestrator."""
+        with self._lifecycle_lock:
+            return self._resolve_approval(task_id, action_hash, decision)
+
+    def _resolve_approval(
+        self, task_id: UUID, action_hash: str, decision: ApprovalDecision
+    ) -> bool:
         task, orchestrator = self._owned_task(task_id)
         if not self._acquire_lease():
             raise RuntimeBusyError()
@@ -245,6 +271,10 @@ class LocalRuntime:
 
     def cancel(self, task_id: UUID) -> TaskState:
         """Cancel one locally-owned task and release its terminal execution lease."""
+        with self._lifecycle_lock:
+            return self._cancel(task_id)
+
+    def _cancel(self, task_id: UUID) -> TaskState:
         task, orchestrator = self._owned_task(task_id)
         if not self._acquire_lease():
             raise RuntimeBusyError()
@@ -267,19 +297,29 @@ class LocalRuntime:
 
     def recover_interrupted_tasks(self) -> tuple[UUID, ...]:
         """Persist restart interruptions and refresh every visible recovered task."""
+        with self._lifecycle_lock:
+            return self._recover_interrupted_tasks()
+
+    def _recover_interrupted_tasks(self) -> tuple[UUID, ...]:
         global_lease = self._acquire_global_state_lease()
         try:
             interrupted: list[UUID] = []
             for root in dict.fromkeys(self._task_roots.values()):
-                store = EventStore(root)
-                recovered_ids = store.mark_unfinished_interrupted()
-                if not recovered_ids:
+                lease = ExecutionLease(root)
+                if not lease.try_acquire():
                     continue
-                stored_tasks = {task.id: task for task in store.tasks()}
-                for task_id in recovered_ids:
-                    self._tasks[task_id] = stored_tasks[task_id]
-                    self._orchestrators.pop(task_id, None)
-                interrupted.extend(recovered_ids)
+                try:
+                    store = EventStore(root)
+                    recovered_ids = store.mark_unfinished_interrupted()
+                    if not recovered_ids:
+                        continue
+                    stored_tasks = {task.id: task for task in store.tasks()}
+                    for task_id in recovered_ids:
+                        self._tasks[task_id] = stored_tasks[task_id]
+                        self._orchestrators.pop(task_id, None)
+                    interrupted.extend(recovered_ids)
+                finally:
+                    lease.release()
             return tuple(interrupted)
         finally:
             global_lease.release()
@@ -411,7 +451,18 @@ class LocalRuntime:
         root, _, _ = self._configured()
         if self._lease is None:
             self._lease = ExecutionLease(root)
-        return self._lease.held or self._lease.try_acquire()
+        if self._execution_lease is None:
+            self._execution_lease = GlobalExecutionLease()
+        acquired_execution_lease = False
+        if not self._execution_lease.held:
+            if not self._execution_lease.try_acquire():
+                return False
+            acquired_execution_lease = True
+        if self._lease.held or self._lease.try_acquire():
+            return True
+        if acquired_execution_lease:
+            self._execution_lease.release()
+        return False
 
     def _require_mutation_lease(self) -> bool:
         if self._lease is not None and self._lease.held:
@@ -423,6 +474,8 @@ class LocalRuntime:
     def _release_lease(self) -> None:
         if self._lease is not None:
             self._lease.release()
+        if self._execution_lease is not None:
+            self._execution_lease.release()
 
     @staticmethod
     def _acquire_global_state_lease() -> GlobalStateLease:

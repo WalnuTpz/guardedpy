@@ -50,6 +50,13 @@ class ExecutionLease(_FileLease):
         super().__init__(app_state_dir(project_root) / "execution.lock")
 
 
+class GlobalExecutionLease(_FileLease):
+    """Hold one non-blocking advisory lock for the sole active local task."""
+
+    def __init__(self) -> None:
+        super().__init__(local_state_path().parent / "execution.lock")
+
+
 class GlobalStateLease(_FileLease):
     """Serialize mutations to application-global local state and keyring boundaries."""
 

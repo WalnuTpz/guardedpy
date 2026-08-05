@@ -12,7 +12,7 @@ from pydantic import ValidationError
 import guardedpy.runtime as runtime_module
 from guardedpy.actions import RunCommandAction
 from guardedpy.command_rules import CommandRuleStore
-from guardedpy.config import HarnessConfig
+from guardedpy.config import HarnessConfig, project_config_path
 from guardedpy.credentials import CredentialStatus
 from guardedpy.domain import TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore
@@ -213,7 +213,10 @@ def test_runtime_exposes_memory_rule_and_nonsecret_credential_operations(tmp_pat
     assert runtime.credential_status().configured is False
 
 
-def test_cross_project_tasks_keep_both_roots_in_the_global_local_index(tmp_path: Path) -> None:
+def test_global_execution_lease_blocks_a_second_project_task_but_preserves_index_history(
+    tmp_path: Path,
+) -> None:
+    """Catches project-scoped task admission allowing two live tasks at once."""
     first_root = _project_root(tmp_path, "first")
     second_root = _project_root(tmp_path, "second")
     first = _runtime(first_root)
@@ -222,10 +225,27 @@ def test_cross_project_tasks_keep_both_roots_in_the_global_local_index(tmp_path:
     second.setup(second_root, _config(), api_key=None)
 
     first_task = first.create_task("first task", TaskMode.FEATURE, None)
-    second_task = second.create_task("second task", TaskMode.FEATURE, None)
+
+    with pytest.raises(RuntimeBusyError):
+        second.create_task("second task", TaskMode.FEATURE, None)
 
     reader = _runtime(second_root)
-    assert {task.id for task in reader.tasks()} == {first_task.id, second_task.id}
+    assert [task.id for task in reader.tasks()] == [first_task.id]
+
+
+def test_setup_rejects_a_second_project_while_a_global_task_is_active(tmp_path: Path) -> None:
+    """Catches setup changing project state while another entrypoint owns live work."""
+    first_root = _project_root(tmp_path, "first")
+    second_root = _project_root(tmp_path, "second")
+    first = _runtime(first_root)
+    second = _runtime(second_root)
+    first.setup(first_root, _config(), api_key=None)
+    first.create_task("first task", TaskMode.FEATURE, None)
+
+    with pytest.raises(RuntimeBusyError):
+        second.setup(second_root, _config(), api_key=None)
+
+    assert not project_config_path(second_root).exists()
 
 
 @dataclass
@@ -356,6 +376,64 @@ def test_failing_submit_keeps_global_index_locked_until_rollback_finishes(
     second_task = second.create_task("after rollback", TaskMode.FEATURE, None)
     reader = _runtime(second_root)
     assert [task.id for task in reader.tasks()] == [second_task.id]
+
+
+def test_same_runtime_task_rollback_cannot_release_a_serialized_winner_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a failed concurrent admission releasing the succeeding task's shared lease."""
+    first_root = _project_root(tmp_path, "first")
+    second_root = _project_root(tmp_path, "second")
+    restore_started = Event()
+    allow_restore = Event()
+    original_restore = runtime_module._restore_file
+    failed: list[RuntimeError] = []
+    winners: list[TaskState] = []
+
+    class SuccessfulSubmitOrchestrator(FailingSubmitOrchestrator):
+        def submit(self, task: TaskState) -> TaskState:
+            return task
+
+    orchestrators = iter((FailingSubmitOrchestrator(), SuccessfulSubmitOrchestrator()))
+    first = LocalRuntime(
+        RuntimeServices(
+            credentials=FakeCredentials(),
+            orchestrator_factory=lambda root, config, memory: next(orchestrators),
+        )
+    )
+    second = _runtime(second_root)
+    first.setup(first_root, _config(), api_key=None)
+    second.setup(second_root, _config(), api_key=None)
+
+    def blocked_restore(path: Path, content: bytes | None) -> None:
+        if path == runtime_module.local_state_path():
+            restore_started.set()
+            assert allow_restore.wait(1)
+        original_restore(path, content)
+
+    def create_failed_task() -> None:
+        try:
+            first.create_task("fail", TaskMode.FEATURE, None)
+        except RuntimeError as error:
+            failed.append(error)
+
+    def create_winning_task() -> None:
+        winners.append(first.create_task("winner", TaskMode.FEATURE, None))
+
+    monkeypatch.setattr(runtime_module, "_restore_file", blocked_restore)
+    failing_thread = Thread(target=create_failed_task)
+    winner_thread = Thread(target=create_winning_task)
+    failing_thread.start()
+    assert restore_started.wait(1)
+    winner_thread.start()
+    allow_restore.set()
+    failing_thread.join()
+    winner_thread.join()
+
+    assert [str(error) for error in failed] == ["submit failed"]
+    assert [task.description for task in winners] == ["winner"]
+    with pytest.raises(RuntimeBusyError):
+        second.create_task("must remain blocked", TaskMode.FEATURE, None)
 
 
 @dataclass
