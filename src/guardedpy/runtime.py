@@ -159,6 +159,9 @@ class LocalRuntime:
     ) -> TaskState:
         """Register one pending task and retain the execution lease for its lifecycle."""
         root, config, memory_store = self._configured()
+        description = description.strip()
+        if not description:
+            raise ValueError("task description must be nonblank")
         if self._has_active_task() or not self._acquire_lease():
             raise RuntimeBusyError()
         task = TaskState(

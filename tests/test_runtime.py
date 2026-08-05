@@ -103,6 +103,14 @@ def test_terminal_run_releases_task_lease_for_another_runtime(tmp_path: Path) ->
     assert second.create_task("next task", TaskMode.FEATURE, None).status is TaskStatus.PENDING
 
 
+def test_runtime_rejects_a_blank_task_description(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.setup(tmp_path, _config(), api_key=None)
+
+    with pytest.raises(ValueError, match="description"):
+        runtime.create_task("  ", TaskMode.FEATURE, None)
+
+
 def test_runtime_returns_event_store_safe_projection_without_pending_action_body(
     tmp_path: Path,
 ) -> None:
