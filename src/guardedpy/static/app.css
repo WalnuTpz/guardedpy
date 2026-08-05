@@ -98,6 +98,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .task-list, .memory-list { display: grid; gap: var(--space-3); list-style: none; }
 .task-list li, .memory-list li { align-items: center; border: 1px solid var(--border); border-radius: var(--radius-sm); display: flex; flex-wrap: wrap; gap: var(--space-3); justify-content: space-between; padding: var(--space-4); }
 .task-list a { font-weight: 600; }
+.task-link { min-height: 44px; align-items: center; display: inline-flex; padding: var(--space-2) 0; }
 .timeline { border-left: 2px solid var(--accent); display: grid; gap: var(--space-3); list-style: none; margin-left: var(--space-2); padding-left: var(--space-5); }
 .timeline li { border-bottom: 1px solid var(--border); display: grid; gap: var(--space-1); padding-bottom: var(--space-3); }
 .approval-card { border: 1px solid var(--warn); border-radius: var(--radius-md); border-top: 4px solid var(--warn); margin: var(--space-5) 0; padding: var(--space-5); }

@@ -8,7 +8,7 @@
   {% if task %}
   <p>{{ task.description }}</p>
   <p>状态：<span class="badge" data-status="{{ task.status }}">{{ status_labels.get(task.status, task.status) }}</span></p>
-  <p><a href="/tasks/{{ task.id }}">查看任务详情</a></p>
+  <p><a class="task-link" href="/tasks/{{ task.id }}">查看任务详情</a></p>
   {% if task.status in ['pending', 'running', 'waiting_approval'] %}
   <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="btn-secondary" type="submit">取消当前任务</button></form>
   {% endif %}
@@ -33,7 +33,7 @@
   <h2>任务历史</h2>
   {% if tasks %}<ul class="task-list">
     {% for known_task in tasks %}
-    <li><a href="/tasks/{{ known_task.id }}">{{ known_task.description }}</a><span class="badge" data-status="{{ known_task.status }}">{{ status_labels.get(known_task.status, known_task.status) }}</span></li>
+    <li><a class="task-link" href="/tasks/{{ known_task.id }}">{{ known_task.description }}</a><span class="badge" data-status="{{ known_task.status }}">{{ status_labels.get(known_task.status, known_task.status) }}</span></li>
     {% endfor %}
   </ul>{% else %}<p class="muted">尚无任务历史。</p>{% endif %}
 </section>

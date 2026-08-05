@@ -111,7 +111,12 @@ _TERMINAL_STATUSES = {
     TaskStatus.INTERRUPTED,
 }
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-_CREDENTIAL_ERROR = "Credential store is unavailable."
+_CREDENTIAL_ERROR = "凭据存储不可用。"
+_SETUP_ERROR = "无法保存设置。"
+_ACTIVE_TASK_ERROR = "已有任务正在运行。"
+_TASK_START_ERROR = "无法启动任务。"
+_TASK_NOT_FOUND_ERROR = "未找到任务。"
+_CREDENTIAL_UPDATE_ERROR = "无法更新凭据。"
 
 
 def create_app(mode: str, services: WebServices) -> FastAPI:
@@ -215,7 +220,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def setup(request: Request) -> Response:
         state: _LocalState = app.state.local
         if _has_active_task(state):
-            return render_task(request, error="Another task is active.", status_code=409)
+            return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
         form = await request.form()
         status, credential_error = credential_status()
         if credential_error is not None:
@@ -225,11 +230,11 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 form, require_api_key=not status.configured
             )
         except (TypeError, ValueError, ValidationError):
-            return render_setup(request, error="Setup could not be saved.", status_code=422)
+            return render_setup(request, error=_SETUP_ERROR, status_code=422)
 
         async with state.mutation_lock:
             if _has_active_task(state):
-                return render_task(request, error="Another task is active.", status_code=409)
+                return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
             try:
                 memory_store = MemoryStore(project_root)
                 config_path = project_config_path(project_root)
@@ -237,7 +242,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 previous_config = _snapshot_file(config_path)
                 previous_index = _snapshot_file(index_path)
             except Exception:
-                return render_setup(request, error="Setup could not be saved.", status_code=422)
+                return render_setup(request, error=_SETUP_ERROR, status_code=422)
             try:
                 _write_snapshot(project_root, config)
                 _write_local_state(project_root, state.task_roots)
@@ -250,7 +255,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             except Exception:
                 _restore_file(config_path, previous_config)
                 _restore_file(index_path, previous_index)
-                return render_setup(request, error="Setup could not be saved.", status_code=422)
+                return render_setup(request, error=_SETUP_ERROR, status_code=422)
 
             state.project_root = project_root
             state.config = config
@@ -272,16 +277,16 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         try:
             task_mode = TaskMode(str(form.get("mode", "")))
         except ValueError:
-            return render_task(request, error="Task could not be started.", status_code=422)
+            return render_task(request, error=_TASK_START_ERROR, status_code=422)
         if not description:
-            return render_task(request, error="Task could not be started.", status_code=422)
+            return render_task(request, error=_TASK_START_ERROR, status_code=422)
         if task_mode is TaskMode.BUGFIX and not bugfix_target:
-            return render_task(request, error="Task could not be started.", status_code=422)
+            return render_task(request, error=_TASK_START_ERROR, status_code=422)
         async with state.mutation_lock:
             if state.config is None or state.project_root is None or state.memory_store is None:
-                return render_setup(request, error="Setup could not be saved.", status_code=422)
+                return render_setup(request, error=_SETUP_ERROR, status_code=422)
             if _has_active_task(state):
-                return render_task(request, error="Another task is active.", status_code=409)
+                return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
 
             task = TaskState(
                 description=description,
@@ -297,7 +302,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             try:
                 previous_index = _snapshot_file(index_path)
             except Exception:
-                return render_task(request, error="Task could not be started.", status_code=422)
+                return render_task(request, error=_TASK_START_ERROR, status_code=422)
             registered = False
             index_written = False
             try:
@@ -312,13 +317,13 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                     _restore_file(index_path, previous_index)
                 if registered:
                     event_store.discard_task_registration(task.id)
-                return render_task(request, error="Another task is active.", status_code=409)
+                return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
             except Exception:
                 if index_written:
                     _restore_file(index_path, previous_index)
                 if registered:
                     event_store.discard_task_registration(task.id)
-                return render_task(request, error="Task could not be started.", status_code=422)
+                return render_task(request, error=_TASK_START_ERROR, status_code=422)
             state.task = task
             state.orchestrator = orchestrator
             state.tasks[task.id] = task
@@ -390,7 +395,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         task = state.tasks.get(task_id)
         orchestrator = state.orchestrators.get(task_id)
         if task is None or orchestrator is None:
-            return render_task(request, error="Task was not found.", status_code=404)
+            return render_task(request, error=_TASK_NOT_FOUND_ERROR, status_code=404)
         cancelled = orchestrator.cancel(task_id)
         state.tasks[task_id] = cancelled
         if state.task is not None and state.task.id == task_id:
@@ -444,7 +449,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         api_key = str(form.get("api_key", ""))
         if not api_key.strip():
             return render_credentials(
-                request, error="Credential could not be updated.", status_code=422
+                request, error=_CREDENTIAL_UPDATE_ERROR, status_code=422
             )
         try:
             services.credentials.set_key(api_key)

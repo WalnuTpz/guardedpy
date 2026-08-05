@@ -534,7 +534,7 @@ def test_credential_update_clear_and_unavailable_backend_do_not_echo_key(tmp_pat
     assert unavailable_update.status_code == 503
     assert unavailable_clear.status_code == 503
     body = unavailable_page.text + unavailable_update.text + unavailable_clear.text
-    assert body.count("Credential store is unavailable.") == 3
+    assert body.count("凭据存储不可用。") == 3
     assert "never-echo-this" not in body
     assert "leaked-secret" not in body
 
@@ -558,7 +558,7 @@ def test_invalid_setup_has_one_generic_error_and_no_side_effect(tmp_path: Path, 
     response = asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root, **overrides)))
 
     assert response.status_code == 422
-    assert response.text.count("Setup could not be saved.") == 1
+    assert response.text.count("无法保存设置。") == 1
     assert credentials.set_calls == []
     assert not project_config_path(root).exists()
     assert not local_state_path().exists()
@@ -577,7 +577,7 @@ def test_snapshot_write_failure_does_not_store_the_submitted_key(tmp_path: Path)
     response = asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root)))
 
     assert response.status_code == 422
-    assert response.text.count("Setup could not be saved.") == 1
+    assert response.text.count("无法保存设置。") == 1
     assert credentials.set_calls == []
 
 
@@ -603,7 +603,7 @@ def test_setup_keyring_failure_restores_the_previous_snapshot_and_uses_safe_erro
     )
 
     assert response.status_code == 503
-    assert response.text.count("Credential store is unavailable.") == 1
+    assert response.text.count("凭据存储不可用。") == 1
     assert "never-render-this-key" not in response.text
     assert "backend rejected" not in response.text
     if existing_snapshot is None:
@@ -627,8 +627,8 @@ def test_unexpected_setup_key_failure_is_not_misreported_as_keyring_unavailable(
     )
 
     assert response.status_code == 422
-    assert response.text.count("Setup could not be saved.") == 1
-    assert "Credential store is unavailable." not in response.text
+    assert response.text.count("无法保存设置。") == 1
+    assert "凭据存储不可用。" not in response.text
     assert "hidden-key" not in response.text
     assert snapshot.read_bytes() == b"keep this exact snapshot\n"
 

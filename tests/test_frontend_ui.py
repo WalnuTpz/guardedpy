@@ -7,10 +7,11 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
-from guardedpy.credentials import CredentialStatus
+from guardedpy.credentials import CredentialBackendUnavailableError, CredentialStatus
 
 
 @dataclass
@@ -45,6 +46,21 @@ class FakeOrchestrator:
         raise AssertionError("task cancellation is outside this rendered-page contract")
 
 
+@dataclass
+class UnavailableCredentials:
+    """Exercise the fixed safe-error presentation without a real keyring."""
+
+    def status(self) -> CredentialStatus:
+        raise CredentialBackendUnavailableError("unavailable")
+
+    def set_key(self, key: str) -> None:
+        del key
+        raise CredentialBackendUnavailableError("unavailable")
+
+    def clear_key(self) -> None:
+        raise CredentialBackendUnavailableError("unavailable")
+
+
 class RenderedDocument(HTMLParser):
     """Extract semantic page contracts from the response users actually receive."""
 
@@ -61,6 +77,7 @@ class RenderedDocument(HTMLParser):
         self.badge_statuses: set[str] = set()
         self.bugfix_target_copies: set[str] = set()
         self.has_task_mode_control = False
+        self.task_link_hrefs: list[str] = []
         self._inside_navigation = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -79,6 +96,8 @@ class RenderedDocument(HTMLParser):
             self.navigation_hrefs.append(href)
             if attributes.get("aria-current") == "page":
                 self.current_href = href
+        if tag == "a" and "task-link" in attributes.get("class", "").split():
+            self.task_link_hrefs.append(attributes.get("href", ""))
         if tag == "form":
             self.form_actions.append(attributes.get("action", ""))
         if tag in {"input", "select", "textarea"} and attributes.get("name"):
@@ -110,13 +129,13 @@ def _document(response: httpx.Response) -> RenderedDocument:
     return document
 
 
-def _app() -> Any:
+def _app(credentials: Any | None = None) -> Any:
     from guardedpy import web
 
     return web.create_app(
         "local",
         web.WebServices(
-            credentials=FakeCredentials(),
+            credentials=credentials or FakeCredentials(),
             orchestrator_factory=lambda root, config, memory: FakeOrchestrator(),
         ),
     )
@@ -129,8 +148,8 @@ def _project_root(tmp_path: Path) -> Path:
     return root
 
 
-def _setup_data(root: Path) -> dict[str, str]:
-    return {
+def _setup_data(root: Path, **overrides: str) -> dict[str, str]:
+    data = {
         "project_root": str(root),
         "source_dirs": "src",
         "test_dirs": "tests",
@@ -139,6 +158,8 @@ def _setup_data(root: Path) -> dict[str, str]:
         "timeout_seconds": "30",
         "api_key": "test-only-key",
     }
+    data.update(overrides)
+    return data
 
 
 def test_shell_exposes_chinese_landmarks_navigation_and_explicit_current_page(
@@ -212,6 +233,75 @@ def test_task_workspace_keeps_submission_contract_in_three_labelled_regions(
     assert document.has_task_mode_control
     assert document.bugfix_target_copies == {"功能开发不需要缺陷测试目标。", "缺陷修复必须填写唯一的 pytest 测试目标。"}
     assert {"task-current", "task-create", "task-history"} <= document.data_od_ids
+
+
+def test_task_workspace_detail_links_have_the_local_44px_target_contract(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Catches current-task or history detail links shrinking to ordinary text targets."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    root = _project_root(tmp_path)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    created = asyncio.run(
+        _request(app, "POST", "/tasks", data={"mode": "feature", "description": "可访问任务链接"})
+    )
+    document = _document(asyncio.run(_request(app, "GET", "/tasks/new")))
+    stylesheet = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.css").read_text()
+
+    assert created.status_code == 303
+    assert document.task_link_hrefs == [created.headers["location"], created.headers["location"]]
+    assert ".task-link" in stylesheet
+    assert ".task-link { min-height: 44px;" in stylesheet
+
+
+def test_task14_pages_render_the_complete_fixed_error_set_in_chinese(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Catches Task 14 surfaces exposing fixed English errors after the Chinese rebuild."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    root = _project_root(tmp_path)
+    invalid_setup = asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root, api_key="")))
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    invalid_task = asyncio.run(_request(app, "POST", "/tasks", data={"mode": "feature", "description": ""}))
+    created = asyncio.run(
+        _request(app, "POST", "/tasks", data={"mode": "feature", "description": "保持活跃"})
+    )
+    active_setup = asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root)))
+    missing_task = asyncio.run(_request(app, "POST", f"/tasks/{uuid4()}/cancel"))
+    invalid_credential = asyncio.run(
+        _request(app, "POST", "/settings/credentials", data={"api_key": ""})
+    )
+    unavailable = asyncio.run(_request(_app(UnavailableCredentials()), "GET", "/settings/credentials"))
+
+    rendered = (
+        invalid_setup.text
+        + invalid_task.text
+        + active_setup.text
+        + missing_task.text
+        + invalid_credential.text
+        + unavailable.text
+    )
+    assert created.status_code == 303
+    for message in {
+        "无法保存设置。",
+        "无法启动任务。",
+        "已有任务正在运行。",
+        "未找到任务。",
+        "无法更新凭据。",
+        "凭据存储不可用。",
+    }:
+        assert message in rendered
+    for message in {
+        "Setup could not be saved.",
+        "Task could not be started.",
+        "Another task is active.",
+        "Task was not found.",
+        "Credential could not be updated.",
+        "Credential store is unavailable.",
+    }:
+        assert message not in rendered
 
 
 def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives() -> None:
