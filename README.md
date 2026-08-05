@@ -86,6 +86,27 @@ The [GitHub Actions workflow](.github/workflows/ci.yml) and [.gitlab-ci.yml](.gi
 
 The local templates and CSS follow the selected [Open Design Agentic direction](https://open-design.ai/plugins/design-system-agentic/): clear task outcomes, restrained controls, semantic status badges, and readable local-console surfaces. GuardedPy uses handwritten Jinja, CSS, and JavaScript; it does not bundle Open Design assets. See the [Open Design project](https://open-design.ai/) for its local-first, BYOK design workflow and licensing information.
 
+## Third-party software and licenses
+
+GuardedPy imports installed third-party distributions; it does not copy their source into this repository. The table lists every direct Python dependency declared in `pyproject.toml`. License identifiers were checked from the installed distributions' `License-Expression`, license field, or license classifier on 2026-08-05. Versions remain resolver-controlled except where `pyproject.toml` states a constraint, so redistributors should re-check the metadata of the versions they actually ship.
+
+| Role | Direct dependency | License |
+| --- | --- | --- |
+| Runtime | FastAPI | MIT |
+| Runtime | Jinja2 | BSD-3-Clause |
+| Runtime | python-multipart | Apache-2.0 |
+| Runtime | Pydantic | MIT |
+| Runtime | keyring | MIT |
+| Runtime | OpenAI Python SDK | Apache-2.0 |
+| Runtime | Uvicorn | BSD-3-Clause |
+| Runtime | PyYAML | MIT |
+| Development | pytest | MIT |
+| Development | HTTPX | BSD-3-Clause |
+| Development/build frontend | build | MIT |
+| Build backend | setuptools | MIT |
+
+Transitive dependencies are installed through these distributions and retain their own package metadata and license files. Open Design is a design reference only; no Open Design code or asset is included in the package.
+
 ## Known limitations
 
 - Local mode supports one active task and Python 3.11+ projects that use pytest; it is not a multi-user, remote, or multi-project runner.
