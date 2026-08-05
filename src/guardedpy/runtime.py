@@ -162,26 +162,26 @@ class LocalRuntime:
         description = description.strip()
         if not description:
             raise ValueError("task description must be nonblank")
-        if self._has_active_task() or not self._acquire_lease():
-            raise RuntimeBusyError()
         task = TaskState(
             description=description,
             mode=mode,
             bugfix_target=bugfix_target if mode is TaskMode.BUGFIX else None,
             config=config,
         )
-        event_store = EventStore(root)
-        index_path = local_state_path()
-        previous_index = _snapshot_file(index_path)
+        if self._has_active_task() or not self._acquire_lease():
+            raise RuntimeBusyError()
         registered = False
         index_written = False
         try:
+            event_store = EventStore(root)
+            index_path = local_state_path()
+            previous_index = _snapshot_file(index_path)
+            orchestrator = self._services.orchestrator_factory(root, config, memory_store)
             event_store.register_task(task)
             registered = True
             task_roots = {**self._task_roots, task.id: root}
             _write_local_state(root, task_roots)
             index_written = True
-            orchestrator = self._services.orchestrator_factory(root, config, memory_store)
             orchestrator.submit(task)
         except Exception:
             if index_written:

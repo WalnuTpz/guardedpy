@@ -6,12 +6,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from guardedpy.actions import RunCommandAction
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.domain import TaskMode, TaskStatus
+from guardedpy.events import EventStore
 from guardedpy.lease import ExecutionLease
 from guardedpy.llm import ScriptedLLM
 from guardedpy.orchestrator import TaskOrchestrator
@@ -109,6 +111,31 @@ def test_runtime_rejects_a_blank_task_description(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="description"):
         runtime.create_task("  ", TaskMode.FEATURE, None)
+
+
+def test_runtime_registers_a_task_after_orchestrator_startup_recovery(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.setup(tmp_path, _config(), api_key=None)
+
+    task = runtime.create_task("keep pending", TaskMode.FEATURE, None)
+
+    assert EventStore(tmp_path).tasks()[0].id == task.id
+    assert EventStore(tmp_path).tasks()[0].status is TaskStatus.PENDING
+    assert EventStore(tmp_path).events_for(task.id) == []
+
+
+def test_invalid_bugfix_target_releases_the_lease_before_another_runtime_mutates(
+    tmp_path: Path,
+) -> None:
+    first = _runtime(tmp_path)
+    second = _runtime(tmp_path)
+    first.setup(tmp_path, _config(), api_key=None)
+    second.setup(tmp_path, _config(), api_key=None)
+
+    with pytest.raises(ValidationError):
+        first.create_task("repair", TaskMode.BUGFIX, "  ")
+
+    assert second.create_task("another task", TaskMode.FEATURE, None).status is TaskStatus.PENDING
 
 
 def test_runtime_returns_event_store_safe_projection_without_pending_action_body(
