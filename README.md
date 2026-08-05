@@ -72,7 +72,24 @@ make build
 
 ## Repository and PR evidence
 
-The configured GitHub origin, verified locally with `git remote get-url origin`, is `git@github.com:WalnuTpz/guardedpy.git`. There is currently no PR URL because creating or pushing a real pull request has not been authorized for this remediation work. A PR link belongs here only after an authorized PR actually exists; this README does not substitute a branch name or invented URL for that evidence.
+The configured GitHub origin, verified locally with `git remote get-url origin`, is `git@github.com:WalnuTpz/guardedpy.git`. The user-authorized reconstruction created and merged these real pull requests:
+
+| Milestone | Pull request |
+| --- | --- |
+| Task 1 | [#1](https://github.com/WalnuTpz/guardedpy/pull/1) |
+| Task 3 | [#2](https://github.com/WalnuTpz/guardedpy/pull/2) |
+| Task 4 | [#3](https://github.com/WalnuTpz/guardedpy/pull/3) |
+| Task 2 | [#4](https://github.com/WalnuTpz/guardedpy/pull/4) |
+| Task 5 | [#5](https://github.com/WalnuTpz/guardedpy/pull/5) |
+| Task 6 | [#6](https://github.com/WalnuTpz/guardedpy/pull/6) |
+| Task 7 | [#7](https://github.com/WalnuTpz/guardedpy/pull/7) |
+| Task 8 | [#8](https://github.com/WalnuTpz/guardedpy/pull/8) |
+| Task 9 | [#9](https://github.com/WalnuTpz/guardedpy/pull/9) |
+| Task 10 | [#10](https://github.com/WalnuTpz/guardedpy/pull/10) |
+| Task 11 | [#11](https://github.com/WalnuTpz/guardedpy/pull/11) |
+| Task 12 | [#12](https://github.com/WalnuTpz/guardedpy/pull/12) |
+
+Each listed PR was created as a draft, validated by its GitHub Actions run, marked ready, and merged with a merge commit. These are present-time reconstruction records; they do not imply that the missing remote PRs existed during the original implementation, especially for the post-rollback Tasks 9–12.
 
 ## Render demo wake-up
 

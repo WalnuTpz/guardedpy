@@ -93,7 +93,9 @@ def test_readme_documents_real_local_demo_security_delivery_and_course_context()
     assert "Open Design" in readme
     assert "Agentic" in readme
     assert "git@github.com:WalnuTpz/guardedpy.git" in readme
-    assert "no PR URL" in readme
+    assert "https://github.com/WalnuTpz/guardedpy/pull/1" in readme
+    assert "https://github.com/WalnuTpz/guardedpy/pull/12" in readme
+    assert "present-time reconstruction records" in readme
     assert "src/guardedpy/" in readme
     assert "tests/" in readme
 
