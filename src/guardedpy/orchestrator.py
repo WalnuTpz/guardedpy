@@ -25,10 +25,12 @@ from guardedpy.actions import (
     parse_action,
     stable_hash,
 )
+from guardedpy.context import ContextBuilder, LlmContext
 from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskState, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 from guardedpy.feedback import FeedbackCollector, PytestFeedback
-from guardedpy.llm import LLMClient
+from guardedpy.llm import LLMClient, TemporaryProviderFailure
+from guardedpy.memory import MemoryStore
 from guardedpy.policy import PolicyEngine
 from guardedpy.workspace import ToolResult, Workspace
 
@@ -44,10 +46,18 @@ class _LoopState:
 class TaskOrchestrator:
     """Run one-action LLM rounds through deterministic policy and workspace tools."""
 
-    def __init__(self, project_root: Path, llm: LLMClient, *, max_rounds: int = 20) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        llm: LLMClient,
+        *,
+        max_rounds: int = 20,
+        memory_store: MemoryStore | None = None,
+    ) -> None:
         self._project_root = project_root.resolve()
         self._llm = llm
         self._max_rounds = max_rounds
+        self._memory_store = memory_store or MemoryStore(self._project_root)
         self._policy = PolicyEngine(self._project_root)
         self._workspace_by_task: dict[UUID, Workspace] = {}
         self._tasks: dict[UUID, TaskState] = {}
@@ -83,6 +93,8 @@ class TaskOrchestrator:
             round_number = loop.next_round
             try:
                 action = parse_action(self._llm.complete(self._context(task)))
+            except TemporaryProviderFailure:
+                return self._stop(task, StopReason.PROVIDER_TEMPORARY_FAILURE, round_number)
             except (ValidationError, ValueError, json.JSONDecodeError):
                 return self._stop(task, StopReason.INVALID_MODEL_OUTPUT, round_number)
             except Exception:
@@ -316,6 +328,7 @@ class TaskOrchestrator:
     ) -> TaskState:
         if reason in {
             StopReason.INVALID_MODEL_OUTPUT,
+            StopReason.PROVIDER_TEMPORARY_FAILURE,
             StopReason.UNRECOVERABLE_ERROR,
             StopReason.ROUND_LIMIT,
             StopReason.REPEATED_ACTION,
@@ -334,14 +347,11 @@ class TaskOrchestrator:
         )
         return task
 
-    def _context(self, task: TaskState) -> str:
-        return json.dumps(
-            {
-                "task": {"description": task.description, "mode": task.mode.value},
-                "tdd_phase": task.tdd_phase.value,
-                "last_feedback": self._feedback.get(task.id),
-            },
-            sort_keys=True,
+    def _context(self, task: TaskState) -> LlmContext:
+        return ContextBuilder(self._project_root).build(
+            task,
+            self._feedback.get(task.id),
+            self._memory_store.search(task.description),
         )
 
     @staticmethod
