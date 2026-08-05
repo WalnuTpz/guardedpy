@@ -75,6 +75,16 @@ class _TaskDetailDom(HTMLParser):
         super().__init__()
         self._next_element_id = 0
         self._ancestors: list[tuple[int, str, dict[str, str]]] = []
+        self._text_captures: list[tuple[str, list[str]]] = []
+        self._inside_navigation = 0
+        self._inside_context_title = False
+        self._context_title_fragments: list[str] = []
+        self.regions: list[str] = []
+        self.decision_values: list[str] = []
+        self.raw_status: str | None = None
+        self.visible_status: str | None = None
+        self.current_navigation_hrefs: list[str] = []
+        self.context_title: str | None = None
         self.event_list_polling_root_id: int | None = None
         self.status_polling_root_id: int | None = None
 
@@ -82,10 +92,23 @@ class _TaskDetailDom(HTMLParser):
         attributes = {name: value or "" for name, value in attrs}
         element_id = self._next_element_id
         self._next_element_id += 1
+        if tag == "section" and attributes.get("aria-label"):
+            self.regions.append(attributes["aria-label"])
+        if tag == "nav":
+            self._inside_navigation += 1
+        if tag == "a" and self._inside_navigation and attributes.get("aria-current") == "page":
+            self.current_navigation_hrefs.append(attributes.get("href", ""))
+        if "context-bar-title" in attributes.get("class", "").split():
+            self._inside_context_title = True
+        if tag == "button" and attributes.get("name") == "decision":
+            self.decision_values.append(attributes.get("value", ""))
+        if "data-events-url" in attributes:
+            self.raw_status = attributes.get("data-current-status")
         if "data-event-list" in attributes:
             self.event_list_polling_root_id = self._polling_root_id()
         if "data-task-status" in attributes:
             self.status_polling_root_id = self._polling_root_id()
+            self._text_captures.append((tag, []))
         if tag not in self._VOID_TAGS:
             self._ancestors.append((element_id, tag, attributes))
 
@@ -93,10 +116,24 @@ class _TaskDetailDom(HTMLParser):
         return
 
     def handle_endtag(self, tag: str) -> None:
+        if self._text_captures and self._text_captures[-1][0] == tag:
+            _, fragments = self._text_captures.pop()
+            self.visible_status = "".join(fragments).strip()
+        if tag == "span" and self._inside_context_title:
+            self.context_title = "".join(self._context_title_fragments).strip()
+            self._inside_context_title = False
+        if tag == "nav":
+            self._inside_navigation -= 1
         for index in range(len(self._ancestors) - 1, -1, -1):
             if self._ancestors[index][1] == tag:
                 del self._ancestors[index:]
                 return
+
+    def handle_data(self, data: str) -> None:
+        for _, fragments in self._text_captures:
+            fragments.append(data)
+        if self._inside_context_title:
+            self._context_title_fragments.append(data)
 
     def _polling_root_id(self) -> int | None:
         for element_id, _tag, attributes in reversed(self._ancestors):
@@ -295,13 +332,15 @@ def test_command_approval_page_shows_safe_rule_reason_and_all_decisions(
     page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
 
     assert page.status_code == 200
-    assert "Policy rule: command.approval_required" in page.text
-    assert "Policy reason: the constrained command requires approval" in page.text
+    assert "策略规则" in page.text
+    assert "command.approval_required" in page.text
+    assert "策略原因" in page.text
+    assert "the constrained command requires approval" in page.text
     assert 'value="reject"' in page.text
     assert 'value="once"' in page.text
     assert 'value="always"' in page.text
-    assert "Allow once" in page.text
-    assert "Always allow this rule" in page.text
+    assert "仅允许一次" in page.text
+    assert "始终允许此规则" in page.text
     assert "hidden context" not in page.text
 
 
@@ -363,6 +402,9 @@ def test_non_command_approval_hides_always_and_keeps_pending_after_forgery(
 
     assert page.status_code == 200
     assert 'value="always"' not in page.text
+    detail = _TaskDetailDom()
+    detail.feed(page.text)
+    assert "always" not in detail.decision_values
     assert resolved.status_code == 303
 
 
@@ -383,6 +425,33 @@ def test_task_detail_polling_root_owns_status_and_event_list_in_parsed_dom(
     assert document.status_polling_root_id is not None
     assert document.event_list_polling_root_id is not None
     assert document.status_polling_root_id == document.event_list_polling_root_id
+
+
+def test_task_detail_prioritizes_governance_regions_and_translates_waiting_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a responsive detail view exposing raw status or moving approval after history."""
+    command = _action(
+        kind="run_command",
+        summary="install package with hidden context",
+        args=["python", "-m", "pip", "install", "example-package==1.2.3"],
+    )
+    app, _, _ = _waiting_app(tmp_path, monkeypatch, [command])
+    task = app.state.local.task
+    assert task is not None
+
+    page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    detail = _TaskDetailDom()
+    detail.feed(page.text)
+
+    assert page.status_code == 200
+    assert detail.regions[:3] == ["任务状态", "操作审批", "审计时间线"]
+    assert detail.decision_values == ["reject", "once", "always"]
+    assert detail.raw_status == "waiting_approval"
+    assert detail.visible_status == "等待审批"
+    assert detail.context_title == "任务详情"
+    assert detail.current_navigation_hrefs == ["/tasks/new"]
+    assert detail.event_list_polling_root_id == detail.status_polling_root_id
 
 
 def test_polling_protocol_reloads_running_page_when_latest_event_requires_approval(
@@ -510,7 +579,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
     feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
 
     assert expected_projection in page.text
-    assert f"Project: {root.resolve()}" in page.text
+    assert f"项目：{root.resolve()}" in page.text
     assert unsafe_text not in page.text
     assert unsafe_text not in feed.text
     waiting = feed.json()[-1]
@@ -526,7 +595,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
             "approval.granted",
             "user approved this exact action once",
             True,
-            "approval: granted",
+            "审批：已同意",
             id="once",
         ),
         pytest.param(
@@ -534,7 +603,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
             "approval.granted_always",
             "user approved a constrained persistent command rule",
             True,
-            "approval: granted",
+            "审批：已同意",
             id="always",
         ),
         pytest.param(
@@ -542,7 +611,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
             "approval.declined",
             "user declined the action",
             False,
-            "approval: rejected",
+            "审批：已拒绝",
             id="reject",
         ),
     ],
@@ -686,7 +755,7 @@ def test_terminal_task_keeps_its_original_event_root_after_reconfiguration(
 
     assert replaced.status_code == 303
     assert detail.status_code == 200
-    assert f"Project: {original_root.resolve()}" in detail.text
+    assert f"项目：{original_root.resolve()}" in detail.text
     assert "delete.approval_required" in detail.text
     assert feed.status_code == 200
     events = feed.json()

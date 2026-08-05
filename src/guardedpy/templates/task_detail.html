@@ -1,51 +1,66 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="card task-detail" data-events-url="/tasks/{{ task.id }}/events" data-current-status="{{ task.status }}" data-terminal="{{ 'true' if terminal else 'false' }}">
-  <p class="eyebrow">GOVERNED TASK TIMELINE</p>
-  <h1>Task activity</h1>
-  <p>Task status: <span class="badge {% if task.status in ['completed', 'cancelled'] %}badge-green{% elif task.status in ['blocked', 'interrupted'] %}badge-red{% else %}badge-amber{% endif %}" data-task-status>{{ task.status }}</span></p>
-  <p class="muted">Events show fixed audit summaries only.</p>
+<div class="task-detail-layout" data-events-url="/tasks/{{ task.id }}/events" data-current-status="{{ task.status }}" data-terminal="{{ 'true' if terminal else 'false' }}" data-od-id="task-detail-workspace">
+  <section class="card task-detail-sidebar" aria-label="任务状态" data-od-id="task-status-sidebar">
+    <p class="eyebrow">受治理任务</p>
+    <h1>任务详情</h1>
+    <p class="muted">当前状态</p>
+    <p><span class="badge" data-status="{{ task.status }}" data-task-status>{{ status_labels.get(task.status, task.status) }}</span></p>
+    <dl class="definition-grid">
+      <div><dt>任务 ID</dt><dd class="mono">{{ task.id }}</dd></div>
+      <div><dt>运行模式</dt><dd class="mono">{{ task.mode }}</dd></div>
+    </dl>
+  </section>
 
-{% if approval_event and task.status == 'waiting_approval' %}
-<section class="approval-card">
-  <p class="eyebrow">ACTION APPROVAL REQUIRED</p>
-  <h2>{{ approval_event.action_summary }}</h2>
-  {% if approval_event.action_projection %}<p>{{ approval_event.action_projection }}</p>{% endif %}
-  {% if approval_event.affected_project %}<p>Project: {{ approval_event.affected_project }}</p>{% endif %}
-  <p>Policy: <span class="badge badge-amber">{{ approval_event.policy_verdict }}</span></p>
-  {% if approval_event.policy_rule_id %}<p>Policy rule: {{ approval_event.policy_rule_id }}</p>{% endif %}
-  {% if approval_event.policy_reason %}<p>Policy reason: {{ approval_event.policy_reason }}</p>{% endif %}
-  <form method="post" action="/tasks/{{ task.id }}/approval" class="approval-actions">
-    <input type="hidden" name="action_hash" value="{{ approval_event.action_hash }}">
-    <button class="secondary" type="submit" name="decision" value="reject">Reject action</button>
-    <button type="submit" name="decision" value="once">Allow once</button>
-    {% if approval_event.permanent_eligible %}
-    <button type="submit" name="decision" value="always">Always allow this rule</button>
-    {% endif %}
-  </form>
-</section>
-{% endif %}
+  {% if approval_event and task.status == 'waiting_approval' %}
+  <section class="approval-card" aria-label="操作审批" data-od-id="approval-decision">
+    <p class="eyebrow">需要人工审批</p>
+    <h2>操作审批</h2>
+    <dl class="definition-grid approval-detail">
+      {% if approval_event.action_summary %}<div><dt>操作摘要</dt><dd>{{ approval_event.action_summary }}</dd></div>{% endif %}
+      {% if approval_event.action_projection %}<div><dt>安全投影</dt><dd class="mono">{{ approval_event.action_projection }}</dd></div>{% endif %}
+      {% if approval_event.affected_project %}<div><dt>受影响项目</dt><dd class="mono">{{ approval_event.affected_project }}</dd></div>{% endif %}
+      {% if approval_event.policy_verdict %}<div><dt>策略结论</dt><dd class="mono">{{ approval_event.policy_verdict }}</dd></div>{% endif %}
+      {% if approval_event.policy_rule_id %}<div><dt>策略规则</dt><dd class="mono">{{ approval_event.policy_rule_id }}</dd></div>{% endif %}
+      {% if approval_event.policy_reason %}<div><dt>策略原因</dt><dd>{{ approval_event.policy_reason }}</dd></div>{% endif %}
+    </dl>
+    <form method="post" action="/tasks/{{ task.id }}/approval" class="approval-actions">
+      <input type="hidden" name="action_hash" value="{{ approval_event.action_hash }}">
+      <button class="btn-danger" type="submit" name="decision" value="reject">拒绝</button>
+      <button class="btn-primary" type="submit" name="decision" value="once">仅允许一次</button>
+      {% if approval_event.permanent_eligible %}
+      <button class="btn-secondary" type="submit" name="decision" value="always">始终允许此规则</button>
+      {% endif %}
+    </form>
+  </section>
+  {% endif %}
 
-<section class="timeline-card">
-  <h2>Audit timeline</h2>
-  <ol class="timeline" data-event-list>
-    {% for event in events %}
-    <li>
-      <span class="badge {% if event.task_status in ['completed', 'cancelled'] %}badge-green{% elif event.task_status in ['blocked', 'interrupted'] %}badge-red{% else %}badge-amber{% endif %}">{{ event.task_status }}</span>
-      {% if event.action_summary %}<span>{{ event.action_summary }}</span>{% endif %}
-      {% if event.action_projection %}<span>{{ event.action_projection }}</span>{% endif %}
-      {% if event.affected_project %}<span>Project: {{ event.affected_project }}</span>{% endif %}
-      {% if event.policy_verdict %}<span>policy: {{ event.policy_verdict }}</span>{% endif %}
-      {% if event.policy_rule_id %}<span>rule: {{ event.policy_rule_id }}</span>{% endif %}
-      {% if event.policy_reason %}<span>{{ event.policy_reason }}</span>{% endif %}
-      {% if event.approval_granted is sameas true %}<span>approval: granted</span>{% elif event.approval_granted is sameas false %}<span>approval: rejected</span>{% endif %}
-      {% if event.feedback_excerpt %}<span>{{ event.feedback_excerpt }}</span>{% endif %}
-      {% if event.feedback_node_id %}<span>{{ event.feedback_node_id }}</span>{% endif %}
-      {% if event.stop_reason %}<span>stop: {{ event.stop_reason }}</span>{% endif %}
-    </li>
-    {% endfor %}
-  </ol>
-</section>
-</section>
+  <section class="card timeline-card" aria-label="审计时间线" data-od-id="task-timeline">
+    <p class="eyebrow">固定审计投影</p>
+    <h2>审计时间线</h2>
+    <p class="muted">事件仅显示经过验证的安全摘要。</p>
+    <ol class="timeline" data-event-list>
+      {% for event in events %}
+      <li data-event-status="{{ event.task_status }}">
+        <div class="timeline-event-header">
+          <span class="badge" data-status="{{ event.task_status }}">{{ status_labels.get(event.task_status, event.task_status) }}</span>
+          {% if event.action_summary %}<span class="event-action">{{ event.action_summary }}</span>{% endif %}
+        </div>
+        <div class="timeline-event-detail">
+          {% if event.action_projection %}<span class="event-action mono">{{ event.action_projection }}</span>{% endif %}
+          {% if event.affected_project %}<span class="event-governance mono">项目：{{ event.affected_project }}</span>{% endif %}
+          {% if event.policy_verdict %}<span class="event-governance mono">策略：{{ event.policy_verdict }}</span>{% endif %}
+          {% if event.policy_rule_id %}<span class="event-governance mono">规则：{{ event.policy_rule_id }}</span>{% endif %}
+          {% if event.policy_reason %}<span class="event-governance">{{ event.policy_reason }}</span>{% endif %}
+          {% if event.approval_granted is sameas true %}<span class="event-governance">审批：已同意</span>{% elif event.approval_granted is sameas false %}<span class="event-governance">审批：已拒绝</span>{% endif %}
+          {% if event.feedback_excerpt %}<span class="event-feedback">{{ event.feedback_excerpt }}</span>{% endif %}
+          {% if event.feedback_node_id %}<span class="event-feedback mono">{{ event.feedback_node_id }}</span>{% endif %}
+          {% if event.stop_reason %}<span class="event-stop mono">停止：{{ event.stop_reason }}</span>{% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ol>
+  </section>
+</div>
 {% if not terminal %}<script defer src="{{ url_for('static', path='app.js') }}"></script>{% endif %}
 {% endblock %}

@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
   </head>
   <body>
-    {% set status_labels = {'pending': '待处理', 'running': '运行中', 'waiting_approval': '等待审批', 'completed': '已完成', 'blocked': '已阻塞', 'cancelled': '已取消', 'interrupted': '已中断'} %}
+    {% set status_labels = {'pending': '待处理', 'running': '运行中', 'waiting_approval': '等待审批', 'completed': '已完成', 'blocked': '已阻止', 'cancelled': '已取消', 'interrupted': '已中断'} %}
     <a class="skip-link" href="#main-content">跳转到主内容</a>
     <div class="app-shell">
       <aside class="rail" aria-label="GuardedPy 主导航" data-od-id="app-rail">
@@ -17,7 +17,7 @@
         </div>
         <nav class="rail-nav" aria-label="主导航" data-od-id="primary-navigation">
           <a href="/" {% if page == 'setup' %}aria-current="page"{% endif %}>设置与概览</a>
-          <a href="/tasks/new" {% if page == 'tasks' %}aria-current="page"{% endif %}>任务</a>
+          <a href="/tasks/new" {% if page in ['tasks', 'task_detail'] %}aria-current="page"{% endif %}>任务</a>
           <a href="/memories" {% if page == 'memories' %}aria-current="page"{% endif %}>记忆</a>
           <a href="/settings/command-rules" {% if page == 'command_rules' %}aria-current="page"{% endif %}>命令规则</a>
           <a href="/settings/credentials" {% if page == 'credentials' %}aria-current="page"{% endif %}>凭据</a>
@@ -25,7 +25,7 @@
       </aside>
       <div class="workspace">
         <header class="context-bar" data-od-id="context-header">
-          <span class="context-bar-title">{% if page == 'setup' %}设置与概览{% elif page == 'tasks' %}任务{% elif page == 'memories' %}记忆{% elif page == 'command_rules' %}命令规则{% else %}凭据{% endif %}</span>
+          <span class="context-bar-title">{% if page == 'setup' %}设置与概览{% elif page == 'tasks' %}任务{% elif page == 'task_detail' %}任务详情{% elif page == 'memories' %}记忆{% elif page == 'command_rules' %}命令规则{% else %}凭据{% endif %}</span>
           <span class="context-bar-meta">
             {% if request.app.state.local.project_root %}<span class="project-path">{{ request.app.state.local.project_root }}</span>{% endif %}
             {% if context_task %}<span class="badge" data-status="{{ context_task.status }}">{{ status_labels.get(context_task.status, context_task.status) }}</span>{% endif %}
@@ -34,10 +34,10 @@
     <main id="main-content" class="content" data-od-id="main-content">
       {% if page == 'credentials' %}
       <section class="card settings-section" aria-label="凭据状态" data-od-id="credentials-status">
-        <p class="eyebrow">本地凭据存储</p>
+        <p class="eyebrow">项目安全设置</p>
         <h1>凭据</h1>
         <p>DeepSeek 凭据状态：{% if configured %}<span class="badge badge-success" data-status="configured">已配置</span>{% else %}<span class="badge badge-warn" data-status="not_configured">未配置</span>{% endif %}</p>
-        <p class="muted">密钥仅保存在操作系统钥匙串中，永不在此页面显示。</p>
+        <div class="security-callout"><p>密钥仅保存在操作系统钥匙串中，永不在此页面显示。</p></div>
         {% if error %}<p class="notice notice-error" role="alert">{{ error }}</p>{% endif %}
       </section>
       <section class="card settings-section" aria-label="更新凭据" data-od-id="credentials-update">

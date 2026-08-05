@@ -356,7 +356,8 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 "events": events,
                 "approval_event": approval_event,
                 "terminal": task.status in _TERMINAL_STATUSES,
-                "page": "tasks",
+                "page": "task_detail",
+                "context_task": task,
             },
         )
 

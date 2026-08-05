@@ -1,22 +1,30 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="card">
-  <p class="eyebrow">PROJECT COMMAND POLICY</p>
-  <h1>Command rules</h1>
-  <p class="muted">Only constrained rules for the currently connected project appear here.</p>
+<section class="card settings-section" aria-label="命令规则状态" data-od-id="command-rules-status">
+  <p class="eyebrow">项目安全设置</p>
+  <h1>命令规则</h1>
+  <div class="security-callout">
+    <h2>规则范围</h2>
+    <p>仅显示当前连接项目中，经人工批准且受约束的持久化命令规则。</p>
+  </div>
 </section>
-<section class="card">
+<section class="card settings-section" aria-label="已保存的命令规则" data-od-id="command-rules-list">
+  <h2>已保存的命令规则</h2>
   {% if rules %}
   <ul class="memory-list">
     {% for rule, projection in rules %}
     <li>
-      <p>{{ projection }}</p>
+      <div>
+        <p class="mono">{{ rule.id }}</p>
+        <p class="mono muted">{{ rule.kind }}</p>
+        <p>{{ projection }}</p>
+      </div>
       <form method="post" action="/settings/command-rules/{{ rule.id }}/delete">
-        <button class="secondary" type="submit">Revoke rule</button>
+        <button class="btn-danger" type="submit">撤销规则</button>
       </form>
     </li>
     {% endfor %}
   </ul>
-  {% else %}<p class="muted">No persistent command rules.</p>{% endif %}
+  {% else %}<p class="empty-state">没有持久化命令规则。</p>{% endif %}
 </section>
 {% endblock %}

@@ -369,6 +369,47 @@ def test_task14_pages_render_the_complete_fixed_error_set_in_chinese(
         assert english not in response.text
 
 
+def test_memory_review_uses_chinese_pending_and_approved_regions(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Catches consent-controlled memory lists losing their review-stage meaning."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    root = _project_root(tmp_path)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    memory_store = app.state.local.memory_store
+    assert memory_store is not None
+    proposal = memory_store.propose(uuid4(), "记住解析器命名约定")
+
+    document = _document(asyncio.run(_request(app, "GET", "/memories")))
+
+    assert {"待审记忆", "已批准记忆"} <= document.section_labels
+    assert document.forms == [
+        (f"/memories/{proposal.id}/approve", set()),
+        (f"/memories/{proposal.id}/delete", set()),
+    ]
+
+
+def test_security_settings_explain_current_rules_without_changing_their_controls(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Catches command-rule settings becoming an unexplained or non-semantic control surface."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    root = _project_root(tmp_path)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+
+    command_rules = _document(asyncio.run(_request(app, "GET", "/settings/command-rules")))
+    credentials = _document(asyncio.run(_request(app, "GET", "/settings/credentials")))
+
+    assert {"命令规则状态", "已保存的命令规则"} <= command_rules.section_labels
+    assert {"凭据状态", "更新凭据", "清除凭据"} <= credentials.section_labels
+    assert credentials.forms == [
+        ("/settings/credentials", {"api_key"}),
+        ("/settings/credentials/clear", set()),
+    ]
+
+
 def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives() -> None:
     """Catches a shared stylesheet that removes the responsive console guarantees."""
     stylesheet = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.css").read_text()
@@ -400,5 +441,4 @@ def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives()
     phone_rules = _css_rules(stylesheet, "max-width: 639px")
     assert phone_rules[".rail"]["position"] == "static"
     assert phone_rules[".rail-nav"]["flex-wrap"] == "wrap"
-    reduced_motion_rules = _css_rules(stylesheet, "prefers-reduced-motion: reduce")
-    assert reduced_motion_rules["*"]["transition-duration"] == ".01ms !important"
+    assert "prefers-reduced-motion: reduce" not in stylesheet
