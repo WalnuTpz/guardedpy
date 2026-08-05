@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guardedpy"
+version = "0.1.0"
+description = "A governed, test-driven coding agent harness"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "jinja2",
+    "pydantic>=2,<3",
+    "keyring",
+    "openai",
+    "uvicorn",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx", "build"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

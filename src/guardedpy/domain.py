@@ -1,0 +1,58 @@
+"""Domain values shared by GuardedPy components."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, Field
+
+from guardedpy.config import HarnessConfig
+
+
+class TaskMode(StrEnum):
+    FEATURE = "feature"
+    BUGFIX = "bugfix"
+
+
+class TaskStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
+
+class TddPhase(StrEnum):
+    TEST_DESIGN = "test_design"
+    RED_OBSERVED = "red_observed"
+    IMPLEMENTATION = "implementation"
+    GREEN_OBSERVED = "green_observed"
+    FINISHED = "finished"
+
+
+class PolicyVerdict(StrEnum):
+    ALLOW = "allow"
+    APPROVAL_REQUIRED = "approval_required"
+    DENY = "deny"
+
+
+class FeedbackKind(StrEnum):
+    PASSED = "passed"
+    ASSERTION_FAILURE = "assertion_failure"
+    COLLECTION_ERROR = "collection_error"
+    EXECUTION_ERROR = "execution_error"
+    TIMEOUT = "timeout"
+
+
+class TaskState(BaseModel):
+    """The persisted state needed to govern one coding task."""
+
+    description: str
+    mode: TaskMode
+    config: HarnessConfig
+    id: UUID = Field(default_factory=uuid4)
+    status: TaskStatus = TaskStatus.PENDING
+    tdd_phase: TddPhase = TddPhase.TEST_DESIGN
