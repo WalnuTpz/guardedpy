@@ -79,6 +79,10 @@ class RenderedDocument(HTMLParser):
         self.bugfix_target_copies: set[str] = set()
         self.has_task_mode_control = False
         self.task_link_hrefs: list[str] = []
+        self.anchors: list[tuple[str, str]] = []
+        self.header_texts: list[str] = []
+        self._anchor_captures: list[list[str]] = []
+        self._header_captures: list[list[str]] = []
         self._inside_navigation = 0
         self._form_stack: list[tuple[str, set[str]]] = []
         self._script_fragments: list[str] = []
@@ -104,6 +108,10 @@ class RenderedDocument(HTMLParser):
                 self.current_href = href
         if tag == "a" and "task-link" in attributes.get("class", "").split():
             self.task_link_hrefs.append(attributes.get("href", ""))
+        if tag == "a":
+            self._anchor_captures.append([attributes.get("href", "")])
+        if tag == "header":
+            self._header_captures.append([])
         if tag == "form":
             form = (attributes.get("action", ""), set())
             self.forms.append(form)
@@ -135,9 +143,18 @@ class RenderedDocument(HTMLParser):
             self.mono_texts.append("".join(fragments).strip())
         if tag == "script":
             self._inside_script = False
+        if tag == "a":
+            href, *fragments = self._anchor_captures.pop()
+            self.anchors.append((href, "".join(fragments).strip()))
+        if tag == "header":
+            self.header_texts.append("".join(self._header_captures.pop()).strip())
 
     def handle_data(self, data: str) -> None:
         for _, fragments in self._mono_text_captures:
+            fragments.append(data)
+        for fragments in self._anchor_captures:
+            fragments.append(data)
+        for fragments in self._header_captures:
             fragments.append(data)
         if self._inside_script:
             self._script_fragments.append(data)
@@ -476,3 +493,24 @@ def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives()
     assert phone_rules[".rail"]["position"] == "static"
     assert phone_rules[".rail-nav"]["flex-wrap"] == "wrap"
     assert "prefers-reduced-motion: reduce" not in stylesheet
+
+
+def test_public_demo_is_a_chinese_read_only_surface_with_only_fixed_scenario_links() -> None:
+    """Catches the public demo regressing into local-console navigation or controls."""
+    from guardedpy.demo import create_demo_app
+
+    document = _document(asyncio.run(_request(create_demo_app(), "GET", "/")))
+    stylesheet = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.css").read_text()
+
+    assert document.lang == "zh-CN"
+    assert any("只读演示" in text for text in document.header_texts)
+    assert document.landmarks == {"main"}
+    assert document.forms == []
+    assert document.anchors == [
+        ("/demo/scenarios/dangerous_action_denied", "危险动作被拒绝"),
+        ("/demo/scenarios/failure_feedback_corrects", "失败反馈促成修正"),
+        ("/demo/scenarios/tdd_source_patch_denied", "未观察失败前拒绝源码修改"),
+    ]
+    assert _css_rules(stylesheet)[".demo-scenario-link"]["min-height"] == "44px"
+    phone_rules = _css_rules(stylesheet, "max-width: 639px")
+    assert phone_rules[".demo-header"]["align-items"] == "flex-start"
