@@ -88,7 +88,8 @@ def test_readme_documents_real_local_demo_security_delivery_and_course_context()
     assert ".env" in readme
     assert "127.0.0.1" in readme
     assert "not deployed" in readme
-    assert "not been run" in readme
+    assert "GitHub Actions has recorded successful validation runs" in readme
+    assert "GitLab workflow has not yet been executed" in readme
     assert "Open Design" in readme
     assert "Agentic" in readme
     assert "git@github.com:WalnuTpz/guardedpy.git" in readme
