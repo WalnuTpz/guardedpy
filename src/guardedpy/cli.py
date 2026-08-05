@@ -65,11 +65,14 @@ def main(
         from guardedpy.web import demo_main
 
         return demo_main(())
-    if arguments.mode == TaskMode.BUGFIX.value and not arguments.target:
+    if arguments.mode == TaskMode.BUGFIX.value and not (
+        arguments.target and arguments.target.strip()
+    ):
         return 2
 
     runtime = runtime_factory()
     output = stdout or sys.stdout
+    source = stdin or sys.stdin
     if arguments.prompt is not None:
         return _run_task(
             runtime,
@@ -77,9 +80,8 @@ def main(
             TaskMode(arguments.mode),
             arguments.target,
             output,
-            lambda: "",
+            source.readline,
         )
-    source = stdin or sys.stdin
     return run_repl(runtime, source, output, source.isatty)
 
 
@@ -211,7 +213,10 @@ def _run_task(
         return 1
     _render_task(runtime, result, stdout)
     while result.status is TaskStatus.WAITING_APPROVAL:
-        decision = _prompt(stdout, read_line, "审批（reject/once/always）: ")
+        try:
+            decision = _prompt(stdout, read_line, "审批（reject/once/always）: ")
+        except KeyboardInterrupt:
+            return _cancel_task(runtime, result.id, stdout)
         if not is_approval_decision(decision):
             stdout.write("审批输入无效。\n")
             continue

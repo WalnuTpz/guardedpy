@@ -141,6 +141,55 @@ def test_one_shot_bugfix_requires_an_explicit_pytest_node() -> None:
     assert main(["--prompt", "repair", "--mode", "bugfix"], runtime_factory=FakeRuntime) == 2
 
 
+def test_one_shot_bugfix_rejects_a_whitespace_only_pytest_node_before_composition() -> None:
+    """Catches a whitespace target constructing a runtime or creating a malformed task."""
+    from guardedpy.cli import main
+
+    composed: list[FakeRuntime] = []
+
+    def runtime_factory() -> FakeRuntime:
+        runtime = FakeRuntime()
+        composed.append(runtime)
+        return runtime
+
+    assert (
+        main(
+            ["--prompt", "repair", "--mode", "bugfix", "--target", "   "],
+            runtime_factory=runtime_factory,
+        )
+        == 2
+    )
+    assert composed == []
+
+
+@pytest.mark.parametrize("decision", ("reject", "once", "always"))
+def test_one_shot_consumes_injected_approval_input_until_the_task_finishes(
+    decision: str,
+) -> None:
+    """Catches a waiting one-shot ignoring stdin and repeatedly reading an empty approval."""
+    from guardedpy.cli import main
+
+    class ApprovalOutput(StringIO):
+        def write(self, text: str) -> int:
+            if text == "审批输入无效。\n":
+                raise AssertionError("one-shot ignored its supplied approval input")
+            return super().write(text)
+
+    runtime = FakeRuntime(wait_for_approval=True)
+    output = ApprovalOutput()
+
+    code = main(
+        ["--prompt", "dangerous task"],
+        runtime_factory=lambda: runtime,
+        stdin=StringIO(f"{decision}\n"),
+        stdout=output,
+    )
+
+    assert code == 0
+    assert runtime.decisions == [(runtime.created[0].id, "bound-approval-hash", decision)]
+    assert runtime.created[0].status is TaskStatus.COMPLETED
+
+
 def test_repl_refuses_a_blank_first_key_without_persisting_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Catches allowing a first setup that has neither a hidden key nor a stored credential."""
     from guardedpy.cli import run_repl
@@ -243,6 +292,30 @@ def test_repl_cancels_the_active_task_after_ctrl_c() -> None:
     output = StringIO()
 
     code = run_repl(runtime, StringIO("long task\n"), output, lambda: False)
+
+    assert code == 0
+    assert runtime.cancelled == [runtime.created[0].id]
+    assert "cancelled" in output.getvalue()
+
+
+def test_repl_cancels_the_waiting_task_when_ctrl_c_interrupts_the_approval_prompt() -> None:
+    """Catches Ctrl-C at an approval prompt leaving its active runtime task alive."""
+    from guardedpy.cli import run_repl
+
+    class InterruptAtApproval:
+        def __init__(self) -> None:
+            self._lines = iter(("dangerous task\n", KeyboardInterrupt(), "/exit\n"))
+
+        def readline(self) -> str:
+            value = next(self._lines)
+            if isinstance(value, KeyboardInterrupt):
+                raise value
+            return value
+
+    runtime = FakeRuntime(wait_for_approval=True)
+    output = StringIO()
+
+    code = run_repl(runtime, InterruptAtApproval(), output, lambda: False)
 
     assert code == 0
     assert runtime.cancelled == [runtime.created[0].id]
