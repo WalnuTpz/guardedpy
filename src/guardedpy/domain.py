@@ -39,6 +39,16 @@ class PolicyVerdict(StrEnum):
     DENY = "deny"
 
 
+class PolicyDecision(BaseModel):
+    """A deterministic policy result for one proposed action."""
+
+    verdict: PolicyVerdict
+    rule_id: str
+    reason: str
+    task_id: UUID | None = None
+    action_hash: str | None = None
+
+
 class FeedbackKind(StrEnum):
     PASSED = "passed"
     ASSERTION_FAILURE = "assertion_failure"
