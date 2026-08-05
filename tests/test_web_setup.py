@@ -116,6 +116,7 @@ class _NavigationDom(HTMLParser):
         super().__init__()
         self._inside_navigation = 0
         self.navigation_hrefs: list[str] = []
+        self.current_hrefs: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
@@ -123,6 +124,8 @@ class _NavigationDom(HTMLParser):
             self._inside_navigation += 1
         if tag == "a" and self._inside_navigation and attributes.get("href"):
             self.navigation_hrefs.append(attributes["href"])
+            if attributes.get("aria-current") == "page":
+                self.current_hrefs.append(attributes["href"])
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "nav":
@@ -210,6 +213,7 @@ def test_narrow_layout_keeps_all_navigation_destinations_as_real_links(tmp_path:
         "/settings/command-rules",
         "/settings/credentials",
     ]
+    assert navigation.current_hrefs == ["/tasks/new"]
     assert _media_hides_navigation("@media (max-width: 36rem) { nav { display: none; } }")
     assert _media_hides_navigation("@media(max-width:36rem){ header > nav, .topbar { display : none !important } }")
     assert not _media_hides_navigation(stylesheet)
@@ -348,7 +352,7 @@ def test_missing_or_malformed_startup_state_fails_closed_to_setup(
     response = asyncio.run(_request(app, "GET", "/"))
 
     assert response.status_code == 200
-    assert "Connect one project" in response.text
+    assert "连接一个项目" in response.text
     assert "broken" not in response.text
     assert "leaked" not in response.text
     assert app.state.local.config is None
@@ -391,7 +395,7 @@ def test_invalid_restored_harness_config_fails_closed_to_setup(
     response = asyncio.run(_request(app, "GET", "/"))
 
     assert response.status_code == 200
-    assert "Connect one project" in response.text
+    assert "连接一个项目" in response.text
     assert app.state.local.config is None
     assert factory_calls == []
 

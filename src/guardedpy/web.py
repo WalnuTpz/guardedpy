@@ -140,6 +140,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             "setup.html",
             {
                 "request": request,
+                "page": "setup",
                 "error": error,
                 "configured": status.configured,
                 "project_root": str(state.project_root) if state.project_root else "",
@@ -177,6 +178,8 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             "task.html",
             {
                 "error": error,
+                "page": "tasks",
+                "context_task": state.task,
                 "configured": state.config is not None,
                 "task": state.task,
                 "tasks": list(state.tasks.values()),
@@ -348,6 +351,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 "events": events,
                 "approval_event": approval_event,
                 "terminal": task.status in _TERMINAL_STATUSES,
+                "page": "tasks",
             },
         )
 
@@ -401,7 +405,11 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         return _TEMPLATES.TemplateResponse(
             request,
             "memory.html",
-            {"proposals": memory_store.proposals(), "approved": memory_store.approved()},
+            {
+                "proposals": memory_store.proposals(),
+                "approved": memory_store.approved(),
+                "page": "memories",
+            },
         )
 
     @app.post("/memories/{memory_id}/approve", response_class=HTMLResponse)
@@ -464,7 +472,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         return _TEMPLATES.TemplateResponse(
             request,
             "command_rules.html",
-            {"rules": rules},
+            {"rules": rules, "page": "command_rules"},
         )
 
     @app.post("/settings/command-rules/{rule_id}/delete", response_class=HTMLResponse)

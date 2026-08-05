@@ -1,19 +1,35 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="card">
-  <p class="eyebrow">LOCAL SETUP</p>
-  <h1>Connect one project</h1>
-  <p class="muted">GuardedPy stays on this machine and runs one governed task at a time.</p>
+<section class="card" data-od-id="setup-form">
+  <p class="eyebrow">本地设置</p>
+  <h1>连接一个项目</h1>
+  <p class="muted">GuardedPy 仅在此设备运行，每次只执行一个受治理任务。</p>
   {% if error %}<p class="notice notice-error" role="alert">{{ error }}</p>{% endif %}
   <form method="post" action="/setup" class="form-grid">
-    <label>Project root <input name="project_root" type="text" value="{{ project_root }}" required></label>
-    <label>Source directories <input name="source_dirs" value="{{ source_dirs }}" required></label>
-    <label>Test directories <input name="test_dirs" value="{{ test_dirs }}" required></label>
-    <label>Pytest command <input name="pytest_command" value="{{ pytest_command }}" required></label>
-    <label>Model <input name="model" value="{{ model }}" required></label>
-    <label>Timeout seconds <input name="timeout_seconds" value="{{ timeout_seconds }}" type="number" min="5" max="120" required></label>
-    <label>DeepSeek API key <input name="api_key" type="password" autocomplete="new-password" {% if not configured %}required{% endif %}></label>
-    <button type="submit">Save local setup</button>
+    <section class="form-section" aria-label="项目边界" data-od-id="setup-project-boundary">
+      <h2>项目边界</h2>
+      <p class="muted">这些目录定义 GuardedPy 可读取和修改的项目范围。</p>
+      <label>项目根目录 <input class="mono" name="project_root" type="text" value="{{ project_root }}" autocomplete="off" required></label>
+      <label>源码目录 <input class="mono" name="source_dirs" value="{{ source_dirs }}" autocomplete="off" required></label>
+      <label>测试目录 <input class="mono" name="test_dirs" value="{{ test_dirs }}" autocomplete="off" required></label>
+    </section>
+    <section class="form-section" aria-label="测试策略" data-od-id="setup-test-strategy">
+      <h2>测试策略</h2>
+      <p class="muted">使用项目既有的 pytest 命令来记录反馈和最终验证。</p>
+      <label>pytest 命令 <input class="mono" name="pytest_command" value="{{ pytest_command }}" autocomplete="off" required></label>
+    </section>
+    <section class="form-section" aria-label="模型运行时" data-od-id="setup-model-runtime">
+      <h2>模型运行时</h2>
+      <p class="muted">模型与超时设置会写入新任务的配置快照。</p>
+      <label>模型 <input name="model" value="{{ model }}" autocomplete="off" required></label>
+      <label>超时秒数 <input name="timeout_seconds" value="{{ timeout_seconds }}" type="number" min="5" max="120" autocomplete="off" required></label>
+    </section>
+    <section class="security-callout" aria-label="凭据安全" data-od-id="setup-credential-security">
+      <h2>凭据安全</h2>
+      <p>{% if configured %}已配置凭据；留空将保持当前密钥不变。{% else %}API Key 仅写入操作系统钥匙串，不会保存到项目配置。{% endif %}</p>
+      <label>DeepSeek API Key <input name="api_key" type="password" autocomplete="new-password" {% if not configured %}required{% endif %}></label>
+    </section>
+    <div class="form-actions"><button class="btn-primary" type="submit">保存本地设置</button></div>
   </form>
 </section>
 {% endblock %}
