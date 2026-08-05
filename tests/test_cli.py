@@ -25,7 +25,13 @@ def _config() -> HarnessConfig:
 class FakeRuntime:
     """A local-only runtime fake that exposes terminal boundary behavior."""
 
-    def __init__(self, *, wait_for_approval: bool = False, interrupt: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        wait_for_approval: bool = False,
+        interrupt: bool = False,
+        consume_reject: bool = False,
+    ) -> None:
         self.configured = False
         self.project_root: Path | None = None
         self.config: HarnessConfig | None = None
@@ -35,6 +41,7 @@ class FakeRuntime:
         self.cancelled: list[UUID] = []
         self._wait_for_approval = wait_for_approval
         self._interrupt = interrupt
+        self._consume_reject = consume_reject
 
     def setup(self, project_root: Path, config: HarnessConfig, api_key: str | None) -> None:
         self.project_root = project_root
@@ -70,6 +77,9 @@ class FakeRuntime:
 
     def resolve_approval(self, task_id: UUID, action_hash: str, decision: str) -> bool:
         self.decisions.append((task_id, action_hash, decision))
+        if self._consume_reject and decision == "reject":
+            self.task(task_id).status = TaskStatus.BLOCKED
+            return False
         return True
 
     def cancel(self, task_id: UUID) -> TaskState:
@@ -126,12 +136,50 @@ def test_repl_uses_hidden_key_input_and_never_echoes_key(monkeypatch: pytest.Mon
         runtime,
         StringIO("/init\n/project\nsrc\ntests\npytest\nmodel\n30\n/exit\n"),
         output,
-        lambda: False,
+        lambda: True,
     )
 
     assert code == 0
     assert "REAL-KEY-MUST-NOT-PRINT" not in output.getvalue()
     assert runtime.configured is True
+
+
+def test_repl_refuses_init_secret_entry_from_non_tty_without_calling_getpass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a piped init falling back to a blocking or visible key read."""
+    from guardedpy.cli import run_repl
+
+    runtime = FakeRuntime()
+    output = StringIO()
+    monkeypatch.setattr(
+        "guardedpy.cli.getpass", lambda _: pytest.fail("non-TTY init must not call getpass")
+    )
+
+    code = run_repl(runtime, StringIO("/init\n/exit\n"), output, lambda: False)
+
+    assert code == 0
+    assert runtime.setups == []
+    assert output.getvalue() == "非交互终端不能录入凭据。\n"
+
+
+def test_repl_refuses_credential_update_secret_entry_from_non_tty_without_getpass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a piped credential update reading a secret through getpass fallback."""
+    from guardedpy.cli import run_repl
+
+    runtime = FakeRuntime()
+    output = StringIO()
+    monkeypatch.setattr(
+        "guardedpy.cli.getpass", lambda _: pytest.fail("non-TTY update must not call getpass")
+    )
+
+    code = run_repl(runtime, StringIO("/credentials\nupdate\n/exit\n"), output, lambda: False)
+
+    assert code == 0
+    assert runtime.configured is False
+    assert output.getvalue().endswith("非交互终端不能录入凭据。\n")
 
 
 def test_one_shot_bugfix_requires_an_explicit_pytest_node() -> None:
@@ -202,7 +250,7 @@ def test_repl_refuses_a_blank_first_key_without_persisting_setup(monkeypatch: py
         runtime,
         StringIO("/init\n/project\nsrc\ntests\npytest\nmodel\n30\n/exit\n"),
         output,
-        lambda: False,
+        lambda: True,
     )
 
     assert runtime.setups == []
@@ -223,7 +271,7 @@ def test_repl_reports_malformed_init_tokens_without_starting_a_task(
         runtime,
         StringIO('/init\n/project\n"\ntests\npytest\nmodel\n30\n/exit\n'),
         output,
-        lambda: False,
+        lambda: True,
     )
 
     assert code == 0
@@ -268,6 +316,21 @@ def test_repl_resolves_only_an_exact_approval_decision_before_continuing() -> No
     assert runtime.decisions == [(runtime.created[0].id, "bound-approval-hash", "once")]
     assert "审批输入无效。" in output.getvalue()
     assert runtime.created[0].status is TaskStatus.COMPLETED
+
+
+def test_repl_renders_a_consumed_reject_approval_as_blocked_not_stale() -> None:
+    """Catches the terminal reporting a valid rejected approval as stale."""
+    from guardedpy.cli import run_repl
+
+    runtime = FakeRuntime(wait_for_approval=True, consume_reject=True)
+    output = StringIO()
+
+    code = run_repl(runtime, StringIO("dangerous task\nreject\n/exit\n"), output, lambda: False)
+
+    assert code == 0
+    assert runtime.created[0].status is TaskStatus.BLOCKED
+    assert "blocked" in output.getvalue()
+    assert "审批请求已失效。" not in output.getvalue()
 
 
 def test_repl_rejects_unknown_slash_commands_without_creating_a_task() -> None:

@@ -174,6 +174,8 @@ def create_api_router(runtime: LocalRuntime) -> APIRouter:
         except RuntimeTaskNotFoundError as error:
             raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND) from error
         if not accepted:
+            if runtime.task(task_id).status is TaskStatus.BLOCKED:
+                return runtime.task(task_id).model_dump(mode="json")
             raise HTTPException(status_code=409, detail=_APPROVAL_STALE)
         Thread(target=runtime.run, args=(task_id,), daemon=True).start()
         return runtime.task(task_id).model_dump(mode="json")

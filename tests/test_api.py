@@ -207,6 +207,25 @@ def test_api_rejects_remote_host_configuration_and_a_stale_approval_hash(
     assert missing.json() == {"detail": "审批请求已失效。"}
 
 
+def test_api_accepts_a_consumed_reject_approval_as_a_blocked_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches treating a valid reject decision as if its action hash were stale."""
+    app, waiting_id = _waiting_app(tmp_path, monkeypatch)
+    waiting = _request(app, "GET", f"/api/v1/tasks/{waiting_id}/events").json()
+    action_hash = next(event["action_hash"] for event in waiting if event["action_hash"])
+
+    response = _request(
+        app,
+        "POST",
+        f"/api/v1/tasks/{waiting_id}/approval",
+        json={"action_hash": action_hash, "decision": "reject"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "blocked"
+
+
 def test_api_returns_the_fixed_validation_error_for_invalid_setup_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

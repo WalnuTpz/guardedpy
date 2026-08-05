@@ -107,7 +107,7 @@ def run_repl(
             stdout.write(_HELP)
             continue
         if line == "/init":
-            _initialize(runtime, stdout, stdin.readline)
+            _initialize(runtime, stdout, stdin.readline, isatty)
             continue
         if line == "/task":
             _interactive_task(runtime, stdout, stdin.readline)
@@ -125,7 +125,7 @@ def run_repl(
             _rules_command(runtime, stdout, stdin.readline)
             continue
         if line == "/credentials":
-            _credentials_command(runtime, stdout, stdin.readline)
+            _credentials_command(runtime, stdout, stdin.readline, isatty)
             continue
         if line == "/clear":
             if isatty():
@@ -147,7 +147,15 @@ def _parser() -> _ArgumentParser:
     return parser
 
 
-def _initialize(runtime: LocalRuntime, stdout: TextIO, read_line: Callable[[], str]) -> None:
+def _initialize(
+    runtime: LocalRuntime,
+    stdout: TextIO,
+    read_line: Callable[[], str],
+    isatty: Callable[[], bool],
+) -> None:
+    if not isatty():
+        stdout.write("非交互终端不能录入凭据。\n")
+        return
     project_root = Path(_prompt(stdout, read_line, "项目目录: ")).expanduser()
     source_dirs_text = _prompt(stdout, read_line, "源码目录（空格分隔）: ")
     test_dirs_text = _prompt(stdout, read_line, "测试目录（空格分隔）: ")
@@ -226,6 +234,10 @@ def _run_task(
             return 1
         try:
             if not runtime.resolve_approval(result.id, action_hash, decision):
+                resolved = runtime.task(result.id)
+                if resolved.status is TaskStatus.BLOCKED:
+                    _render_task(runtime, resolved, stdout)
+                    return 0
                 stdout.write("审批请求已失效。\n")
                 return 1
             result = runtime.run(result.id)
@@ -335,12 +347,20 @@ def _rules_command(runtime: LocalRuntime, stdout: TextIO, read_line: Callable[[]
     stdout.write("规则操作已完成。\n")
 
 
-def _credentials_command(runtime: LocalRuntime, stdout: TextIO, read_line: Callable[[], str]) -> None:
+def _credentials_command(
+    runtime: LocalRuntime,
+    stdout: TextIO,
+    read_line: Callable[[], str],
+    isatty: Callable[[], bool],
+) -> None:
     operation = _prompt(stdout, read_line, "凭据操作（status/update/clear）: ")
     if operation == "status":
         stdout.write(f"凭据：{'已配置' if _credential_configured(runtime) else '未配置'}\n")
         return
     if operation == "update":
+        if not isatty():
+            stdout.write("非交互终端不能录入凭据。\n")
+            return
         key = getpass("DeepSeek API Key: ")
         if not key:
             stdout.write("凭据不能为空。\n")
