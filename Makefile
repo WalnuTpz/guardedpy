@@ -15,6 +15,6 @@ build:
 	$(PYTHON) -m build --no-isolation
 
 cli-check:
-	PYTHONPATH=src $(PYTHON) -c 'from guardedpy.cli import main; raise SystemExit(main(["--help"]))'
-	PYTHONPATH=src $(PYTHON) -c 'from guardedpy.cli import main; raise SystemExit(main(["--help"]))'
-	PYTHONPATH=src $(PYTHON) -c 'from guardedpy.cli import server_main; raise SystemExit(server_main(["--help"]))'
+	guardedpy --help
+	guardedpy-cli --help
+	guardedpy-server --help
