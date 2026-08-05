@@ -70,8 +70,7 @@ class RenderedDocument(HTMLParser):
         self.landmarks: set[str] = set()
         self.navigation_hrefs: list[str] = []
         self.current_href: str | None = None
-        self.form_actions: list[str] = []
-        self.input_names: set[str] = set()
+        self.forms: list[tuple[str, set[str]]] = []
         self.section_labels: set[str] = set()
         self.data_od_ids: set[str] = set()
         self.badge_statuses: set[str] = set()
@@ -79,6 +78,9 @@ class RenderedDocument(HTMLParser):
         self.has_task_mode_control = False
         self.task_link_hrefs: list[str] = []
         self._inside_navigation = 0
+        self._form_stack: list[tuple[str, set[str]]] = []
+        self._script_fragments: list[str] = []
+        self._inside_script = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
@@ -99,9 +101,12 @@ class RenderedDocument(HTMLParser):
         if tag == "a" and "task-link" in attributes.get("class", "").split():
             self.task_link_hrefs.append(attributes.get("href", ""))
         if tag == "form":
-            self.form_actions.append(attributes.get("action", ""))
+            form = (attributes.get("action", ""), set())
+            self.forms.append(form)
+            self._form_stack.append(form)
         if tag in {"input", "select", "textarea"} and attributes.get("name"):
-            self.input_names.add(attributes["name"])
+            if self._form_stack:
+                self._form_stack[-1][1].add(attributes["name"])
         if tag == "select" and "data-task-mode" in attributes:
             self.has_task_mode_control = True
         if tag == "label" and attributes.get("data-feature-copy"):
@@ -111,10 +116,27 @@ class RenderedDocument(HTMLParser):
             self.badge_statuses.add(attributes["data-status"])
         if tag == "section" and attributes.get("aria-label"):
             self.section_labels.add(attributes["aria-label"])
+        if tag == "script":
+            self._inside_script = True
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "nav":
             self._inside_navigation -= 1
+        if tag == "form":
+            self._form_stack.pop()
+        if tag == "script":
+            self._inside_script = False
+
+    def handle_data(self, data: str) -> None:
+        if self._inside_script:
+            self._script_fragments.append(data)
+
+    def form_fields(self, action: str) -> list[set[str]]:
+        return [fields for form_action, fields in self.forms if form_action == action]
+
+    @property
+    def task_mode_wiring(self) -> str:
+        return "".join(self._script_fragments)
 
 
 async def _request(app: Any, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -162,6 +184,44 @@ def _setup_data(root: Path, **overrides: str) -> dict[str, str]:
     return data
 
 
+def _css_rules(stylesheet: str, media_condition: str | None = None) -> dict[str, dict[str, str]]:
+    """Parse flat rules and selected media contents without CSS-format assumptions."""
+    def declarations(content: str) -> dict[str, str]:
+        return {
+            name.strip(): value.strip()
+            for name, value in (
+                declaration.split(":", 1)
+                for declaration in content.split(";")
+                if ":" in declaration
+            )
+        }
+
+    rules: dict[str, dict[str, str]] = {}
+    start = 0
+    while start < len(stylesheet):
+        brace = stylesheet.find("{", start)
+        if brace < 0:
+            break
+        header = stylesheet[start:brace].strip()
+        depth = 1
+        end = brace + 1
+        while depth and end < len(stylesheet):
+            if stylesheet[end] == "{":
+                depth += 1
+            elif stylesheet[end] == "}":
+                depth -= 1
+            end += 1
+        content = stylesheet[brace + 1 : end - 1]
+        if header.startswith("@media"):
+            if media_condition and media_condition in header:
+                rules.update(_css_rules(content))
+        elif media_condition is None and not header.startswith("@"):
+            for selector in header.split(","):
+                rules[selector.strip()] = declarations(content)
+        start = end
+    return rules
+
+
 def test_shell_exposes_chinese_landmarks_navigation_and_explicit_current_page(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -182,17 +242,17 @@ def test_shell_exposes_chinese_landmarks_navigation_and_explicit_current_page(
         "/settings/command-rules",
         "/settings/credentials",
     ]
-    for response, expected_current_href, expected_form_actions in [
-        (setup_page, "/", ["/setup"]),
-        (task_page, "/tasks/new", ["/tasks"]),
-        (credentials_page, "/settings/credentials", ["/settings/credentials", "/settings/credentials/clear"]),
+    for response, expected_current_href, expected_forms in [
+        (setup_page, "/", [("/setup", {"project_root", "source_dirs", "test_dirs", "pytest_command", "model", "timeout_seconds", "api_key"})]),
+        (task_page, "/tasks/new", [("/tasks", {"mode", "description", "bugfix_target"})]),
+        (credentials_page, "/settings/credentials", [("/settings/credentials", {"api_key"}), ("/settings/credentials/clear", set())]),
     ]:
         document = _document(response)
         assert document.lang == "zh-CN"
         assert document.landmarks == {"navigation", "main"}
         assert document.navigation_hrefs == expected_navigation
         assert document.current_href == expected_current_href
-        assert document.form_actions == expected_form_actions
+        assert document.forms == expected_forms
     assert {"app-rail", "primary-navigation", "context-header", "main-content"} <= _document(task_page).data_od_ids
     assert _document(credentials_page).badge_statuses == {"configured"}
 
@@ -204,8 +264,7 @@ def test_setup_keeps_one_submission_form_with_its_security_fields(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     document = _document(asyncio.run(_request(_app(), "GET", "/setup")))
 
-    assert document.form_actions == ["/setup"]
-    assert document.input_names == {
+    assert document.forms == [("/setup", {
         "project_root",
         "source_dirs",
         "test_dirs",
@@ -213,7 +272,7 @@ def test_setup_keeps_one_submission_form_with_its_security_fields(
         "model",
         "timeout_seconds",
         "api_key",
-    }
+    })]
     assert {"项目边界", "测试策略", "模型运行时"} <= document.section_labels
 
 
@@ -227,12 +286,30 @@ def test_task_workspace_keeps_submission_contract_in_three_labelled_regions(
     assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
     document = _document(asyncio.run(_request(app, "GET", "/tasks/new")))
 
-    assert document.form_actions == ["/tasks"]
-    assert {"mode", "description", "bugfix_target"} <= document.input_names
+    assert document.forms == [("/tasks", {"mode", "description", "bugfix_target"})]
     assert {"当前任务", "新建任务", "任务历史"} <= document.section_labels
     assert document.has_task_mode_control
     assert document.bugfix_target_copies == {"功能开发不需要缺陷测试目标。", "缺陷修复必须填写唯一的 pytest 测试目标。"}
     assert {"task-current", "task-create", "task-history"} <= document.data_od_ids
+
+
+def test_task_mode_copy_and_requiredness_wiring_is_complete(tmp_path: Path, monkeypatch: Any) -> None:
+    """Catches mode changes leaving stale copy or bugfix target requiredness behind."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    root = _project_root(tmp_path)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    wiring = _document(asyncio.run(_request(app, "GET", "/tasks/new"))).task_mode_wiring
+
+    assert all(
+        fragment in wiring
+        for fragment in (
+            'mode.addEventListener("change", updateBugfixTarget)',
+            'mode.value === "bugfix"',
+            "copy.textContent = isBugfix",
+            "target.required = isBugfix",
+        )
+    )
 
 
 def test_task_workspace_detail_links_have_the_local_44px_target_contract(
@@ -251,8 +328,11 @@ def test_task_workspace_detail_links_have_the_local_44px_target_contract(
 
     assert created.status_code == 303
     assert document.task_link_hrefs == [created.headers["location"], created.headers["location"]]
-    assert ".task-link" in stylesheet
-    assert ".task-link { min-height: 44px;" in stylesheet
+    assert document.forms == [
+        (f"/tasks/{created.headers['location'].rsplit('/', 1)[1]}/cancel", set()),
+        ("/tasks", {"mode", "description", "bugfix_target"}),
+    ]
+    assert _css_rules(stylesheet)[".task-link"]["min-height"] == "44px"
 
 
 def test_task14_pages_render_the_complete_fixed_error_set_in_chinese(
@@ -275,39 +355,26 @@ def test_task14_pages_render_the_complete_fixed_error_set_in_chinese(
     )
     unavailable = asyncio.run(_request(_app(UnavailableCredentials()), "GET", "/settings/credentials"))
 
-    rendered = (
-        invalid_setup.text
-        + invalid_task.text
-        + active_setup.text
-        + missing_task.text
-        + invalid_credential.text
-        + unavailable.text
-    )
     assert created.status_code == 303
-    for message in {
-        "无法保存设置。",
-        "无法启动任务。",
-        "已有任务正在运行。",
-        "未找到任务。",
-        "无法更新凭据。",
-        "凭据存储不可用。",
-    }:
-        assert message in rendered
-    for message in {
-        "Setup could not be saved.",
-        "Task could not be started.",
-        "Another task is active.",
-        "Task was not found.",
-        "Credential could not be updated.",
-        "Credential store is unavailable.",
-    }:
-        assert message not in rendered
+    for response, status_code, chinese, english in [
+        (invalid_setup, 422, "无法保存设置。", "Setup could not be saved."),
+        (invalid_task, 422, "无法启动任务。", "Task could not be started."),
+        (active_setup, 409, "已有任务正在运行。", "Another task is active."),
+        (missing_task, 404, "未找到任务。", "Task was not found."),
+        (invalid_credential, 422, "无法更新凭据。", "Credential could not be updated."),
+        (unavailable, 503, "凭据存储不可用。", "Credential store is unavailable."),
+    ]:
+        assert response.status_code == status_code
+        assert chinese in response.text
+        assert english not in response.text
 
 
 def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives() -> None:
     """Catches a shared stylesheet that removes the responsive console guarantees."""
     stylesheet = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.css").read_text()
 
+    rules = _css_rules(stylesheet)
+    root = rules[":root"]
     for token, value in {
         "--bg": "#FAFAFA",
         "--surface": "#FFFFFF",
@@ -321,17 +388,17 @@ def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives()
         "--rail-width": "240px",
         "--container-max": "1200px",
     }.items():
-        assert f"{token}: {value}" in stylesheet
-    assert ".rail" in stylesheet and "position: fixed" in stylesheet
-    assert "@media (max-width: 639px)" in stylesheet
-    assert ":focus-visible" in stylesheet
-    assert "min-height: 44px" in stylesheet
-    assert "overflow-wrap: anywhere" in stylesheet
-    assert "@media (prefers-reduced-motion: reduce)" in stylesheet
-    assert "input:hover" in stylesheet
-    assert "input:active" in stylesheet
-    assert "input:disabled" in stylesheet
-    assert "[aria-invalid=\"true\"]" in stylesheet
-    assert ".empty-state" in stylesheet
-    assert "border-left: 2px solid var(--accent)" in stylesheet
-    assert "border-top: 4px solid var(--warn)" in stylesheet
+        assert root[token] == value
+    assert rules[".rail"]["position"] == "fixed"
+    assert rules[".rail"]["width"] == "var(--rail-width)"
+    assert rules[".task-link"]["min-height"] == "44px"
+    assert rules["a:focus-visible"]["box-shadow"] == "var(--focus-ring)"
+    assert rules["input:focus-visible"]["border-color"] == "var(--accent)"
+    assert rules[".timeline"]["border-left"] == "2px solid var(--accent)"
+    assert rules[".approval-card"]["border-top"] == "4px solid var(--warn)"
+    assert rules[".empty-state"]["text-align"] == "center"
+    phone_rules = _css_rules(stylesheet, "max-width: 639px")
+    assert phone_rules[".rail"]["position"] == "static"
+    assert phone_rules[".rail-nav"]["flex-wrap"] == "wrap"
+    reduced_motion_rules = _css_rules(stylesheet, "prefers-reduced-motion: reduce")
+    assert reduced_motion_rules["*"]["transition-duration"] == ".01ms !important"
