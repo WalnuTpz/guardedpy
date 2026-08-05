@@ -15,11 +15,20 @@ class HarnessConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    source_dirs: tuple[Path, ...]
-    test_dirs: tuple[Path, ...]
-    pytest_command: tuple[str, ...]
+    source_dirs: tuple[Path, ...] = Field(min_length=1)
+    test_dirs: tuple[Path, ...] = Field(min_length=1)
+    pytest_command: tuple[str, ...] = Field(min_length=1)
     model: str = "deepseek-chat"
     timeout_seconds: int = Field(default=30, ge=5, le=120)
+
+    @field_validator("source_dirs", "test_dirs", mode="before")
+    @classmethod
+    def path_tokens_are_not_blank(cls, paths: object) -> object:
+        if isinstance(paths, (list, tuple)) and any(
+            isinstance(path, str) and not path.strip() for path in paths
+        ):
+            raise ValueError("configured path tokens must be non-empty")
+        return paths
 
     @field_validator("source_dirs", "test_dirs")
     @classmethod
@@ -28,6 +37,22 @@ class HarnessConfig(BaseModel):
             if path.is_absolute() or ".." in path.parts:
                 raise ValueError("configured paths must stay inside the project root")
         return paths
+
+    @field_validator("pytest_command")
+    @classmethod
+    def normalize_pytest_command(cls, tokens: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(token.strip() for token in tokens)
+        if any(not token for token in normalized):
+            raise ValueError("pytest command tokens must be non-empty")
+        return normalized
+
+    @field_validator("model")
+    @classmethod
+    def normalize_model(cls, model: str) -> str:
+        normalized = model.strip()
+        if not normalized:
+            raise ValueError("model must be non-empty")
+        return normalized
 
 
 def load_config(path: Path, project_root: Path) -> HarnessConfig:
@@ -38,6 +63,20 @@ def load_config(path: Path, project_root: Path) -> HarnessConfig:
 
 def app_state_dir(project_root: Path) -> Path:
     """Return the per-project state location outside the selected project."""
-    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     root_hash = sha256(str(project_root.resolve()).encode()).hexdigest()
-    return state_home / "guardedpy" / root_hash
+    return _application_state_root() / root_hash
+
+
+def project_config_path(project_root: Path) -> Path:
+    """Return the external configuration snapshot for one selected project."""
+    return app_state_dir(project_root) / "harness.yaml"
+
+
+def local_state_path() -> Path:
+    """Return the external selected-project and task-root index path."""
+    return _application_state_root() / "local-state.yaml"
+
+
+def _application_state_root() -> Path:
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_home / "guardedpy"

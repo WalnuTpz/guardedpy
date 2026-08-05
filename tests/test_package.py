@@ -56,11 +56,12 @@ def test_delivery_automation_runs_the_same_offline_test_demo_and_build_contract(
 
 
 def test_render_blueprint_starts_the_isolated_demo_not_local_controls() -> None:
-    """Catches a public deployment composing keyring-backed local controls."""
+    """Catches a public deployment missing demo runtime or composing local controls."""
     render = yaml.safe_load(_text("render.yaml"))
     service = render["services"][0]
 
     assert service["name"] == "guardedpy-demo"
+    assert service["buildCommand"] == 'pip install ".[dev]"'
     assert "guardedpy.demo:create_demo_app" in service["startCommand"]
     assert "guardedpy.web:serve" not in service["startCommand"]
     assert "guardedpy serve" not in service["startCommand"]
@@ -76,6 +77,8 @@ def test_readme_documents_real_local_demo_security_delivery_and_course_context()
         "## Keyring lifecycle",
         "## Safety boundaries",
         "## Tests and build",
+        "## Directory structure",
+        "## Repository and PR evidence",
         "## Render demo wake-up",
         "## CI evidence",
         "## Open Design attribution",
@@ -89,6 +92,13 @@ def test_readme_documents_real_local_demo_security_delivery_and_course_context()
     assert "GitLab workflow has not yet been executed" in readme
     assert "Open Design" in readme
     assert "Agentic" in readme
+    assert "git@github.com:WalnuTpz/guardedpy.git" in readme
+    assert "https://github.com/WalnuTpz/guardedpy/pull/1" in readme
+    assert "https://github.com/WalnuTpz/guardedpy/pull/12" in readme
+    assert "https://github.com/WalnuTpz/guardedpy/pull/13" in readme
+    assert "present-time reconstruction records" in readme
+    assert "src/guardedpy/" in readme
+    assert "tests/" in readme
 
 
 @pytest.mark.parametrize("mode", ["serve", "demo"])

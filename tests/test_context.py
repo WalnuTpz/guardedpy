@@ -14,6 +14,7 @@ def _task() -> TaskState:
     return TaskState(
         description="Repair the parser",
         mode=TaskMode.BUGFIX,
+        bugfix_target="tests/test_parser.py::test_bad_input",
         config=HarnessConfig(
             source_dirs=(Path("src"),),
             test_dirs=(Path("tests"),),
@@ -86,5 +87,6 @@ def test_context_marks_pytest_excerpt_untrusted_and_exposes_action_kinds() -> No
         "run_pytest",
         "run_command",
         "request_approval",
+        "propose_memory",
         "finish",
     }

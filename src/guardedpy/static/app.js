@@ -10,7 +10,24 @@
 
   const renderEvent = (event) => {
     const item = document.createElement("li");
-    const parts = [event.task_status, event.action_summary, event.policy_verdict, event.feedback_excerpt, event.stop_reason]
+    const approval = event.approval_granted === true
+      ? "approval: granted"
+      : event.approval_granted === false
+        ? "approval: rejected"
+        : null;
+    const parts = [
+      event.task_status,
+      event.action_summary,
+      event.action_projection,
+      event.affected_project ? `Project: ${event.affected_project}` : null,
+      event.policy_verdict,
+      event.policy_rule_id ? `rule: ${event.policy_rule_id}` : null,
+      event.policy_reason,
+      approval,
+      event.feedback_excerpt,
+      event.feedback_node_id,
+      event.stop_reason,
+    ]
       .filter(Boolean);
     item.textContent = parts.join(" · ");
     return item;
@@ -24,6 +41,10 @@
     const events = await response.json();
     const latest = events.at(-1);
     if (!latest) {
+      return;
+    }
+    if (timeline.dataset.currentStatus !== latest.task_status) {
+      window.location.reload();
       return;
     }
     if (status) {

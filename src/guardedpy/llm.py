@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Protocol
 
+from openai import APIConnectionError, APITimeoutError
+
 from guardedpy.context import LlmContext
 
 
@@ -57,7 +59,7 @@ class DeepSeekClient:
                     response_format={"type": "json_object"},
                 )
                 return response.choices[0].message.content
-            except (ConnectionError, TimeoutError):
+            except (ConnectionError, TimeoutError, APIConnectionError, APITimeoutError):
                 if attempt == 1:
                     raise TemporaryProviderFailure from None
         raise AssertionError("unreachable")

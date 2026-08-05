@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -6,6 +8,7 @@ from guardedpy.actions import (
     DeletePathAction,
     FinishAction,
     ListFilesAction,
+    ProposeMemoryAction,
     ReadFileAction,
     RequestApprovalAction,
     RunCommandAction,
@@ -26,11 +29,12 @@ from guardedpy.domain import TddPhase
         ('{"kind":"run_pytest","summary":"test","targets":["tests/test_a.py"]}', RunPytestAction),
         ('{"kind":"run_command","summary":"format","args":["ruff","check"]}', RunCommandAction),
         ('{"kind":"request_approval","summary":"ask","reason":"delete generated file"}', RequestApprovalAction),
+        ('{"kind":"propose_memory","summary":"remember","text":"Use parser fixtures"}', ProposeMemoryAction),
         ('{"kind":"finish","summary":"stop","status":"blocked"}', FinishAction),
     ],
 )
 def test_parse_action_returns_the_matching_known_action(payload: str, action_type: type) -> None:
-    """Catches a parser branch that cannot construct one of the eight supported actions."""
+    """Catches a parser branch that cannot construct one of the nine supported actions."""
     assert isinstance(parse_action(payload), action_type)
 
 
@@ -38,6 +42,16 @@ def test_parse_action_rejects_unknown_kind() -> None:
     """Catches an unsafe parser fallback that accepts an unrecognized action kind."""
     with pytest.raises(ValidationError):
         parse_action('{"kind":"shell","summary":"run"}')
+
+
+def test_parse_memory_proposal_requires_bounded_text() -> None:
+    """Catches unbounded model text entering the in-process proposal queue."""
+    payload = json.dumps(
+        {"kind": "propose_memory", "summary": "remember", "text": "x" * 501}
+    )
+
+    with pytest.raises(ValidationError):
+        parse_action(payload)
 
 
 def test_stable_hash_ignores_json_object_key_order() -> None:

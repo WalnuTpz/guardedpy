@@ -10,10 +10,21 @@
       <select name="mode"><option value="feature">Feature</option><option value="bugfix">Bugfix</option></select>
     </label>
     <label>Task description <textarea name="description" required></textarea></label>
+    <label>Bugfix target <input name="bugfix_target" placeholder="tests/test_file.py::test_name"></label>
     <button type="submit">Submit governed task</button>
   </form>
   {% if task and task.status in ['pending', 'running', 'waiting_approval'] %}
   <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="secondary" type="submit">Cancel current task</button></form>
   {% endif %}
 </section>
+{% if tasks %}
+<section class="card">
+  <h2>Known tasks</h2>
+  <ul>
+    {% for known_task in tasks %}
+    <li><a href="/tasks/{{ known_task.id }}">{{ known_task.description }}</a> <span class="badge">{{ known_task.status }}</span></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
 {% endblock %}

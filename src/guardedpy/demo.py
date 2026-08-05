@@ -91,6 +91,7 @@ def run_scenario(name: str) -> ScenarioResult:
         task = TaskState(
             description=_description_for(name),
             mode=TaskMode.BUGFIX,
+            bugfix_target="tests/test_value.py::test_value_is_fixed",
             config=HarnessConfig(
                 source_dirs=(Path("src"),),
                 test_dirs=(Path("tests"),),
@@ -152,7 +153,7 @@ def _responses_for(name: str) -> list[str]:
     ]
     corrective = [
         _action(kind="read_file", summary="inspect value", path="src/value.py"),
-        _action(kind="run_pytest", summary="observe failure", targets=["tests/test_value.py"]),
+        _action(kind="run_pytest", summary="observe failure", targets=[]),
         _action(
             kind="apply_patch",
             summary="repair value",
