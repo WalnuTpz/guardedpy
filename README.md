@@ -88,6 +88,7 @@ The configured GitHub origin, verified locally with `git remote get-url origin`,
 | Task 10 | [#10](https://github.com/WalnuTpz/guardedpy/pull/10) |
 | Task 11 | [#11](https://github.com/WalnuTpz/guardedpy/pull/11) |
 | Task 12 | [#12](https://github.com/WalnuTpz/guardedpy/pull/12) |
+| Final remediation | [#13](https://github.com/WalnuTpz/guardedpy/pull/13) |
 
 Each listed PR was created as a draft, validated by its GitHub Actions run, marked ready, and merged with a merge commit. These are present-time reconstruction records; they do not imply that the missing remote PRs existed during the original implementation, especially for the post-rollback Tasks 9–12.
 
