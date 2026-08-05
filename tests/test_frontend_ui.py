@@ -597,8 +597,11 @@ def test_all_local_webui_http_exception_routes_return_chinese_details(
         ("POST", "/memories/not-a-uuid/delete"),
     ],
 )
-def test_invalid_uuid_routes_return_a_chinese_validation_error(method: str, path: str) -> None:
+def test_invalid_uuid_routes_return_a_chinese_validation_error(
+    method: str, path: str, tmp_path: Path, monkeypatch: Any
+) -> None:
     """Catches FastAPI's default English UUID parser message leaking through local routes."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     response = asyncio.run(_request(_app(), method, path))
 
     assert response.status_code == 422
