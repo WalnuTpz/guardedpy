@@ -13,7 +13,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialBackendUnavailableError
 from guardedpy.domain import ApprovalDecision, TaskMode, TaskStatus
-from guardedpy.events import StoredRunEvent
 from guardedpy.runtime import (
     LocalRuntime,
     RuntimeBusyError,
@@ -60,6 +59,7 @@ class ApprovalResolution(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    action_hash: str | None = None
     decision: Literal["reject", "once", "always"]
 
 
@@ -163,16 +163,12 @@ def create_api_router(runtime: LocalRuntime) -> APIRouter:
     async def resolve_approval(task_id: UUID, body: ApprovalResolution) -> dict[str, object]:
         try:
             task = runtime.task(task_id)
-            events = runtime.events(task_id)
         except RuntimeTaskNotFoundError as error:
             raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND) from error
-        action_hash = _waiting_action_hash(events)
-        if task.status is not TaskStatus.WAITING_APPROVAL or action_hash is None:
+        if task.status is not TaskStatus.WAITING_APPROVAL or not body.action_hash:
             raise HTTPException(status_code=409, detail=_APPROVAL_STALE)
         try:
-            accepted = runtime.resolve_approval(
-                task_id, action_hash, body.decision  # type: ignore[arg-type]
-            )
+            accepted = runtime.resolve_approval(task_id, body.action_hash, body.decision)
         except RuntimeBusyError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except RuntimeTaskNotFoundError as error:
@@ -266,13 +262,6 @@ def create_api_router(runtime: LocalRuntime) -> APIRouter:
             raise HTTPException(status_code=503, detail=_CREDENTIAL_UNAVAILABLE) from error
 
     return router
-
-
-def _waiting_action_hash(events: list[StoredRunEvent]) -> str | None:
-    for event in reversed(events):
-        if event.task_status is TaskStatus.WAITING_APPROVAL and event.action_hash is not None:
-            return event.action_hash
-    return None
 
 
 def _memory_payload(entry: object) -> dict[str, object]:

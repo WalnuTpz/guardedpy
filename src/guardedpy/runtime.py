@@ -265,6 +265,25 @@ class LocalRuntime:
             stored_tasks.extend(EventStore(root).tasks())
         return [self._tasks.get(task.id, task) for task in stored_tasks]
 
+    def recover_interrupted_tasks(self) -> tuple[UUID, ...]:
+        """Persist restart interruptions and refresh every visible recovered task."""
+        global_lease = self._acquire_global_state_lease()
+        try:
+            interrupted: list[UUID] = []
+            for root in dict.fromkeys(self._task_roots.values()):
+                store = EventStore(root)
+                recovered_ids = store.mark_unfinished_interrupted()
+                if not recovered_ids:
+                    continue
+                stored_tasks = {task.id: task for task in store.tasks()}
+                for task_id in recovered_ids:
+                    self._tasks[task_id] = stored_tasks[task_id]
+                    self._orchestrators.pop(task_id, None)
+                interrupted.extend(recovered_ids)
+            return tuple(interrupted)
+        finally:
+            global_lease.release()
+
     def events(self, task_id: UUID) -> list[StoredRunEvent]:
         """Return only EventStore's fixed safe event projection."""
         return EventStore(self._task_root(task_id)).events_for(task_id)

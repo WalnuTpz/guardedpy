@@ -77,7 +77,9 @@ def _setup_data(root: Path) -> dict[str, str]:
     }
 
 
-def _waiting_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, UUID]:
+def _waiting_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, responses: list[str] | None = None
+) -> tuple[Any, UUID]:
     """Build a real runtime task paused on a non-permanent approval decision."""
     import guardedpy.web as web
 
@@ -88,7 +90,10 @@ def _waiting_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, 
     def factory(project_root: Path, config: Any, memory: Any) -> TaskOrchestrator:
         return TaskOrchestrator(
             project_root,
-            ScriptedLLM(['{"kind":"delete_path","summary":"PRIVATE-PATCH","path":"obsolete.txt"}']),
+            ScriptedLLM(
+                responses
+                or ['{"kind":"delete_path","summary":"PRIVATE-PATCH","path":"obsolete.txt"}']
+            ),
             memory_store=memory,
         )
 
@@ -146,17 +151,30 @@ def test_api_feedback_and_approval_expose_only_safe_event_fields(
     response = _request(app, "GET", f"/api/v1/tasks/{waiting_id}/events")
 
     assert response.status_code == 200
-    event = response.json()[-1]
-    assert event["action_projection"] == "删除项目内文件"
-    assert "PRIVATE-PATCH" not in json.dumps(event, ensure_ascii=False)
-    assert "api_key" not in event
+    payload = response.json()
+
+    assert payload[-1]["action_projection"] == "删除项目内文件"
+    assert "PRIVATE-PATCH" not in json.dumps(payload, ensure_ascii=False)
+    assert "api_key" not in json.dumps(payload, ensure_ascii=False)
 
 
-def test_api_rejects_remote_host_configuration_and_stale_approval(
+def test_api_rejects_remote_host_configuration_and_a_stale_approval_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catches remote-listen input or a non-permanent approval being accepted."""
-    app, waiting_id = _waiting_app(tmp_path, monkeypatch)
+    """Catches a stale client decision approving a later pending action."""
+    first = '{"kind":"request_approval","summary":"first","reason":"first approval"}'
+    second = '{"kind":"delete_path","summary":"second","path":"obsolete.txt"}'
+    app, waiting_id = _waiting_app(tmp_path, monkeypatch, [first, second])
+    first_event = next(
+        event
+        for event in _request(app, "GET", f"/api/v1/tasks/{waiting_id}/events").json()
+        if event["action_summary"] == "request action approval"
+    )
+    first_hash = first_event["action_hash"]
+    assert first_hash is not None
+    assert app.state.runtime.resolve_approval(waiting_id, first_hash, "once") is True
+    app.state.runtime.run(waiting_id)
+    current = _request(app, "GET", f"/api/v1/tasks/{waiting_id}")
 
     remote = _request(
         app,
@@ -173,13 +191,20 @@ def test_api_rejects_remote_host_configuration_and_stale_approval(
         },
     )
     response = _request(
-        app, "POST", f"/api/v1/tasks/{waiting_id}/approval", json={"decision": "always"}
+        app,
+        "POST",
+        f"/api/v1/tasks/{waiting_id}/approval",
+        json={"action_hash": first_hash, "decision": "once"},
     )
+    missing = _request(app, "POST", f"/api/v1/tasks/{waiting_id}/approval", json={"decision": "once"})
 
     assert remote.status_code == 422
     assert remote.json() == {"detail": "请求参数无效。"}
+    assert current.json()["status"] == "waiting_approval"
     assert response.status_code == 409
     assert response.json() == {"detail": "审批请求已失效。"}
+    assert missing.status_code == 409
+    assert missing.json() == {"detail": "审批请求已失效。"}
 
 
 def test_api_returns_the_fixed_validation_error_for_invalid_setup_values(
@@ -246,6 +271,7 @@ def test_api_uses_the_runtime_for_nonsecret_management_controls(
     cleared = _request(app, "DELETE", "/api/v1/credentials")
     missing_task = _request(app, "GET", f"/api/v1/tasks/{uuid4()}")
     missing_api_route = _request(app, "GET", "/api/v1/not-a-route")
+    missing_api_root = _request(app, "GET", "/api/v1")
 
     assert initial_credentials.json() == {"configured": False}
     assert stored.status_code == 204
@@ -265,3 +291,5 @@ def test_api_uses_the_runtime_for_nonsecret_management_controls(
     assert missing_task.json() == {"detail": "未找到任务。"}
     assert missing_api_route.status_code == 404
     assert missing_api_route.json() == {"detail": "未找到资源。"}
+    assert missing_api_root.status_code == 404
+    assert missing_api_root.json() == {"detail": "未找到资源。"}

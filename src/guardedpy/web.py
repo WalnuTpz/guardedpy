@@ -28,7 +28,7 @@ from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialBackendUnavailableError, CredentialService, CredentialStatus, KeyringBackend
 from guardedpy.demo import create_demo_app
 from guardedpy.domain import ApprovalDecision, CommandApprovalRule, CommandRuleKind, PolicyVerdict, TaskMode, TaskStatus, is_approval_decision
-from guardedpy.events import EventStore, StoredRunEvent
+from guardedpy.events import StoredRunEvent
 from guardedpy.llm import DeepSeekClient
 from guardedpy.memory import MemoryEntry, MemoryStore
 from guardedpy.orchestrator import TaskOrchestrator
@@ -71,7 +71,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
 
     app = FastAPI()
     runtime = LocalRuntime(services)
-    _mark_restored_tasks_interrupted(runtime)
+    runtime.recover_interrupted_tasks()
     app.state.runtime = runtime
     app.state.local = _RuntimeStateView(runtime)
 
@@ -84,7 +84,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         if (
             type(error) is StarletteHTTPException
             and error.status_code == 404
-            and request.url.path.startswith("/api/v1/")
+            and (request.url.path == "/api/v1" or request.url.path.startswith("/api/v1/"))
         ):
             return JSONResponse(status_code=404, content={"detail": "未找到资源。"})
         return await http_exception_handler(request, error)
@@ -385,12 +385,6 @@ def _display_paths(paths: tuple[Path, ...]) -> str:
 
 def _has_active_task(runtime: LocalRuntime) -> bool:
     return any(task.status in _ACTIVE_STATUSES for task in runtime.tasks())
-
-
-def _mark_restored_tasks_interrupted(runtime: LocalRuntime) -> None:
-    """Retain the old WebUI restart contract without creating another task store."""
-    for project_root in dict.fromkeys(runtime._task_roots.values()):
-        EventStore(project_root).mark_unfinished_interrupted()
 
 
 def _system_keyring() -> KeyringBackend:

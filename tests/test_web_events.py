@@ -1079,17 +1079,29 @@ def test_fresh_app_marks_indexed_unfinished_task_interrupted_without_resuming_it
     assert created.headers["location"] != "/tasks/new"
     task_id = UUID(created.headers["location"].rsplit("/", 1)[-1])
     assert len(factory_calls) == 1
+    app.state.runtime._release_lease()
 
     fresh_app = web.create_app("local", web.WebServices(credentials, factory))
     detail = asyncio.run(_request(fresh_app, "GET", f"/tasks/{task_id}"))
     feed = asyncio.run(_request(fresh_app, "GET", f"/tasks/{task_id}/events"))
+    api_task = asyncio.run(_request(fresh_app, "GET", f"/api/v1/tasks/{task_id}"))
+    next_task = asyncio.run(
+        _request(
+            fresh_app,
+            "POST",
+            "/tasks",
+            data={"mode": "feature", "description": "Not blocked after recovery"},
+        )
+    )
 
-    assert len(factory_calls) == 1
+    assert len(factory_calls) == 2
     assert detail.status_code == 200
     assert "interrupted" in detail.text
     assert feed.status_code == 200
     assert feed.json()[-1]["task_status"] == "interrupted"
     assert feed.json()[-1]["stop_reason"] == "service_restarted"
+    assert api_task.json()["status"] == "interrupted"
+    assert next_task.status_code == 303
 
 
 def test_memory_controls_keep_proposals_pending_until_approval_and_404_unknown_ids(

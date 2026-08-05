@@ -114,6 +114,23 @@ def test_terminal_run_releases_task_lease_for_another_runtime(tmp_path: Path) ->
     assert second.create_task("next task", TaskMode.FEATURE, None).status is TaskStatus.PENDING
 
 
+def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate(
+    tmp_path: Path,
+) -> None:
+    """Catches restart recovery leaving persisted work active in the runtime cache."""
+    first = _runtime(tmp_path)
+    first.setup(tmp_path, _config(), api_key=None)
+    task = first.create_task("interrupted", TaskMode.FEATURE, None)
+    first._release_lease()
+
+    recovered = _runtime(tmp_path)
+    interrupted = recovered.recover_interrupted_tasks()
+
+    assert interrupted == (task.id,)
+    assert recovered.task(task.id).status is TaskStatus.INTERRUPTED
+    assert recovered.create_task("next", TaskMode.FEATURE, None).status is TaskStatus.PENDING
+
+
 def test_runtime_rejects_a_blank_task_description(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     runtime.setup(tmp_path, _config(), api_key=None)
