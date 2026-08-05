@@ -11,6 +11,8 @@ from uuid import uuid4
 
 import httpx
 
+from guardedpy.actions import RunCommandAction
+from guardedpy.command_rules import CommandRuleStore
 from guardedpy.credentials import CredentialBackendUnavailableError, CredentialStatus
 
 
@@ -80,6 +82,8 @@ class RenderedDocument(HTMLParser):
         self._inside_navigation = 0
         self._form_stack: list[tuple[str, set[str]]] = []
         self._script_fragments: list[str] = []
+        self._mono_text_captures: list[tuple[str, list[str]]] = []
+        self.mono_texts: list[str] = []
         self._inside_script = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -116,6 +120,8 @@ class RenderedDocument(HTMLParser):
             self.badge_statuses.add(attributes["data-status"])
         if tag == "section" and attributes.get("aria-label"):
             self.section_labels.add(attributes["aria-label"])
+        if "mono" in attributes.get("class", "").split():
+            self._mono_text_captures.append((tag, []))
         if tag == "script":
             self._inside_script = True
 
@@ -124,10 +130,15 @@ class RenderedDocument(HTMLParser):
             self._inside_navigation -= 1
         if tag == "form":
             self._form_stack.pop()
+        if self._mono_text_captures and self._mono_text_captures[-1][0] == tag:
+            _, fragments = self._mono_text_captures.pop()
+            self.mono_texts.append("".join(fragments).strip())
         if tag == "script":
             self._inside_script = False
 
     def handle_data(self, data: str) -> None:
+        for _, fragments in self._mono_text_captures:
+            fragments.append(data)
         if self._inside_script:
             self._script_fragments.append(data)
 
@@ -408,6 +419,29 @@ def test_security_settings_explain_current_rules_without_changing_their_controls
         ("/settings/credentials", {"api_key"}),
         ("/settings/credentials/clear", set()),
     ]
+
+
+def test_command_rule_projection_keeps_raw_command_in_monospace(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Catches a persisted command projection rendering as ordinary prose."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    root = _project_root(tmp_path)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    rule = CommandRuleStore(root).add_from(
+        RunCommandAction(
+            kind="run_command",
+            summary="not rendered",
+            args=("python", "-m", "pip", "install", "example-package==1.2.3"),
+        ),
+        None,
+    )
+
+    document = _document(asyncio.run(_request(app, "GET", "/settings/command-rules")))
+
+    assert document.forms == [(f"/settings/command-rules/{rule.id}/delete", set())]
+    assert "Python package install: example-package==1.2.3" in document.mono_texts
 
 
 def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives() -> None:

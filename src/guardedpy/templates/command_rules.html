@@ -17,7 +17,7 @@
       <div>
         <p class="mono">{{ rule.id }}</p>
         <p class="mono muted">{{ rule.kind }}</p>
-        <p>{{ projection }}</p>
+        <p class="mono">{{ projection }}</p>
       </div>
       <form method="post" action="/settings/command-rules/{{ rule.id }}/delete">
         <button class="btn-danger" type="submit">撤销规则</button>
