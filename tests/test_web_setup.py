@@ -853,7 +853,9 @@ def test_task_index_failure_rolls_back_sqlite_registration_before_submit_or_thre
         raise OSError("simulated local index failure")
 
     monkeypatch.setattr(web, "Thread", CapturingThread)
-    monkeypatch.setattr(web, "_write_local_state", fail_index_write)
+    import guardedpy.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_write_local_state", fail_index_write)
 
     failed = asyncio.run(
         _request(
