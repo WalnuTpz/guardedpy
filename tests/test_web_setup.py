@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 import importlib
 from pathlib import Path
+import sys
 from typing import Any
 from uuid import UUID
 
@@ -303,6 +304,7 @@ def test_serve_binds_uvicorn_to_loopback_only(monkeypatch: pytest.MonkeyPatch) -
         "run",
         lambda app, *, host: received.update({"app": app, "host": host}),
     )
+    monkeypatch.setattr(sys, "argv", ["guardedpy", "serve"])
 
     web.serve()
 

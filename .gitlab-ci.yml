@@ -1,0 +1,8 @@
+image: python:3.11
+
+unit-test:
+  script:
+    - pip install -e ".[dev]"
+    - make test
+    - make demo
+    - make build
