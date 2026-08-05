@@ -20,11 +20,15 @@ def _text(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-def test_package_metadata_declares_web_console_entrypoint_and_ui_assets() -> None:
-    """Catches a wheel that omits the installed WebUI entrypoint or templates."""
+def test_package_metadata_declares_cli_and_loopback_server_entrypoints() -> None:
+    """Catches a wheel that routes either public command away from its local adapter."""
     project = tomllib.loads(_text("pyproject.toml"))
 
-    assert project["project"]["scripts"] == {"guardedpy": "guardedpy.web:serve"}
+    assert project["project"]["scripts"] == {
+        "guardedpy": "guardedpy.cli:main",
+        "guardedpy-cli": "guardedpy.cli:main",
+        "guardedpy-server": "guardedpy.cli:server_main",
+    }
     assert project["tool"]["setuptools"]["package-data"]["guardedpy"] == [
         "templates/*.html",
         "static/*.css",
@@ -80,6 +84,9 @@ def test_delivery_automation_runs_the_same_offline_test_demo_and_build_contract(
     assert "test:" in makefile
     assert "demo:" in makefile
     assert "build:" in makefile
+    assert "cli-check:" in makefile
+    assert "from guardedpy.cli import main" in makefile
+    assert "from guardedpy.cli import server_main" in makefile
     assert "pytest tests -q" in makefile
     for scenario in (
         "dangerous_action_denied",
@@ -144,6 +151,17 @@ def test_readme_documents_real_local_demo_security_delivery_and_course_context()
     assert "present-time reconstruction records" in readme
     assert "src/guardedpy/" in readme
     assert "tests/" in readme
+
+
+def test_readme_documents_local_cli_server_and_pending_release_assets() -> None:
+    """Catches an operator guide that promotes a public UI or invents a release asset."""
+    readme = _text("README.md")
+
+    assert "guardedpy-cli" in readme
+    assert "guardedpy-server" in readme
+    assert "公网 WebUI" in readme
+    assert "Release asset URL is pending" in readme
+    assert "releases/download" not in readme
 
 
 @pytest.mark.parametrize("mode", ["serve", "demo"])

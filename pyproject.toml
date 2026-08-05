@@ -20,7 +20,9 @@ dependencies = [
 ]
 
 [project.scripts]
-guardedpy = "guardedpy.web:serve"
+guardedpy = "guardedpy.cli:main"
+guardedpy-cli = "guardedpy.cli:main"
+guardedpy-server = "guardedpy.cli:server_main"
 
 [project.optional-dependencies]
 dev = ["httpx", "build"]
