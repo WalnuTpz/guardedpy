@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 from typing import Any
 
 from guardedpy.config import HarnessConfig
+from guardedpy.feedback import PytestRun
 
 
 _MAX_READ_LINES = 200
@@ -131,11 +133,49 @@ class Workspace:
             {"path": target.relative_to(self.root).as_posix()},
         )
 
+    def run_pytest(self, targets: tuple[str, ...]) -> PytestRun:
+        """Run configured pytest from the selected root with test-root-only targets."""
+        self._validate_pytest_targets(targets)
+        try:
+            completed = subprocess.run(
+                (*self.config.pytest_command, *targets),
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_seconds,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            return PytestRun(
+                -1,
+                self._output_text(error.stdout),
+                self._output_text(error.stderr),
+                True,
+            )
+        return PytestRun(completed.returncode, completed.stdout, completed.stderr, False)
+
     def _inside_root(self, path: PurePosixPath) -> Path | None:
         candidate = (self.root / Path(path)).resolve()
         if candidate.is_relative_to(self.root):
             return candidate
         return None
+
+    def _validate_pytest_targets(self, targets: tuple[str, ...]) -> None:
+        test_roots = tuple((self.root / path).resolve() for path in self.config.test_dirs)
+        for target in targets:
+            path_text = target.split("::", 1)[0]
+            if target.startswith("-") or not path_text:
+                raise ValueError("pytest targets must name files in configured test directories")
+            candidate = self._inside_root(PurePosixPath(path_text))
+            if candidate is None or not any(candidate.is_relative_to(root) for root in test_roots):
+                raise ValueError("pytest targets must stay inside configured test directories")
+
+    @staticmethod
+    def _output_text(value: str | bytes | None) -> str:
+        if isinstance(value, bytes):
+            return value.decode(errors="replace")
+        return value or ""
 
     @staticmethod
     def _outside_root() -> ToolResult:
