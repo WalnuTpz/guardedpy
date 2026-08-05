@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GuardedPy · Agentic Demo</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">GuardedPy <span>DEMO</span></a>
+      <span class="muted">Offline governed-agent scenarios</span>
+    </header>
+    <main class="canvas">
+      <section class="card">
+        <p class="eyebrow">READ-ONLY MECHANISM DEMO</p>
+        <h1>Deterministic safety evidence</h1>
+        <p class="muted">Each scenario starts with a fresh temporary project and uses a scripted offline LLM.</p>
+      </section>
+      <section class="card timeline-card">
+        <h2>Fixed scenarios</h2>
+        <ol class="timeline">
+          {% for scenario in scenarios %}
+          <li><span class="badge badge-amber">{{ scenario }}</span></li>
+          {% endfor %}
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>
