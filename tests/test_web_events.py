@@ -14,6 +14,7 @@ import pytest
 
 from guardedpy.actions import RunCommandAction, parse_action
 from guardedpy.command_rules import CommandRuleStore
+from guardedpy.config import local_state_path
 from guardedpy.credentials import CredentialStatus
 from guardedpy.domain import PolicyVerdict, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
@@ -505,6 +506,169 @@ def test_terminal_task_keeps_its_original_event_root_after_reconfiguration(
     assert events
     assert all(event["affected_project"] == str(original_root.resolve()) for event in events)
     assert all(event["task_status"] != "completed" for event in events)
+
+
+def test_reconfigured_two_task_history_survives_fresh_app_with_original_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches task/config history remaining process-local or rebinding to the latest root."""
+    import guardedpy.web as web
+
+    first_root = _project_root(tmp_path / "first")
+    second_root = _project_root(tmp_path / "second")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    ImmediateThread.started = []
+    monkeypatch.setattr(web, "Thread", ImmediateThread)
+    created_orchestrators: list[tuple[Path, str]] = []
+
+    def factory(project_root: Path, config: Any, memory: Any) -> TaskOrchestrator:
+        created_orchestrators.append((project_root, config.model))
+        return TaskOrchestrator(
+            project_root,
+            ScriptedLLM([_action(kind="finish", summary="stop", status="blocked")]),
+            memory_store=memory,
+        )
+
+    credentials = FakeCredentials()
+    app = web.create_app("local", web.WebServices(credentials, factory))
+    assert asyncio.run(
+        _request(app, "POST", "/setup", data=_setup_data(first_root))
+    ).status_code == 303
+    first_created = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/tasks",
+            data={"mode": "feature", "description": "First historical task"},
+        )
+    )
+    assert first_created.status_code == 303
+    assert first_created.headers["location"].startswith("/tasks/")
+    assert first_created.headers["location"] != "/tasks/new"
+    first_id = UUID(first_created.headers["location"].rsplit("/", 1)[-1])
+
+    reconfigured = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/setup",
+            data={**_setup_data(second_root), "api_key": "", "model": "deepseek-reasoner"},
+        )
+    )
+    second_created = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/tasks",
+            data={"mode": "feature", "description": "Second historical task"},
+        )
+    )
+    assert second_created.status_code == 303
+    assert second_created.headers["location"].startswith("/tasks/")
+    assert second_created.headers["location"] != "/tasks/new"
+    second_id = UUID(second_created.headers["location"].rsplit("/", 1)[-1])
+
+    assert first_created.headers["location"] == f"/tasks/{first_id}"
+    assert reconfigured.status_code == 303
+    assert second_created.headers["location"] == f"/tasks/{second_id}"
+    assert created_orchestrators == [
+        (first_root.resolve(), "deepseek-chat"),
+        (second_root.resolve(), "deepseek-reasoner"),
+    ]
+    assert credentials.configured is True
+    assert "test-key" not in local_state_path().read_text()
+
+    fresh_app = web.create_app("local", web.WebServices(credentials, factory))
+    setup_page = asyncio.run(_request(fresh_app, "GET", "/setup"))
+    task_page = asyncio.run(_request(fresh_app, "GET", "/tasks/new"))
+    first_detail = asyncio.run(_request(fresh_app, "GET", f"/tasks/{first_id}"))
+    first_feed = asyncio.run(_request(fresh_app, "GET", f"/tasks/{first_id}/events"))
+    second_detail = asyncio.run(_request(fresh_app, "GET", f"/tasks/{second_id}"))
+
+    assert len(created_orchestrators) == 2
+    assert setup_page.status_code == 200
+    assert str(second_root.resolve()) in setup_page.text
+    assert "deepseek-reasoner" in setup_page.text
+    assert "test-key" not in setup_page.text
+    assert task_page.status_code == 200
+    assert f'href="/tasks/{first_id}"' in task_page.text
+    assert f'href="/tasks/{second_id}"' in task_page.text
+    assert first_detail.status_code == 200
+    assert second_detail.status_code == 200
+    assert first_feed.status_code == 200
+    assert all(
+        event["affected_project"] == str(first_root.resolve())
+        for event in first_feed.json()
+    )
+    assert EventStore(first_root).tasks()[0].config.model == "deepseek-chat"
+    assert EventStore(second_root).tasks()[0].config.model == "deepseek-reasoner"
+
+
+def test_fresh_app_marks_indexed_unfinished_task_interrupted_without_resuming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches startup resuming an unfinished loop or dropping it from task history."""
+    import guardedpy.web as web
+
+    root = _project_root(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    factory_calls: list[Path] = []
+
+    class DormantThread:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def start(self) -> None:
+            return None
+
+    class PendingOrchestrator:
+        def submit(self, task: Any) -> Any:
+            return task
+
+        def run(self, task: Any) -> Any:
+            raise AssertionError("an interrupted task must not resume")
+
+        def cancel(self, task_id: UUID) -> Any:
+            raise AssertionError(task_id)
+
+        def resolve_approval(self, task_id: UUID, action_hash: str, *, decision: str) -> bool:
+            raise AssertionError((task_id, action_hash, decision))
+
+    def factory(project_root: Path, config: Any, memory: Any) -> PendingOrchestrator:
+        del config, memory
+        factory_calls.append(project_root)
+        return PendingOrchestrator()
+
+    monkeypatch.setattr(web, "Thread", DormantThread)
+    credentials = FakeCredentials()
+    app = web.create_app("local", web.WebServices(credentials, factory))
+    assert asyncio.run(
+        _request(app, "POST", "/setup", data=_setup_data(root))
+    ).status_code == 303
+    created = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/tasks",
+            data={"mode": "feature", "description": "Interrupted on restart"},
+        )
+    )
+    assert created.status_code == 303
+    assert created.headers["location"].startswith("/tasks/")
+    assert created.headers["location"] != "/tasks/new"
+    task_id = UUID(created.headers["location"].rsplit("/", 1)[-1])
+    assert len(factory_calls) == 1
+
+    fresh_app = web.create_app("local", web.WebServices(credentials, factory))
+    detail = asyncio.run(_request(fresh_app, "GET", f"/tasks/{task_id}"))
+    feed = asyncio.run(_request(fresh_app, "GET", f"/tasks/{task_id}/events"))
+
+    assert len(factory_calls) == 1
+    assert detail.status_code == 200
+    assert "interrupted" in detail.text
+    assert feed.status_code == 200
+    assert feed.json()[-1]["task_status"] == "interrupted"
+    assert feed.json()[-1]["stop_reason"] == "service_restarted"
 
 
 def test_memory_controls_keep_proposals_pending_until_approval_and_404_unknown_ids(

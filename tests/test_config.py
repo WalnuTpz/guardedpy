@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from guardedpy.config import HarnessConfig, app_state_dir, load_config
+from guardedpy.config import (
+    HarnessConfig,
+    app_state_dir,
+    load_config,
+    local_state_path,
+    project_config_path,
+)
 
 
 def test_config_rejects_parent_escape(tmp_path: Path) -> None:
@@ -67,3 +73,20 @@ def test_app_state_dir_is_outside_project_and_root_isolated(
     assert first.is_relative_to(state_home)
     assert not first.is_relative_to(project_one)
     assert first != second
+
+
+def test_project_config_and_local_index_paths_stay_in_external_application_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches configuration or the selected-project index being written into a project."""
+    state_home = tmp_path / "state-home"
+    project_root = tmp_path / "project"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    config_path = project_config_path(project_root)
+    index_path = local_state_path()
+
+    assert config_path == app_state_dir(project_root) / "harness.yaml"
+    assert config_path.is_relative_to(state_home)
+    assert not config_path.is_relative_to(project_root)
+    assert index_path == state_home / "guardedpy" / "local-state.yaml"

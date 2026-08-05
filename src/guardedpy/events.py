@@ -12,8 +12,15 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from guardedpy.actions import Action, stable_hash
-from guardedpy.config import app_state_dir
-from guardedpy.domain import FeedbackKind, PolicyDecision, PolicyVerdict, TaskStatus
+from guardedpy.config import HarnessConfig, app_state_dir
+from guardedpy.domain import (
+    FeedbackKind,
+    PolicyDecision,
+    PolicyVerdict,
+    TaskMode,
+    TaskState,
+    TaskStatus,
+)
 from guardedpy.policy import APPROVAL_ACTION_PROJECTION_MAX_LENGTH, approval_action_projection
 
 
@@ -228,6 +235,68 @@ class EventStore:
                 created_at=created_at,
             )
 
+    def register_task(self, task: TaskState) -> None:
+        """Persist immutable task identity/configuration and its initial pending state."""
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO task_metadata (
+                    task_id, description, mode, config_json, bugfix_target
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(task.id),
+                    task.description,
+                    task.mode.value,
+                    task.config.model_dump_json(),
+                    task.bugfix_target,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_states (task_id, task_status) VALUES (?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET task_status = excluded.task_status
+                """,
+                (str(task.id), TaskStatus.PENDING.value),
+            )
+            connection.commit()
+
+    def tasks(self) -> list[TaskState]:
+        """Return registered tasks with their latest persisted lifecycle status."""
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT task_metadata.task_id, task_metadata.description,
+                       task_metadata.mode, task_metadata.config_json,
+                       task_metadata.bugfix_target, task_states.task_status
+                FROM task_metadata
+                JOIN task_states ON task_states.task_id = task_metadata.task_id
+                ORDER BY task_metadata.rowid
+                """
+            ).fetchall()
+        return [
+            TaskState(
+                id=UUID(row[0]),
+                description=row[1],
+                mode=TaskMode(row[2]),
+                config=HarnessConfig.model_validate_json(row[3]),
+                bugfix_target=row[4],
+                status=TaskStatus(row[5]),
+            )
+            for row in rows
+        ]
+
+    def discard_task_registration(self, task_id: UUID) -> None:
+        """Remove a registered task before any background execution has started."""
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute(
+                "DELETE FROM task_metadata WHERE task_id = ?", (str(task_id),)
+            )
+            connection.execute(
+                "DELETE FROM task_states WHERE task_id = ?", (str(task_id),)
+            )
+            connection.commit()
+
     def events_for(self, task_id: UUID) -> list[StoredRunEvent]:
         """Return a task's audit trail in insertion order."""
         with closing(sqlite3.connect(self.database_path)) as connection:
@@ -321,6 +390,13 @@ class EventStore:
                 CREATE TABLE IF NOT EXISTS task_states (
                     task_id TEXT PRIMARY KEY,
                     task_status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS task_metadata (
+                    task_id TEXT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    bugfix_target TEXT
                 );
                 CREATE TABLE IF NOT EXISTS event_policies (
                     event_id INTEGER PRIMARY KEY,

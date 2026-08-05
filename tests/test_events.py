@@ -10,7 +10,8 @@ import pytest
 from pydantic import ValidationError
 
 from guardedpy.actions import parse_action
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskStatus
+from guardedpy.config import HarnessConfig
+from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 
 
@@ -221,3 +222,60 @@ def test_mark_unfinished_interrupted_adds_terminal_event_only_for_active_tasks(
     assert [event.task_status for event in store.events_for(completed_task_id)] == [
         TaskStatus.COMPLETED
     ]
+
+
+def test_register_task_persists_static_metadata_and_forces_pending_state(
+    store: EventStore,
+) -> None:
+    """Catches restart history losing task identity/config or inheriting a forged status."""
+    config = HarnessConfig(
+        source_dirs=(Path("src"),),
+        test_dirs=(Path("tests"),),
+        pytest_command=("pytest", "-q"),
+        model="deepseek-chat",
+        timeout_seconds=45,
+    )
+    task = TaskState(
+        description="Keep this task after restart",
+        mode=TaskMode.BUGFIX,
+        bugfix_target="tests/test_value.py::test_value",
+        config=config,
+        status=TaskStatus.COMPLETED,
+    )
+
+    store.register_task(task)
+
+    restored = EventStore(store.project_root).tasks()
+    assert len(restored) == 1
+    assert restored[0].id == task.id
+    assert restored[0].description == "Keep this task after restart"
+    assert restored[0].mode is TaskMode.BUGFIX
+    assert restored[0].bugfix_target == "tests/test_value.py::test_value"
+    assert restored[0].config == config
+    assert restored[0].status is TaskStatus.PENDING
+
+
+def test_existing_event_database_adds_task_metadata_without_losing_events(
+    store: EventStore,
+) -> None:
+    """Catches the additive task-history migration replacing an existing audit database."""
+    existing_task_id = uuid4()
+    store.append(RunEvent(task_id=existing_task_id, task_status=TaskStatus.COMPLETED))
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("DROP TABLE IF EXISTS task_metadata")
+        connection.commit()
+
+    migrated = EventStore(store.project_root)
+    new_task = TaskState(
+        description="Registered after migration",
+        mode=TaskMode.FEATURE,
+        config=HarnessConfig(
+            source_dirs=(Path("src"),),
+            test_dirs=(Path("tests"),),
+            pytest_command=("pytest",),
+        ),
+    )
+    migrated.register_task(new_task)
+
+    assert migrated.events_for(existing_task_id)[0].task_status is TaskStatus.COMPLETED
+    assert [task.id for task in migrated.tasks()] == [new_task.id]

@@ -38,6 +38,20 @@ def load_config(path: Path, project_root: Path) -> HarnessConfig:
 
 def app_state_dir(project_root: Path) -> Path:
     """Return the per-project state location outside the selected project."""
-    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     root_hash = sha256(str(project_root.resolve()).encode()).hexdigest()
-    return state_home / "guardedpy" / root_hash
+    return _application_state_root() / root_hash
+
+
+def project_config_path(project_root: Path) -> Path:
+    """Return the external configuration snapshot for one selected project."""
+    return app_state_dir(project_root) / "harness.yaml"
+
+
+def local_state_path() -> Path:
+    """Return the external selected-project and task-root index path."""
+    return _application_state_root() / "local-state.yaml"
+
+
+def _application_state_root() -> Path:
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_home / "guardedpy"

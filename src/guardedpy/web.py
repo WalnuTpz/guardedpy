@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 from threading import Thread
 from typing import Any, Callable, Protocol
 from uuid import UUID
@@ -22,7 +24,12 @@ from pydantic import ValidationError
 import uvicorn
 import yaml
 
-from guardedpy.config import HarnessConfig
+from guardedpy.config import (
+    HarnessConfig,
+    load_config,
+    local_state_path,
+    project_config_path,
+)
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.credentials import (
     CredentialBackendUnavailableError,
@@ -90,6 +97,8 @@ class _LocalState:
     task: TaskState | None = None
     orchestrator: OrchestratorPort | None = None
     thread: Thread | None = None
+    tasks: dict[UUID, TaskState] = field(default_factory=dict)
+    orchestrators: dict[UUID, OrchestratorPort] = field(default_factory=dict)
     task_roots: dict[UUID, Path] = field(default_factory=dict)
     mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -112,7 +121,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
 
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
-    app.state.local = _LocalState()
+    app.state.local = _load_startup_state()
 
     def credential_status() -> tuple[CredentialStatus, str | None]:
         try:
@@ -121,6 +130,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             return CredentialStatus(configured=False), _CREDENTIAL_ERROR
 
     def render_setup(request: Request, *, error: str | None = None, status_code: int = 200) -> HTMLResponse:
+        state: _LocalState = app.state.local
         status, credential_error = credential_status()
         if credential_error is not None:
             error = credential_error
@@ -132,6 +142,12 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 "request": request,
                 "error": error,
                 "configured": status.configured,
+                "project_root": str(state.project_root) if state.project_root else "",
+                "source_dirs": _display_paths(state.config.source_dirs) if state.config else "src",
+                "test_dirs": _display_paths(state.config.test_dirs) if state.config else "tests",
+                "pytest_command": shlex.join(state.config.pytest_command) if state.config else "pytest",
+                "model": state.config.model if state.config else "deepseek-chat",
+                "timeout_seconds": state.config.timeout_seconds if state.config else 30,
             },
             status_code=status_code,
         )
@@ -159,13 +175,18 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         return _TEMPLATES.TemplateResponse(
             request,
             "task.html",
-            {"error": error, "configured": state.config is not None, "task": state.task},
+            {
+                "error": error,
+                "configured": state.config is not None,
+                "task": state.task,
+                "tasks": list(state.tasks.values()),
+            },
             status_code=status_code,
         )
 
     def task_for(task_id: UUID) -> TaskState:
-        task = app.state.local.task
-        if task is None or task.id != task_id:
+        task = app.state.local.tasks.get(task_id)
+        if task is None:
             raise HTTPException(status_code=404, detail="Task was not found.")
         return task
 
@@ -183,33 +204,49 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             return render_setup(request)
         return render_task(request)
 
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_page(request: Request) -> HTMLResponse:
+        return render_setup(request)
+
     @app.post("/setup", response_class=HTMLResponse)
     async def setup(request: Request) -> Response:
+        state: _LocalState = app.state.local
+        if _has_active_task(state):
+            return render_task(request, error="Another task is active.", status_code=409)
         form = await request.form()
+        status, credential_error = credential_status()
+        if credential_error is not None:
+            return render_setup(request, error=_CREDENTIAL_ERROR, status_code=503)
         try:
-            project_root, config, api_key = _validated_setup(form)
+            project_root, config, api_key = _validated_setup(
+                form, require_api_key=not status.configured
+            )
         except (TypeError, ValueError, ValidationError):
             return render_setup(request, error="Setup could not be saved.", status_code=422)
 
-        state: _LocalState = app.state.local
         async with state.mutation_lock:
-            if state.task is not None and state.task.status in _ACTIVE_STATUSES:
+            if _has_active_task(state):
                 return render_task(request, error="Another task is active.", status_code=409)
             try:
                 memory_store = MemoryStore(project_root)
-                snapshot = project_root / "harness.yaml"
-                had_snapshot = snapshot.is_file()
-                previous_snapshot = snapshot.read_bytes() if had_snapshot else None
-                _write_snapshot(project_root, config)
+                config_path = project_config_path(project_root)
+                index_path = local_state_path()
+                previous_config = _snapshot_file(config_path)
+                previous_index = _snapshot_file(index_path)
             except Exception:
                 return render_setup(request, error="Setup could not be saved.", status_code=422)
             try:
-                services.credentials.set_key(api_key)
+                _write_snapshot(project_root, config)
+                _write_local_state(project_root, state.task_roots)
+                if api_key.strip():
+                    services.credentials.set_key(api_key)
             except CredentialBackendUnavailableError:
-                _restore_snapshot(snapshot, had_snapshot, previous_snapshot)
+                _restore_file(config_path, previous_config)
+                _restore_file(index_path, previous_index)
                 return render_setup(request, error=_CREDENTIAL_ERROR, status_code=503)
             except Exception:
-                _restore_snapshot(snapshot, had_snapshot, previous_snapshot)
+                _restore_file(config_path, previous_config)
+                _restore_file(index_path, previous_index)
                 return render_setup(request, error="Setup could not be saved.", status_code=422)
 
             state.project_root = project_root
@@ -240,7 +277,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         async with state.mutation_lock:
             if state.config is None or state.project_root is None or state.memory_store is None:
                 return render_setup(request, error="Setup could not be saved.", status_code=422)
-            if state.task is not None and state.task.status in _ACTIVE_STATUSES:
+            if _has_active_task(state):
                 return render_task(request, error="Another task is active.", status_code=409)
 
             task = TaskState(
@@ -252,17 +289,42 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             orchestrator = services.orchestrator_factory(
                 state.project_root, state.config, state.memory_store
             )
+            event_store = EventStore(state.project_root)
+            index_path = local_state_path()
             try:
+                previous_index = _snapshot_file(index_path)
+            except Exception:
+                return render_task(request, error="Task could not be started.", status_code=422)
+            registered = False
+            index_written = False
+            try:
+                event_store.register_task(task)
+                registered = True
+                task_roots = {**state.task_roots, task.id: state.project_root}
+                _write_local_state(state.project_root, task_roots)
+                index_written = True
                 orchestrator.submit(task)
             except ValueError:
+                if index_written:
+                    _restore_file(index_path, previous_index)
+                if registered:
+                    event_store.discard_task_registration(task.id)
                 return render_task(request, error="Another task is active.", status_code=409)
+            except Exception:
+                if index_written:
+                    _restore_file(index_path, previous_index)
+                if registered:
+                    event_store.discard_task_registration(task.id)
+                return render_task(request, error="Task could not be started.", status_code=422)
             state.task = task
             state.orchestrator = orchestrator
-            state.task_roots[task.id] = state.project_root
+            state.tasks[task.id] = task
+            state.orchestrators[task.id] = orchestrator
+            state.task_roots = task_roots
             thread = Thread(target=orchestrator.run, args=(task,), daemon=True)
             state.thread = thread
         thread.start()
-        return RedirectResponse("/tasks/new", status_code=303)
+        return RedirectResponse(f"/tasks/{task.id}", status_code=303)
 
     @app.get("/tasks/{task_id}", response_class=HTMLResponse)
     async def task_detail(task_id: UUID, request: Request) -> HTMLResponse:
@@ -298,7 +360,8 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def resolve_task_approval(task_id: UUID, request: Request) -> Response:
         state: _LocalState = app.state.local
         task = task_for(task_id)
-        if state.orchestrator is None:
+        orchestrator = state.orchestrators.get(task_id)
+        if orchestrator is None:
             raise HTTPException(status_code=404, detail="Task was not found.")
         form = await request.form()
         action_hash = str(form.get("action_hash", ""))
@@ -307,9 +370,9 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             raise HTTPException(status_code=409, detail="Approval is stale.")
 
         was_waiting = task.status is TaskStatus.WAITING_APPROVAL
-        accepted = state.orchestrator.resolve_approval(task_id, action_hash, decision=decision)
+        accepted = orchestrator.resolve_approval(task_id, action_hash, decision=decision)
         if accepted:
-            thread = Thread(target=state.orchestrator.run, args=(task,), daemon=True)
+            thread = Thread(target=orchestrator.run, args=(task,), daemon=True)
             state.thread = thread
             thread.start()
             return RedirectResponse(f"/tasks/{task_id}", status_code=303)
@@ -320,9 +383,14 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     @app.post("/tasks/{task_id}/cancel", response_class=HTMLResponse)
     async def cancel_task(task_id: UUID, request: Request) -> Response:
         state: _LocalState = app.state.local
-        if state.task is None or state.orchestrator is None or state.task.id != task_id:
+        task = state.tasks.get(task_id)
+        orchestrator = state.orchestrators.get(task_id)
+        if task is None or orchestrator is None:
             return render_task(request, error="Task was not found.", status_code=404)
-        state.task = state.orchestrator.cancel(task_id)
+        cancelled = orchestrator.cancel(task_id)
+        state.tasks[task_id] = cancelled
+        if state.task is not None and state.task.id == task_id:
+            state.task = cancelled
         return RedirectResponse("/tasks/new", status_code=303)
 
     @app.get("/memories", response_class=HTMLResponse)
@@ -411,7 +479,9 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     return app
 
 
-def _validated_setup(form: Any) -> tuple[Path, HarnessConfig, str]:
+def _validated_setup(
+    form: Any, *, require_api_key: bool = True
+) -> tuple[Path, HarnessConfig, str]:
     project_root = Path(str(form.get("project_root", ""))).expanduser()
     if not project_root.is_dir():
         raise ValueError("project root is invalid")
@@ -421,7 +491,7 @@ def _validated_setup(form: Any) -> tuple[Path, HarnessConfig, str]:
     command = tuple(shlex.split(str(form.get("pytest_command", ""))))
     model = str(form.get("model", "")).strip()
     api_key = str(form.get("api_key", ""))
-    if not command or not model or not api_key.strip():
+    if not command or not model or (require_api_key and not api_key.strip()):
         raise ValueError("required setup value is empty")
     config = HarnessConfig(
         source_dirs=source_dirs,
@@ -461,16 +531,116 @@ def _write_snapshot(project_root: Path, config: HarnessConfig) -> None:
         "model": config.model,
         "timeout_seconds": config.timeout_seconds,
     }
-    (project_root / "harness.yaml").write_text(yaml.safe_dump(snapshot, sort_keys=False))
+    _atomic_write(
+        project_config_path(project_root),
+        yaml.safe_dump(snapshot, sort_keys=False).encode(),
+    )
 
 
-def _restore_snapshot(path: Path, existed: bool, content: bytes | None) -> None:
-    """Restore the exact pre-setup snapshot after a later credential mutation fails."""
-    if existed:
-        assert content is not None
-        path.write_bytes(content)
+def _display_paths(paths: tuple[Path, ...]) -> str:
+    return ", ".join(str(path) for path in paths)
+
+
+def _has_active_task(state: _LocalState) -> bool:
+    return any(task.status in _ACTIVE_STATUSES for task in state.tasks.values())
+
+
+def _write_local_state(project_root: Path, task_roots: dict[UUID, Path]) -> None:
+    payload = {
+        "selected_project": str(project_root.resolve()),
+        "task_roots": {
+            str(task_id): str(task_root.resolve())
+            for task_id, task_root in task_roots.items()
+        },
+    }
+    _atomic_write(
+        local_state_path(),
+        yaml.safe_dump(payload, sort_keys=False).encode(),
+    )
+
+
+def _snapshot_file(path: Path) -> bytes | None:
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise OSError("state path is not a file")
+    return path.read_bytes()
+
+
+def _restore_file(path: Path, content: bytes | None) -> None:
+    if content is None:
+        path.unlink(missing_ok=True)
         return
-    path.unlink(missing_ok=True)
+    _atomic_write(path, content)
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+            temporary.write(content)
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _load_startup_state() -> _LocalState:
+    state = _LocalState()
+    try:
+        project_root, task_roots = _read_local_state()
+        config = load_config(project_config_path(project_root), project_root)
+        if any(not (project_root / path).is_dir() for path in config.source_dirs + config.test_dirs):
+            raise ValueError("configured directory is unavailable")
+
+        tasks_by_root: dict[Path, dict[UUID, TaskState]] = {}
+        for task_root in dict.fromkeys(task_roots.values()):
+            store = EventStore(task_root)
+            store.mark_unfinished_interrupted()
+            tasks_by_root[task_root] = {task.id: task for task in store.tasks()}
+
+        tasks: dict[UUID, TaskState] = {}
+        for task_id, task_root in task_roots.items():
+            task = tasks_by_root[task_root].get(task_id)
+            if task is None:
+                raise ValueError("task index has no matching metadata")
+            tasks[task_id] = task
+
+        state.project_root = project_root
+        state.config = config
+        state.memory_store = MemoryStore(project_root)
+        state.tasks = tasks
+        state.task_roots = task_roots
+        state.task = next(reversed(tasks.values()), None)
+    except Exception:
+        return _LocalState()
+    return state
+
+
+def _read_local_state() -> tuple[Path, dict[UUID, Path]]:
+    payload = yaml.safe_load(local_state_path().read_text())
+    if not isinstance(payload, dict) or set(payload) != {"selected_project", "task_roots"}:
+        raise ValueError("local state has invalid fields")
+    selected_value = payload["selected_project"]
+    root_values = payload["task_roots"]
+    if not isinstance(selected_value, str) or not isinstance(root_values, dict):
+        raise ValueError("local state has invalid values")
+    project_root = _restored_project_root(selected_value)
+    task_roots: dict[UUID, Path] = {}
+    for task_id, task_root in root_values.items():
+        if not isinstance(task_id, str) or not isinstance(task_root, str):
+            raise ValueError("task index has invalid values")
+        task_roots[UUID(task_id)] = _restored_project_root(task_root)
+    return project_root, task_roots
+
+
+def _restored_project_root(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError("stored project root is invalid")
+    return path.resolve()
 
 
 def _system_keyring() -> KeyringBackend:

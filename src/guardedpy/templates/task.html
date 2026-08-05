@@ -17,4 +17,14 @@
   <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="secondary" type="submit">Cancel current task</button></form>
   {% endif %}
 </section>
+{% if tasks %}
+<section class="card">
+  <h2>Known tasks</h2>
+  <ul>
+    {% for known_task in tasks %}
+    <li><a href="/tasks/{{ known_task.id }}">{{ known_task.description }}</a> <span class="badge">{{ known_task.status }}</span></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
 {% endblock %}
