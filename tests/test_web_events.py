@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 import json
 from pathlib import Path
+import re
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -75,6 +76,16 @@ class _TaskDetailDom(HTMLParser):
         super().__init__()
         self._next_element_id = 0
         self._ancestors: list[tuple[int, str, dict[str, str]]] = []
+        self._text_captures: list[tuple[str, list[str]]] = []
+        self._inside_navigation = 0
+        self._inside_context_title = False
+        self._context_title_fragments: list[str] = []
+        self.regions: list[str] = []
+        self.decision_values: list[str] = []
+        self.raw_status: str | None = None
+        self.visible_status: str | None = None
+        self.current_navigation_hrefs: list[str] = []
+        self.context_title: str | None = None
         self.event_list_polling_root_id: int | None = None
         self.status_polling_root_id: int | None = None
 
@@ -82,10 +93,23 @@ class _TaskDetailDom(HTMLParser):
         attributes = {name: value or "" for name, value in attrs}
         element_id = self._next_element_id
         self._next_element_id += 1
+        if tag == "section" and attributes.get("aria-label"):
+            self.regions.append(attributes["aria-label"])
+        if tag == "nav":
+            self._inside_navigation += 1
+        if tag == "a" and self._inside_navigation and attributes.get("aria-current") == "page":
+            self.current_navigation_hrefs.append(attributes.get("href", ""))
+        if "context-bar-title" in attributes.get("class", "").split():
+            self._inside_context_title = True
+        if tag == "button" and attributes.get("name") == "decision":
+            self.decision_values.append(attributes.get("value", ""))
+        if "data-events-url" in attributes:
+            self.raw_status = attributes.get("data-current-status")
         if "data-event-list" in attributes:
             self.event_list_polling_root_id = self._polling_root_id()
         if "data-task-status" in attributes:
             self.status_polling_root_id = self._polling_root_id()
+            self._text_captures.append((tag, []))
         if tag not in self._VOID_TAGS:
             self._ancestors.append((element_id, tag, attributes))
 
@@ -93,16 +117,179 @@ class _TaskDetailDom(HTMLParser):
         return
 
     def handle_endtag(self, tag: str) -> None:
+        if self._text_captures and self._text_captures[-1][0] == tag:
+            _, fragments = self._text_captures.pop()
+            self.visible_status = "".join(fragments).strip()
+        if tag == "span" and self._inside_context_title:
+            self.context_title = "".join(self._context_title_fragments).strip()
+            self._inside_context_title = False
+        if tag == "nav":
+            self._inside_navigation -= 1
         for index in range(len(self._ancestors) - 1, -1, -1):
             if self._ancestors[index][1] == tag:
                 del self._ancestors[index:]
                 return
+
+    def handle_data(self, data: str) -> None:
+        for _, fragments in self._text_captures:
+            fragments.append(data)
+        if self._inside_context_title:
+            self._context_title_fragments.append(data)
 
     def _polling_root_id(self) -> int | None:
         for element_id, _tag, attributes in reversed(self._ancestors):
             if "data-events-url" in attributes:
                 return element_id
         return None
+
+
+@dataclass(frozen=True)
+class _PollEffects:
+    operations: tuple[str, ...]
+    visible_status: str | None = None
+
+
+class _PollingScriptHarness:
+    """Parse the complete polling IIFE and execute its observable control flow."""
+
+    _POLL = re.compile(
+        r"""\s*
+        const\s+response\s*=\s*await\s+fetch\(timeline\.dataset\.eventsUrl,\s*\{\s*headers:\s*\{\s*Accept:\s*\"application/json\"\s*\}\s*\}\);\s*
+        if\s*\(!response\.ok\)\s*\{\s*return;\s*\}\s*
+        const\s+events\s*=\s*await\s+response\.json\(\);\s*
+        const\s+latest\s*=\s*events\.at\(-1\);\s*
+        if\s*\(!latest\)\s*\{\s*return;\s*\}\s*
+        if\s*\(terminal\.has\(latest\.task_status\)\)\s*\{\s*clearInterval\(interval\);\s*\}\s*
+        if\s*\(timeline\.dataset\.currentStatus\s*!==\s*latest\.task_status\)\s*\{\s*window\.location\.reload\(\);\s*return;\s*\}\s*
+        if\s*\(status\)\s*\{\s*status\.textContent\s*=\s*statusLabel\(latest\.task_status\);\s*status\.dataset\.status\s*=\s*latest\.task_status;\s*\}\s*
+        if\s*\(list\)\s*\{\s*list\.replaceChildren\(\.\.\.events\.map\(renderEvent\)\);\s*\}\s*
+        """,
+        re.VERBOSE | re.DOTALL,
+    )
+
+    def __init__(self, source: str) -> None:
+        self._validate_balanced_source(source)
+        stripped = source.strip()
+        assert stripped.startswith("(() => {") and stripped.endswith("})();")
+        assert source.count("const poll = async () =>") == 1
+        assert source.count("const interval = window.setInterval(poll, 2000);") == 1
+        assert source.count("poll();") == 1
+        assert re.search(
+            r'const timeline = document\.querySelector\("\[data-events-url\]"\);\s*'
+            r'if \(!timeline \|\| timeline\.dataset\.terminal === "true"\) \{\s*return;\s*\}',
+            source,
+        )
+        labels_match = re.search(
+            r"const STATUS_LABELS = Object\.freeze\(\{(?P<body>.*?)\}\);", source, re.DOTALL
+        )
+        assert labels_match is not None
+        self.labels = dict(
+            re.findall(r'(\w+):\s*"([^"]+)"', labels_match.group("body"))
+        )
+        assert self.labels == {
+            "pending": "待处理",
+            "running": "运行中",
+            "waiting_approval": "等待审批",
+            "completed": "已完成",
+            "blocked": "已阻止",
+            "cancelled": "已取消",
+            "interrupted": "已中断",
+        }
+        terminal_match = re.search(r"const terminal = new Set\(\[(?P<body>.*?)\]\);", source)
+        assert terminal_match is not None
+        self.terminal = frozenset(re.findall(r'"([^"]+)"', terminal_match.group("body")))
+        assert self.terminal == {"completed", "blocked", "cancelled", "interrupted"}
+        detail_span = self._block_after(source, "const detailSpan = (className, text) =>")
+        render_event = self._block_after(source, "const renderEvent = (event) =>")
+        poll = self._block_after(source, "const poll = async () =>")
+        assert "span.textContent = text;" in detail_span
+        assert not {"innerHTML", "outerHTML", "insertAdjacentHTML"}.intersection(
+            set(re.findall(r"[A-Za-z_$][\w$]*", detail_span + render_event))
+        )
+        assert set(re.findall(r"event\.(\w+)", render_event)) == {
+            "task_status",
+            "action_summary",
+            "action_projection",
+            "affected_project",
+            "policy_verdict",
+            "policy_rule_id",
+            "policy_reason",
+            "approval_granted",
+            "feedback_excerpt",
+            "feedback_node_id",
+            "stop_reason",
+        }
+        assert self._POLL.fullmatch(poll)
+
+    def poll(
+        self,
+        *,
+        current_status: str,
+        latest_status: str | None,
+        response_ok: bool = True,
+    ) -> _PollEffects:
+        operations = ["fetch"]
+        if not response_ok:
+            return _PollEffects(tuple(operations))
+        if latest_status is None:
+            return _PollEffects(tuple(operations))
+        if latest_status in self.terminal:
+            operations.append("clearInterval")
+        if current_status != latest_status:
+            operations.append("reload")
+            return _PollEffects(tuple(operations))
+        operations.extend(("updateStatus", "replaceChildren"))
+        return _PollEffects(tuple(operations), self.labels.get(latest_status, latest_status))
+
+    @staticmethod
+    def _validate_balanced_source(source: str) -> None:
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack: list[str] = []
+        quote: str | None = None
+        escaped = False
+        for character in source:
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'", "`"}:
+                quote = character
+            elif character in pairs:
+                stack.append(pairs[character])
+            elif character in pairs.values():
+                assert stack and stack.pop() == character
+        assert quote is None and not stack
+
+    @staticmethod
+    def _block_after(source: str, marker: str) -> str:
+        start = source.index(marker)
+        opening = source.index("{", start)
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        for index in range(opening, len(source)):
+            character = source[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'", "`"}:
+                quote = character
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[opening + 1 : index]
+        raise AssertionError(f"unterminated block after {marker!r}")
 
 
 def _project_root(tmp_path: Path) -> Path:
@@ -198,7 +385,6 @@ def test_task_detail_and_events_expose_only_stored_audit_projection(
 
     page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
     events = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
-    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
 
     assert page.status_code == 200
     assert "apply source patch" in page.text
@@ -218,8 +404,6 @@ def test_task_detail_and_events_expose_only_stored_audit_projection(
         "stop_reason", "id", "created_at",
     } for event in payload)
     assert "--- a/secret.py" not in events.text
-    assert "clearInterval(interval)" in script
-    assert "terminal" in script
 
 
 def test_approval_requires_the_exact_waiting_hash_and_starts_one_continuation(
@@ -295,13 +479,15 @@ def test_command_approval_page_shows_safe_rule_reason_and_all_decisions(
     page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
 
     assert page.status_code == 200
-    assert "Policy rule: command.approval_required" in page.text
-    assert "Policy reason: the constrained command requires approval" in page.text
+    assert "策略规则" in page.text
+    assert "command.approval_required" in page.text
+    assert "策略原因" in page.text
+    assert "the constrained command requires approval" in page.text
     assert 'value="reject"' in page.text
     assert 'value="once"' in page.text
     assert 'value="always"' in page.text
-    assert "Allow once" in page.text
-    assert "Always allow this rule" in page.text
+    assert "仅允许一次" in page.text
+    assert "始终允许此规则" in page.text
     assert "hidden context" not in page.text
 
 
@@ -363,6 +549,9 @@ def test_non_command_approval_hides_always_and_keeps_pending_after_forgery(
 
     assert page.status_code == 200
     assert 'value="always"' not in page.text
+    detail = _TaskDetailDom()
+    detail.feed(page.text)
+    assert "always" not in detail.decision_values
     assert resolved.status_code == 303
 
 
@@ -385,6 +574,33 @@ def test_task_detail_polling_root_owns_status_and_event_list_in_parsed_dom(
     assert document.status_polling_root_id == document.event_list_polling_root_id
 
 
+def test_task_detail_prioritizes_governance_regions_and_translates_waiting_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a responsive detail view exposing raw status or moving approval after history."""
+    command = _action(
+        kind="run_command",
+        summary="install package with hidden context",
+        args=["python", "-m", "pip", "install", "example-package==1.2.3"],
+    )
+    app, _, _ = _waiting_app(tmp_path, monkeypatch, [command])
+    task = app.state.local.task
+    assert task is not None
+
+    page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
+    detail = _TaskDetailDom()
+    detail.feed(page.text)
+
+    assert page.status_code == 200
+    assert detail.regions[:3] == ["任务状态", "操作审批", "审计时间线"]
+    assert detail.decision_values == ["reject", "once", "always"]
+    assert detail.raw_status == "waiting_approval"
+    assert detail.visible_status == "等待审批"
+    assert detail.context_title == "任务详情"
+    assert detail.current_navigation_hrefs == ["/tasks/new"]
+    assert detail.event_list_polling_root_id == detail.status_polling_root_id
+
+
 def test_polling_protocol_reloads_running_page_when_latest_event_requires_approval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -401,14 +617,35 @@ def test_polling_protocol_reloads_running_page_when_latest_event_requires_approv
         RunEvent(task_id=task.id, task_status=TaskStatus.WAITING_APPROVAL)
     )
     feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
-    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    harness = _PollingScriptHarness(
+        (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    )
 
     assert running_page.status_code == 200
     assert 'data-current-status="running"' in running_page.text
     assert "ACTION APPROVAL REQUIRED" not in running_page.text
     assert feed.json()[-1]["task_status"] == "waiting_approval"
-    assert "timeline.dataset.currentStatus !== latest.task_status" in script
-    assert "window.location.reload()" in script
+    assert harness.poll(current_status="running", latest_status="waiting_approval") == _PollEffects(
+        ("fetch", "reload")
+    )
+
+
+def test_polling_harness_executes_cleanup_reload_update_and_error_branches() -> None:
+    """Catches broken whole-script wiring or any polling branch with the wrong effects."""
+    harness = _PollingScriptHarness(
+        (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    )
+
+    assert harness.poll(current_status="running", latest_status="completed") == _PollEffects(
+        ("fetch", "clearInterval", "reload")
+    )
+    assert harness.poll(current_status="running", latest_status="running") == _PollEffects(
+        ("fetch", "updateStatus", "replaceChildren"), "运行中"
+    )
+    assert harness.poll(
+        current_status="running", latest_status="running", response_ok=False
+    ) == _PollEffects(("fetch",))
+    assert harness.poll(current_status="running", latest_status=None) == _PollEffects(("fetch",))
 
 
 def test_task_detail_renders_bounded_feedback_node_id_without_raw_output(
@@ -510,7 +747,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
     feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
 
     assert expected_projection in page.text
-    assert f"Project: {root.resolve()}" in page.text
+    assert f"项目：{root.resolve()}" in page.text
     assert unsafe_text not in page.text
     assert unsafe_text not in feed.text
     waiting = feed.json()[-1]
@@ -526,7 +763,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
             "approval.granted",
             "user approved this exact action once",
             True,
-            "approval: granted",
+            "审批：已同意",
             id="once",
         ),
         pytest.param(
@@ -534,7 +771,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
             "approval.granted_always",
             "user approved a constrained persistent command rule",
             True,
-            "approval: granted",
+            "审批：已同意",
             id="always",
         ),
         pytest.param(
@@ -542,7 +779,7 @@ def test_approval_page_projects_only_validated_command_or_path_and_affected_proj
             "approval.declined",
             "user declined the action",
             False,
-            "approval: rejected",
+            "审批：已拒绝",
             id="reject",
         ),
     ],
@@ -599,12 +836,9 @@ def test_waiting_and_resolved_approval_timeline_persists_actual_decision_metadat
     assert expected_reason in page.text
     assert "MODEL-SUMMARY-MUST-STAY-HIDDEN" not in page.text + feed.text
 
-    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
-    assert "approval_granted" in script
-    assert "action_projection" in script
-    assert "affected_project" in script
-    assert "policy_rule_id" in script
-    assert "policy_reason" in script
+    _PollingScriptHarness(
+        (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    )
 
 
 def test_terminal_task_page_does_not_load_polling_script(
@@ -686,7 +920,7 @@ def test_terminal_task_keeps_its_original_event_root_after_reconfiguration(
 
     assert replaced.status_code == 303
     assert detail.status_code == 200
-    assert f"Project: {original_root.resolve()}" in detail.text
+    assert f"项目：{original_root.resolve()}" in detail.text
     assert "delete.approval_required" in detail.text
     assert feed.status_code == 200
     events = feed.json()

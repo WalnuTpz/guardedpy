@@ -15,7 +15,8 @@ from typing import Any, Callable, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import keyring
@@ -111,7 +112,17 @@ _TERMINAL_STATUSES = {
     TaskStatus.INTERRUPTED,
 }
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-_CREDENTIAL_ERROR = "Credential store is unavailable."
+_CREDENTIAL_ERROR = "凭据存储不可用。"
+_SETUP_ERROR = "无法保存设置。"
+_ACTIVE_TASK_ERROR = "已有任务正在运行。"
+_TASK_START_ERROR = "无法启动任务。"
+_TASK_NOT_FOUND_ERROR = "未找到任务。"
+_CREDENTIAL_UPDATE_ERROR = "无法更新凭据。"
+_APPROVAL_STALE_ERROR = "审批请求已失效。"
+_MEMORY_STORE_NOT_FOUND_ERROR = "未找到记忆存储。"
+_MEMORY_NOT_FOUND_ERROR = "未找到记忆。"
+_PROJECT_NOT_FOUND_ERROR = "未找到项目。"
+_COMMAND_RULE_NOT_FOUND_ERROR = "未找到命令规则。"
 
 
 def create_app(mode: str, services: WebServices) -> FastAPI:
@@ -120,6 +131,11 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         raise ValueError("create_app only supports local mode")
 
     app = FastAPI()
+
+    @app.exception_handler(RequestValidationError)
+    async def local_validation_error(_request: Request, _error: RequestValidationError) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": "请求参数无效。"})
+
     app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
     app.state.local = _load_startup_state()
 
@@ -140,6 +156,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             "setup.html",
             {
                 "request": request,
+                "page": "setup",
                 "error": error,
                 "configured": status.configured,
                 "project_root": str(state.project_root) if state.project_root else "",
@@ -177,6 +194,8 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             "task.html",
             {
                 "error": error,
+                "page": "tasks",
+                "context_task": state.task,
                 "configured": state.config is not None,
                 "task": state.task,
                 "tasks": list(state.tasks.values()),
@@ -187,14 +206,14 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     def task_for(task_id: UUID) -> TaskState:
         task = app.state.local.tasks.get(task_id)
         if task is None:
-            raise HTTPException(status_code=404, detail="Task was not found.")
+            raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND_ERROR)
         return task
 
     def task_events(task_id: UUID) -> list[StoredRunEvent]:
         state: _LocalState = app.state.local
         project_root = state.task_roots.get(task_id)
         if project_root is None:
-            raise HTTPException(status_code=404, detail="Task was not found.")
+            raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND_ERROR)
         return EventStore(project_root).events_for(task_id)
 
     @app.get("/", response_class=HTMLResponse)
@@ -212,7 +231,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def setup(request: Request) -> Response:
         state: _LocalState = app.state.local
         if _has_active_task(state):
-            return render_task(request, error="Another task is active.", status_code=409)
+            return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
         form = await request.form()
         status, credential_error = credential_status()
         if credential_error is not None:
@@ -222,11 +241,11 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 form, require_api_key=not status.configured
             )
         except (TypeError, ValueError, ValidationError):
-            return render_setup(request, error="Setup could not be saved.", status_code=422)
+            return render_setup(request, error=_SETUP_ERROR, status_code=422)
 
         async with state.mutation_lock:
             if _has_active_task(state):
-                return render_task(request, error="Another task is active.", status_code=409)
+                return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
             try:
                 memory_store = MemoryStore(project_root)
                 config_path = project_config_path(project_root)
@@ -234,7 +253,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 previous_config = _snapshot_file(config_path)
                 previous_index = _snapshot_file(index_path)
             except Exception:
-                return render_setup(request, error="Setup could not be saved.", status_code=422)
+                return render_setup(request, error=_SETUP_ERROR, status_code=422)
             try:
                 _write_snapshot(project_root, config)
                 _write_local_state(project_root, state.task_roots)
@@ -247,7 +266,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             except Exception:
                 _restore_file(config_path, previous_config)
                 _restore_file(index_path, previous_index)
-                return render_setup(request, error="Setup could not be saved.", status_code=422)
+                return render_setup(request, error=_SETUP_ERROR, status_code=422)
 
             state.project_root = project_root
             state.config = config
@@ -269,16 +288,16 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         try:
             task_mode = TaskMode(str(form.get("mode", "")))
         except ValueError:
-            return render_task(request, error="Task could not be started.", status_code=422)
+            return render_task(request, error=_TASK_START_ERROR, status_code=422)
         if not description:
-            return render_task(request, error="Task could not be started.", status_code=422)
+            return render_task(request, error=_TASK_START_ERROR, status_code=422)
         if task_mode is TaskMode.BUGFIX and not bugfix_target:
-            return render_task(request, error="Task could not be started.", status_code=422)
+            return render_task(request, error=_TASK_START_ERROR, status_code=422)
         async with state.mutation_lock:
             if state.config is None or state.project_root is None or state.memory_store is None:
-                return render_setup(request, error="Setup could not be saved.", status_code=422)
+                return render_setup(request, error=_SETUP_ERROR, status_code=422)
             if _has_active_task(state):
-                return render_task(request, error="Another task is active.", status_code=409)
+                return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
 
             task = TaskState(
                 description=description,
@@ -294,7 +313,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             try:
                 previous_index = _snapshot_file(index_path)
             except Exception:
-                return render_task(request, error="Task could not be started.", status_code=422)
+                return render_task(request, error=_TASK_START_ERROR, status_code=422)
             registered = False
             index_written = False
             try:
@@ -309,13 +328,13 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                     _restore_file(index_path, previous_index)
                 if registered:
                     event_store.discard_task_registration(task.id)
-                return render_task(request, error="Another task is active.", status_code=409)
+                return render_task(request, error=_ACTIVE_TASK_ERROR, status_code=409)
             except Exception:
                 if index_written:
                     _restore_file(index_path, previous_index)
                 if registered:
                     event_store.discard_task_registration(task.id)
-                return render_task(request, error="Task could not be started.", status_code=422)
+                return render_task(request, error=_TASK_START_ERROR, status_code=422)
             state.task = task
             state.orchestrator = orchestrator
             state.tasks[task.id] = task
@@ -348,6 +367,8 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
                 "events": events,
                 "approval_event": approval_event,
                 "terminal": task.status in _TERMINAL_STATUSES,
+                "page": "task_detail",
+                "context_task": task,
             },
         )
 
@@ -362,12 +383,12 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         task = task_for(task_id)
         orchestrator = state.orchestrators.get(task_id)
         if orchestrator is None:
-            raise HTTPException(status_code=404, detail="Task was not found.")
+            raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND_ERROR)
         form = await request.form()
         action_hash = str(form.get("action_hash", ""))
         decision = str(form.get("decision", ""))
         if not is_approval_decision(decision):
-            raise HTTPException(status_code=409, detail="Approval is stale.")
+            raise HTTPException(status_code=409, detail=_APPROVAL_STALE_ERROR)
 
         was_waiting = task.status is TaskStatus.WAITING_APPROVAL
         accepted = orchestrator.resolve_approval(task_id, action_hash, decision=decision)
@@ -378,7 +399,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             return RedirectResponse(f"/tasks/{task_id}", status_code=303)
         if decision == "reject" and was_waiting and task.status is TaskStatus.BLOCKED:
             return RedirectResponse(f"/tasks/{task_id}", status_code=303)
-        raise HTTPException(status_code=409, detail="Approval is stale.")
+        raise HTTPException(status_code=409, detail=_APPROVAL_STALE_ERROR)
 
     @app.post("/tasks/{task_id}/cancel", response_class=HTMLResponse)
     async def cancel_task(task_id: UUID, request: Request) -> Response:
@@ -386,7 +407,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         task = state.tasks.get(task_id)
         orchestrator = state.orchestrators.get(task_id)
         if task is None or orchestrator is None:
-            return render_task(request, error="Task was not found.", status_code=404)
+            return render_task(request, error=_TASK_NOT_FOUND_ERROR, status_code=404)
         cancelled = orchestrator.cancel(task_id)
         state.tasks[task_id] = cancelled
         if state.task is not None and state.task.id == task_id:
@@ -397,33 +418,37 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def memories(request: Request) -> HTMLResponse:
         memory_store = app.state.local.memory_store
         if memory_store is None:
-            raise HTTPException(status_code=404, detail="Memory store was not found.")
+            raise HTTPException(status_code=404, detail=_MEMORY_STORE_NOT_FOUND_ERROR)
         return _TEMPLATES.TemplateResponse(
             request,
             "memory.html",
-            {"proposals": memory_store.proposals(), "approved": memory_store.approved()},
+            {
+                "proposals": memory_store.proposals(),
+                "approved": memory_store.approved(),
+                "page": "memories",
+            },
         )
 
     @app.post("/memories/{memory_id}/approve", response_class=HTMLResponse)
     async def approve_memory(memory_id: UUID) -> Response:
         memory_store = app.state.local.memory_store
         if memory_store is None:
-            raise HTTPException(status_code=404, detail="Memory was not found.")
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR)
         try:
             memory_store.approve(memory_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Memory was not found.") from None
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR) from None
         return RedirectResponse("/memories", status_code=303)
 
     @app.post("/memories/{memory_id}/delete", response_class=HTMLResponse)
     async def delete_memory(memory_id: UUID) -> Response:
         memory_store = app.state.local.memory_store
         if memory_store is None:
-            raise HTTPException(status_code=404, detail="Memory was not found.")
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR)
         try:
             memory_store.delete(memory_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Memory was not found.") from None
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR) from None
         return RedirectResponse("/memories", status_code=303)
 
     @app.get("/settings/credentials", response_class=HTMLResponse)
@@ -436,7 +461,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         api_key = str(form.get("api_key", ""))
         if not api_key.strip():
             return render_credentials(
-                request, error="Credential could not be updated.", status_code=422
+                request, error=_CREDENTIAL_UPDATE_ERROR, status_code=422
             )
         try:
             services.credentials.set_key(api_key)
@@ -456,7 +481,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def command_rules(request: Request) -> HTMLResponse:
         project_root = app.state.local.project_root
         if project_root is None:
-            raise HTTPException(status_code=404, detail="Project was not found.")
+            raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_ERROR)
         rules = [
             (rule, _command_rule_projection(rule))
             for rule in CommandRuleStore(project_root).list_rules()
@@ -464,16 +489,16 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         return _TEMPLATES.TemplateResponse(
             request,
             "command_rules.html",
-            {"rules": rules},
+            {"rules": rules, "page": "command_rules"},
         )
 
     @app.post("/settings/command-rules/{rule_id}/delete", response_class=HTMLResponse)
     async def delete_command_rule(rule_id: str) -> Response:
         project_root = app.state.local.project_root
         if project_root is None:
-            raise HTTPException(status_code=404, detail="Project was not found.")
+            raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_ERROR)
         if not CommandRuleStore(project_root).delete(rule_id):
-            raise HTTPException(status_code=404, detail="Command rule was not found.")
+            raise HTTPException(status_code=404, detail=_COMMAND_RULE_NOT_FOUND_ERROR)
         return RedirectResponse("/settings/command-rules", status_code=303)
 
     return app

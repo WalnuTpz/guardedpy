@@ -32,7 +32,7 @@ Run the isolated mechanism demo with:
 guardedpy demo
 ```
 
-Demo mode is a distinct FastAPI factory with three fixed, offline mock-LLM scenarios: dangerous-action denial, failure-feedback correction, and TDD source-patch denial. It exposes neither target-project setup, keyring access, a real provider, arbitrary tasks, approvals, nor persistent state.
+Demo mode is a distinct FastAPI factory with a Chinese, independent `只读演示` header and exactly three fixed scenario links: `dangerous_action_denied`, `failure_feedback_corrects`, and `tdd_source_patch_denied`. They are offline mock-LLM mechanism evidence only. The demo exposes neither target-project setup, keyring access, a real provider, arbitrary tasks, approvals, API documentation, nor persistent state.
 
 ## Keyring lifecycle
 
@@ -49,10 +49,11 @@ All verification commands are local and use no real LLM or key:
 ```bash
 make test
 make demo
+make demo-assets
 make build
 ```
 
-`make test` runs the offline pytest suite. `make demo` executes the three literal demo scenarios and exits nonzero if their statuses differ from the expected deterministic result. `make build` runs `python -m build --no-isolation` to create a wheel and sdist in `dist/`.
+`make test` runs the offline pytest suite. `make demo` executes the three literal demo scenarios and exits nonzero if their statuses differ from the expected deterministic result. `make demo-assets` verifies the rendered public demo surface, its fixed route boundary, and its shared responsive CSS contracts. `make build` runs `python -m build --no-isolation` to create a wheel and sdist in `dist/`.
 
 ## Directory structure
 
@@ -102,7 +103,7 @@ The [GitHub Actions workflow](.github/workflows/ci.yml) and [.gitlab-ci.yml](.gi
 
 ## Open Design attribution
 
-The local templates and CSS were handwritten to follow the selected [Open Design Agentic direction](https://open-design.ai/plugins/design-system-agentic/): clear task outcomes, restrained controls, semantic status badges, and readable local-console surfaces. The repository has no recorded Open Design project-generation or `web-design-guidelines` review run, so it does not claim that an Open Design tool generated or approved this WebUI. GuardedPy does not bundle Open Design assets. See the [Open Design project](https://open-design.ai/) for its local-first, BYOK design workflow and licensing information.
+Task 13 used the Neutral Modern `default` system in the real Open Design project `guardedpy-frontend-rebuild`; it supersedes the earlier Agentic-direction exploration recorded in `AGENT_LOG.md`. The recorded `frontend-design` run is `73bf9eed-b6f4-4edc-bf6d-caf5a54c54ea`; the final `web-design-guidelines` correction run is `db7ff169-63b4-4cbe-8c44-983908284248`. The generated reference bundle and run metadata are preserved in [docs/open-design/frontend-rebuild](docs/open-design/frontend-rebuild/README.md). Runtime templates, CSS, and JavaScript remain handwritten Jinja2/plain-web assets that preserve GuardedPy’s existing backend contracts; Open Design assets are not bundled in the package.
 
 ## Third-party software and licenses
 
@@ -116,9 +117,9 @@ GuardedPy imports installed third-party distributions; it does not copy their so
 | Runtime | Pydantic | MIT |
 | Runtime | keyring | MIT |
 | Runtime | OpenAI Python SDK | Apache-2.0 |
+| Runtime | pytest | MIT |
 | Runtime | Uvicorn | BSD-3-Clause |
 | Runtime | PyYAML | MIT |
-| Development | pytest | MIT |
 | Development | HTTPX | BSD-3-Clause |
 | Development/build frontend | build | MIT |
 | Build backend | setuptools | MIT |

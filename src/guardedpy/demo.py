@@ -75,7 +75,7 @@ def create_demo_app() -> FastAPI:
         try:
             result = run_scenario(name)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Demo scenario was not found.") from None
+            raise HTTPException(status_code=404, detail="未找到演示场景。") from None
         return _result_payload(result)
 
     return app

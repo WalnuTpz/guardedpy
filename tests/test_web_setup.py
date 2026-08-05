@@ -116,6 +116,7 @@ class _NavigationDom(HTMLParser):
         super().__init__()
         self._inside_navigation = 0
         self.navigation_hrefs: list[str] = []
+        self.current_hrefs: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
@@ -123,6 +124,8 @@ class _NavigationDom(HTMLParser):
             self._inside_navigation += 1
         if tag == "a" and self._inside_navigation and attributes.get("href"):
             self.navigation_hrefs.append(attributes["href"])
+            if attributes.get("aria-current") == "page":
+                self.current_hrefs.append(attributes["href"])
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "nav":
@@ -210,6 +213,7 @@ def test_narrow_layout_keeps_all_navigation_destinations_as_real_links(tmp_path:
         "/settings/command-rules",
         "/settings/credentials",
     ]
+    assert navigation.current_hrefs == ["/tasks/new"]
     assert _media_hides_navigation("@media (max-width: 36rem) { nav { display: none; } }")
     assert _media_hides_navigation("@media(max-width:36rem){ header > nav, .topbar { display : none !important } }")
     assert not _media_hides_navigation(stylesheet)
@@ -348,7 +352,7 @@ def test_missing_or_malformed_startup_state_fails_closed_to_setup(
     response = asyncio.run(_request(app, "GET", "/"))
 
     assert response.status_code == 200
-    assert "Connect one project" in response.text
+    assert "连接一个项目" in response.text
     assert "broken" not in response.text
     assert "leaked" not in response.text
     assert app.state.local.config is None
@@ -391,7 +395,7 @@ def test_invalid_restored_harness_config_fails_closed_to_setup(
     response = asyncio.run(_request(app, "GET", "/"))
 
     assert response.status_code == 200
-    assert "Connect one project" in response.text
+    assert "连接一个项目" in response.text
     assert app.state.local.config is None
     assert factory_calls == []
 
@@ -530,7 +534,7 @@ def test_credential_update_clear_and_unavailable_backend_do_not_echo_key(tmp_pat
     assert unavailable_update.status_code == 503
     assert unavailable_clear.status_code == 503
     body = unavailable_page.text + unavailable_update.text + unavailable_clear.text
-    assert body.count("Credential store is unavailable.") == 3
+    assert body.count("凭据存储不可用。") == 3
     assert "never-echo-this" not in body
     assert "leaked-secret" not in body
 
@@ -554,7 +558,7 @@ def test_invalid_setup_has_one_generic_error_and_no_side_effect(tmp_path: Path, 
     response = asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root, **overrides)))
 
     assert response.status_code == 422
-    assert response.text.count("Setup could not be saved.") == 1
+    assert response.text.count("无法保存设置。") == 1
     assert credentials.set_calls == []
     assert not project_config_path(root).exists()
     assert not local_state_path().exists()
@@ -573,7 +577,7 @@ def test_snapshot_write_failure_does_not_store_the_submitted_key(tmp_path: Path)
     response = asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root)))
 
     assert response.status_code == 422
-    assert response.text.count("Setup could not be saved.") == 1
+    assert response.text.count("无法保存设置。") == 1
     assert credentials.set_calls == []
 
 
@@ -599,7 +603,7 @@ def test_setup_keyring_failure_restores_the_previous_snapshot_and_uses_safe_erro
     )
 
     assert response.status_code == 503
-    assert response.text.count("Credential store is unavailable.") == 1
+    assert response.text.count("凭据存储不可用。") == 1
     assert "never-render-this-key" not in response.text
     assert "backend rejected" not in response.text
     if existing_snapshot is None:
@@ -623,8 +627,8 @@ def test_unexpected_setup_key_failure_is_not_misreported_as_keyring_unavailable(
     )
 
     assert response.status_code == 422
-    assert response.text.count("Setup could not be saved.") == 1
-    assert "Credential store is unavailable." not in response.text
+    assert response.text.count("无法保存设置。") == 1
+    assert "凭据存储不可用。" not in response.text
     assert "hidden-key" not in response.text
     assert snapshot.read_bytes() == b"keep this exact snapshot\n"
 

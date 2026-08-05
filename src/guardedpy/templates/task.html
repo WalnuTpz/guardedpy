@@ -1,30 +1,55 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="card">
-  <p class="eyebrow">GOVERNED TASK</p>
-  <h1>Start a task</h1>
+{% set status_labels = {'pending': '待处理', 'running': '运行中', 'waiting_approval': '等待审批', 'completed': '已完成', 'blocked': '已阻止', 'cancelled': '已取消', 'interrupted': '已中断'} %}
+<section class="card" aria-label="当前任务" data-od-id="task-current">
+  <p class="eyebrow">受治理任务</p>
+  <h1>当前任务</h1>
   {% if error %}<p class="notice notice-error" role="alert">{{ error }}</p>{% endif %}
-  {% if task %}<p>Current task: <span class="badge {% if task.status in ['completed', 'cancelled'] %}badge-green{% elif task.status == 'blocked' %}badge-red{% else %}badge-amber{% endif %}">{{ task.status }}</span></p>{% endif %}
-  <form method="post" action="/tasks" class="form-grid">
-    <label>Task mode
-      <select name="mode"><option value="feature">Feature</option><option value="bugfix">Bugfix</option></select>
-    </label>
-    <label>Task description <textarea name="description" required></textarea></label>
-    <label>Bugfix target <input name="bugfix_target" placeholder="tests/test_file.py::test_name"></label>
-    <button type="submit">Submit governed task</button>
-  </form>
-  {% if task and task.status in ['pending', 'running', 'waiting_approval'] %}
-  <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="secondary" type="submit">Cancel current task</button></form>
+  {% if task %}
+  <p>{{ task.description }}</p>
+  <p>状态：<span class="badge" data-status="{{ task.status }}">{{ status_labels.get(task.status, task.status) }}</span></p>
+  <p><a class="task-link" href="/tasks/{{ task.id }}">查看任务详情</a></p>
+  {% if task.status in ['pending', 'running', 'waiting_approval'] %}
+  <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="btn-secondary" type="submit">取消当前任务</button></form>
   {% endif %}
+  {% else %}<p class="muted">当前没有正在处理的任务。</p>{% endif %}
 </section>
-{% if tasks %}
-<section class="card">
-  <h2>Known tasks</h2>
-  <ul>
+<section class="card" aria-label="新建任务" data-od-id="task-create">
+  <p class="eyebrow">新建任务</p>
+  <h2>提交受治理任务</h2>
+  <form method="post" action="/tasks" class="form-grid">
+    <label>任务模式
+      <select name="mode" data-task-mode><option value="feature">功能开发</option><option value="bugfix">缺陷修复</option></select>
+    </label>
+    <label>任务描述 <textarea name="description" required></textarea></label>
+    <label data-feature-copy="功能开发不需要缺陷测试目标。" data-bugfix-copy="缺陷修复必须填写唯一的 pytest 测试目标。">
+      <span data-bugfix-target-copy>功能开发不需要缺陷测试目标。</span>
+      <input class="mono" name="bugfix_target" placeholder="tests/test_file.py::test_name" autocomplete="off">
+    </label>
+    <div class="form-actions"><button class="btn-primary" type="submit">提交任务</button></div>
+  </form>
+</section>
+<section class="card" aria-label="任务历史" data-od-id="task-history">
+  <h2>任务历史</h2>
+  {% if tasks %}<ul class="task-list">
     {% for known_task in tasks %}
-    <li><a href="/tasks/{{ known_task.id }}">{{ known_task.description }}</a> <span class="badge">{{ known_task.status }}</span></li>
+    <li><a class="task-link" href="/tasks/{{ known_task.id }}">{{ known_task.description }}</a><span class="badge" data-status="{{ known_task.status }}">{{ status_labels.get(known_task.status, known_task.status) }}</span></li>
     {% endfor %}
-  </ul>
+  </ul>{% else %}<p class="muted">尚无任务历史。</p>{% endif %}
 </section>
-{% endif %}
+<script>
+  (() => {
+    const mode = document.querySelector("[data-task-mode]");
+    const copy = document.querySelector("[data-bugfix-target-copy]");
+    const target = document.querySelector("[name=bugfix_target]");
+    if (!mode || !copy || !target) return;
+    const updateBugfixTarget = () => {
+      const isBugfix = mode.value === "bugfix";
+      copy.textContent = isBugfix ? copy.parentElement.dataset.bugfixCopy : copy.parentElement.dataset.featureCopy;
+      target.required = isBugfix;
+    };
+    mode.addEventListener("change", updateBugfixTarget);
+    updateBugfixTarget();
+  })();
+</script>
 {% endblock %}
