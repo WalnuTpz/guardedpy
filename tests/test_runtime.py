@@ -9,6 +9,7 @@ from threading import Event, Thread
 import pytest
 from pydantic import ValidationError
 
+import guardedpy.runtime as runtime_module
 from guardedpy.actions import RunCommandAction
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
@@ -273,6 +274,71 @@ def test_setup_releases_its_project_lease_when_global_state_is_busy(tmp_path: Pa
 
     global_lease.release()
     second.setup(tmp_path, _config(), api_key=None)
+
+
+@dataclass
+class FailingSubmitOrchestrator:
+    def submit(self, task: TaskState) -> TaskState:
+        del task
+        raise RuntimeError("submit failed")
+
+    def run(self, task: TaskState) -> TaskState:
+        return task
+
+    def cancel(self, task_id: object) -> TaskState:
+        raise AssertionError(task_id)
+
+    def resolve_approval(self, task_id: object, action_hash: str, *, decision: str) -> bool:
+        del task_id, action_hash, decision
+        return False
+
+
+def test_failing_submit_keeps_global_index_locked_until_rollback_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_root = _project_root(tmp_path, "first")
+    second_root = _project_root(tmp_path, "second")
+    first = LocalRuntime(
+        RuntimeServices(
+            credentials=FakeCredentials(),
+            orchestrator_factory=lambda root, config, memory: FailingSubmitOrchestrator(),
+        )
+    )
+    second = _runtime(second_root, [[], []])
+    first.setup(first_root, _config(), api_key=None)
+    second.setup(second_root, _config(), api_key=None)
+    restore_started = Event()
+    allow_restore = Event()
+    original_restore = runtime_module._restore_file
+    errors: list[RuntimeError] = []
+
+    def blocked_restore(path: Path, content: bytes | None) -> None:
+        if path == runtime_module.local_state_path():
+            restore_started.set()
+            assert allow_restore.wait(1)
+        original_restore(path, content)
+
+    def create_failing_task() -> None:
+        try:
+            first.create_task("fail", TaskMode.FEATURE, None)
+        except RuntimeError as error:
+            errors.append(error)
+
+    monkeypatch.setattr(runtime_module, "_restore_file", blocked_restore)
+    failing_thread = Thread(target=create_failing_task)
+    failing_thread.start()
+    assert restore_started.wait(1)
+    try:
+        with pytest.raises(RuntimeBusyError):
+            second.create_task("interleaved", TaskMode.FEATURE, None)
+    finally:
+        allow_restore.set()
+        failing_thread.join()
+
+    assert errors and str(errors[0]) == "submit failed"
+    second_task = second.create_task("after rollback", TaskMode.FEATURE, None)
+    reader = _runtime(second_root)
+    assert [task.id for task in reader.tasks()] == [second_task.id]
 
 
 @dataclass

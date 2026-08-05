@@ -181,18 +181,15 @@ class LocalRuntime:
             event_store = EventStore(root)
             orchestrator = self._services.orchestrator_factory(root, config, memory_store)
             global_lease = self._acquire_global_state_lease()
-            try:
-                index_path = local_state_path()
-                previous_index = _snapshot_file(index_path)
-                task_roots = _read_local_state()[1] if index_path.exists() else {}
-                event_store.register_task(task)
-                registered = True
-                task_roots[task.id] = root
-                _write_local_state(root, task_roots)
-                index_written = True
-                orchestrator.submit(task)
-            finally:
-                global_lease.release()
+            index_path = local_state_path()
+            previous_index = _snapshot_file(index_path)
+            task_roots = _read_local_state()[1] if index_path.exists() else {}
+            event_store.register_task(task)
+            registered = True
+            task_roots[task.id] = root
+            _write_local_state(root, task_roots)
+            index_written = True
+            orchestrator.submit(task)
         except Exception:
             if index_written:
                 _restore_file(index_path, previous_index)
@@ -200,6 +197,9 @@ class LocalRuntime:
                 event_store.discard_task_registration(task.id)
             self._release_lease()
             raise
+        finally:
+            if global_lease is not None:
+                global_lease.release()
         self._tasks[task.id] = task
         self._orchestrators[task.id] = orchestrator
         self._task_roots = task_roots
