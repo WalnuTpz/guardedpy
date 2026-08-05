@@ -139,7 +139,7 @@ class PolicyEngine:
         self._current_branch_provider = current_branch_provider or (lambda: None)
         self._command_rules = command_rules or CommandRuleStore(self._project_root)
         self._read_paths: dict[UUID, set[str]] = {}
-        self._feature_test_changes: set[UUID] = set()
+        self._changed_test_paths: dict[UUID, set[str]] = {}
         self._new_test_paths: dict[UUID, set[str]] = {}
         self._baseline_recorded: set[UUID] = set()
         self._full_suite_green: set[UUID] = set()
@@ -191,7 +191,7 @@ class PolicyEngine:
         category = self._path_category(task, normalized_paths[0])
         self._full_suite_green.discard(task.id)
         if category == "test":
-            self._feature_test_changes.add(task.id)
+            self._changed_test_paths.setdefault(task.id, set()).update(normalized_paths)
         else:
             task.tdd_phase = TddPhase.IMPLEMENTATION
         self._invalidate_reads(task, normalized_paths)
@@ -237,21 +237,21 @@ class PolicyEngine:
         if feedback.kind is FeedbackKind.ASSERTION_FAILURE:
             if task.tdd_phase is not TddPhase.TEST_DESIGN:
                 return self._deny(task, None, "tdd.red_out_of_sequence", "red result is out of sequence")
-            if task.mode is TaskMode.FEATURE and task.id not in self._feature_test_changes:
+            if task.mode is TaskMode.FEATURE and not self._changed_test_paths.get(task.id):
                 return self._deny(
                     task,
                     None,
                     "tdd.test_change_required",
                     "a feature task must change a test before observing red",
                 )
-            if task.mode is TaskMode.FEATURE and not self._feature_red_matches_created_test(
+            if task.mode is TaskMode.FEATURE and not self._feature_red_matches_changed_test(
                 task, action, feedback
             ):
                 return self._deny(
                     task,
                     None,
-                    "tdd.created_test_required",
-                    "a feature red result must target its successfully created test",
+                    "tdd.changed_test_required",
+                    "a feature red result must target its successfully changed test",
                 )
             if task.mode is TaskMode.BUGFIX and (
                 action.targets
@@ -642,10 +642,10 @@ class PolicyEngine:
                 return self._deny(task, action, "pytest.target_not_test", "pytest target must be in a test directory")
         return self._allow(task, action, "pytest.allowed", "restricted pytest is allowed")
 
-    def _feature_red_matches_created_test(
+    def _feature_red_matches_changed_test(
         self, task: TaskState, action: RunPytestAction, feedback: PytestFeedback
     ) -> bool:
-        created_paths = self._new_test_paths.get(task.id, set())
+        changed_paths = self._changed_test_paths.get(task.id, set())
         target_paths = tuple(
             self._normalized_project_path(target.split("::", maxsplit=1)[0])
             for target in action.targets
@@ -655,7 +655,7 @@ class PolicyEngine:
             for node_id in feedback.node_ids
         )
         return bool(target_paths and node_paths) and all(
-            path in created_paths for path in target_paths
+            path in changed_paths for path in target_paths
         ) and all(path in target_paths for path in node_paths)
 
     def _path_category(self, task: TaskState, path: str) -> str:

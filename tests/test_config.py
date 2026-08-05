@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+import yaml
 
 from guardedpy.config import (
     HarnessConfig,
@@ -56,6 +57,46 @@ def test_load_config_returns_relative_directory_configuration(tmp_path: Path) ->
     assert config.source_dirs == (Path("src"),)
     assert config.test_dirs == (Path("tests"),)
     assert config.pytest_command == ("pytest", "-q")
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {"source_dirs": [], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
+        {"source_dirs": ["src"], "test_dirs": [], "pytest_command": ["pytest"]},
+        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": []},
+        {"source_dirs": ["."], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
+        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest", " "]},
+        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest"], "model": "  "},
+    ],
+)
+def test_load_config_rejects_empty_required_values(tmp_path: Path, snapshot: dict[str, object]) -> None:
+    """Catches restored configuration accepting an empty required value."""
+    config_file = tmp_path / "harness.yaml"
+    config_file.write_text(yaml.safe_dump(snapshot))
+
+    with pytest.raises(ValidationError):
+        load_config(config_file, tmp_path)
+
+
+def test_load_config_normalizes_command_tokens_and_model(tmp_path: Path) -> None:
+    """Catches persisted command/model whitespace becoming part of the runtime configuration."""
+    config_file = tmp_path / "harness.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "source_dirs": ["src"],
+                "test_dirs": ["tests"],
+                "pytest_command": [" pytest ", " -q "],
+                "model": " deepseek-chat ",
+            }
+        )
+    )
+
+    config = load_config(config_file, tmp_path)
+
+    assert config.pytest_command == ("pytest", "-q")
+    assert config.model == "deepseek-chat"
 
 
 def test_app_state_dir_is_outside_project_and_root_isolated(

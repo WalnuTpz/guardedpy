@@ -355,6 +355,47 @@ def test_missing_or_malformed_startup_state_fails_closed_to_setup(
     assert factory_calls == []
 
 
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {"source_dirs": [], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
+        {"source_dirs": ["src"], "test_dirs": [], "pytest_command": ["pytest"]},
+        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": []},
+        {"source_dirs": ["."], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
+        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest", " "]},
+        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest"], "model": "  "},
+    ],
+)
+def test_invalid_restored_harness_config_fails_closed_to_setup(
+    tmp_path: Path, snapshot: dict[str, object]
+) -> None:
+    """Catches an invalid external harness snapshot becoming active at fresh startup."""
+    root = _project_root(tmp_path)
+    local_state = local_state_path()
+    local_state.parent.mkdir(parents=True)
+    local_state.write_text(yaml.safe_dump({"selected_project": str(root.resolve()), "task_roots": {}}))
+    config_path = project_config_path(root)
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(snapshot))
+    factory_calls: list[Path] = []
+    web = _web_module()
+
+    app = web.create_app(
+        "local",
+        web.WebServices(
+            credentials=FakeCredentials(configured=True),
+            orchestrator_factory=lambda root, config, memory: factory_calls.append(root),
+        ),
+    )
+
+    response = asyncio.run(_request(app, "GET", "/"))
+
+    assert response.status_code == 200
+    assert "Connect one project" in response.text
+    assert app.state.local.config is None
+    assert factory_calls == []
+
+
 def test_all_task_active_gate_and_old_task_controls_use_uuid_indexed_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -262,7 +262,7 @@ def test_feature_task_records_red_only_after_a_test_patch(
     assert feature_task.tdd_phase is TddPhase.RED_OBSERVED
 
 
-def test_feature_red_requires_registered_created_test_target_and_feedback(
+def test_feature_red_requires_registered_changed_test_target_and_feedback(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
     """Catches an unrelated assertion failure unlocking a new source file."""
@@ -284,7 +284,7 @@ def test_feature_red_requires_registered_created_test_target_and_feedback(
 
     assert (unrelated.verdict, unrelated.rule_id) == (
         PolicyVerdict.DENY,
-        "tdd.created_test_required",
+        "tdd.changed_test_required",
     )
     assert policy.decide(feature_task, source).rule_id == "tdd.red_required"
 
@@ -302,7 +302,7 @@ def test_feature_red_requires_registered_created_test_target_and_feedback(
     assert policy.decide(feature_task, source).verdict is PolicyVerdict.ALLOW
 
 
-def test_feature_red_feedback_must_match_its_own_created_test_target(
+def test_feature_red_feedback_must_match_its_own_changed_test_target(
     policy: PolicyEngine, feature_task: TaskState
 ) -> None:
     """Catches feedback from a second created test unlocking the first test's run."""
@@ -330,7 +330,7 @@ def test_feature_red_feedback_must_match_its_own_created_test_target(
 
     assert (crossed.verdict, crossed.rule_id) == (
         PolicyVerdict.DENY,
-        "tdd.created_test_required",
+        "tdd.changed_test_required",
     )
     assert policy.decide(feature_task, source).rule_id == "tdd.red_required"
     matching = policy.record_pytest(
@@ -344,6 +344,66 @@ def test_feature_red_feedback_must_match_its_own_created_test_target(
     )
     assert matching.verdict is PolicyVerdict.ALLOW
     assert policy.decide(feature_task, source).verdict is PolicyVerdict.ALLOW
+
+
+def test_feature_red_from_modified_existing_test_unlocks_source_patch(
+    policy: PolicyEngine, feature_task: TaskState
+) -> None:
+    """Catches feature RED evidence being restricted to newly created tests."""
+    _record_passing_baseline(policy, feature_task)
+    changed_test = ApplyPatchAction(kind="apply_patch", summary="change test", diff=TEST_DIFF)
+    source = ApplyPatchAction(kind="apply_patch", summary="change source", diff=SOURCE_DIFF)
+    policy.record_read(
+        feature_task,
+        ReadFileAction(kind="read_file", summary="read test", path="tests/test_example.py"),
+    )
+    policy.record_read(
+        feature_task,
+        ReadFileAction(kind="read_file", summary="read source", path="src/example.py"),
+    )
+
+    assert policy.record_patch(feature_task, changed_test).verdict is PolicyVerdict.ALLOW
+    matching = policy.record_pytest(
+        feature_task,
+        RunPytestAction(
+            kind="run_pytest", summary="run changed test", targets=("tests/test_example.py",)
+        ),
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_example.py::test_after",),
+            "assert actual == expected",
+        ),
+    )
+
+    assert matching.verdict is PolicyVerdict.ALLOW
+    assert feature_task.tdd_phase is TddPhase.RED_OBSERVED
+    assert policy.decide(feature_task, source).verdict is PolicyVerdict.ALLOW
+
+    unrelated_task = TaskState(
+        description="Reject unrelated feature red",
+        mode=TaskMode.FEATURE,
+        config=feature_task.config,
+    )
+    _record_passing_baseline(policy, unrelated_task)
+    policy.record_read(
+        unrelated_task,
+        ReadFileAction(kind="read_file", summary="read test", path="tests/test_example.py"),
+    )
+    assert policy.record_patch(unrelated_task, changed_test).verdict is PolicyVerdict.ALLOW
+    unrelated = policy.record_pytest(
+        unrelated_task,
+        RunPytestAction(
+            kind="run_pytest", summary="run changed test", targets=("tests/test_example.py",)
+        ),
+        PytestFeedback(
+            FeedbackKind.ASSERTION_FAILURE,
+            ("tests/test_other.py::test_other",),
+            "assert actual == expected",
+        ),
+    )
+
+    assert unrelated.verdict is PolicyVerdict.DENY
+    assert unrelated_task.tdd_phase is TddPhase.TEST_DESIGN
 
 
 def test_bugfix_only_selected_assertion_failure_records_red(
