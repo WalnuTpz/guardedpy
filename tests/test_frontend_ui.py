@@ -586,6 +586,25 @@ def test_all_local_webui_http_exception_routes_return_chinese_details(
         assert response.json() == {"detail": detail}
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/tasks/not-a-uuid"),
+        ("GET", "/tasks/not-a-uuid/events"),
+        ("POST", "/tasks/not-a-uuid/approval"),
+        ("POST", "/tasks/not-a-uuid/cancel"),
+        ("POST", "/memories/not-a-uuid/approve"),
+        ("POST", "/memories/not-a-uuid/delete"),
+    ],
+)
+def test_invalid_uuid_routes_return_a_chinese_validation_error(method: str, path: str) -> None:
+    """Catches FastAPI's default English UUID parser message leaking through local routes."""
+    response = asyncio.run(_request(_app(), method, path))
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "请求参数无效。"}
+
+
 def test_memory_review_uses_chinese_pending_and_approved_regions(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

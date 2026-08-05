@@ -15,7 +15,8 @@ from typing import Any, Callable, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import keyring
@@ -130,6 +131,11 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         raise ValueError("create_app only supports local mode")
 
     app = FastAPI()
+
+    @app.exception_handler(RequestValidationError)
+    async def local_validation_error(_request: Request, _error: RequestValidationError) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": "请求参数无效。"})
+
     app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
     app.state.local = _load_startup_state()
 

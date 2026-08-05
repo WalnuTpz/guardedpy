@@ -117,9 +117,9 @@ GuardedPy imports installed third-party distributions; it does not copy their so
 | Runtime | Pydantic | MIT |
 | Runtime | keyring | MIT |
 | Runtime | OpenAI Python SDK | Apache-2.0 |
+| Runtime | pytest | MIT |
 | Runtime | Uvicorn | BSD-3-Clause |
 | Runtime | PyYAML | MIT |
-| Development | pytest | MIT |
 | Development | HTTPX | BSD-3-Clause |
 | Development/build frontend | build | MIT |
 | Build backend | setuptools | MIT |

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import sys
 import tomllib
+import zipfile
 
 import pytest
 import yaml
@@ -27,6 +29,33 @@ def test_package_metadata_declares_web_console_entrypoint_and_ui_assets() -> Non
         "static/*.css",
         "static/*.js",
     ]
+
+
+def test_distribution_wheel_includes_pytest_required_by_the_public_demo(tmp_path: Path) -> None:
+    """Catches a standard wheel install whose fixed demo cannot run its pytest fixture."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    wheel = next(tmp_path.glob("guardedpy-*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        metadata = archive.read(metadata_name).decode()
+
+    assert "Requires-Dist: pytest\n" in metadata
 
 
 def test_delivery_automation_runs_the_same_offline_test_demo_and_build_contract() -> None:
