@@ -24,6 +24,10 @@ class CredentialBackendUnavailableError(RuntimeError):
     """Raised when the operating-system keyring cannot be used."""
 
 
+class CredentialNotConfiguredError(RuntimeError):
+    """Raised when a provider requests a credential that has not been stored."""
+
+
 @dataclass(frozen=True, slots=True)
 class CredentialStatus:
     configured: bool
@@ -41,6 +45,16 @@ class CredentialService:
         except KeyringError as error:
             raise CredentialBackendUnavailableError("keyring backend is unavailable") from error
         return CredentialStatus(configured=configured)
+
+    def get_key(self) -> str:
+        """Return the configured key to the provider adapter, never a fallback value."""
+        try:
+            key = self._keyring.get_password(_SERVICE_NAME, _USERNAME)
+        except KeyringError as error:
+            raise CredentialBackendUnavailableError("keyring backend is unavailable") from error
+        if key is None:
+            raise CredentialNotConfiguredError("credential is not configured")
+        return key
 
     def set_key(self, key: str) -> None:
         try:

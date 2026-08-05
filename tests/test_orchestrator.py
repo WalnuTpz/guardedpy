@@ -34,6 +34,21 @@ def _bugfix_task() -> TaskState:
     return TaskState(description="Repair the selected failure", mode=TaskMode.BUGFIX, config=_config())
 
 
+def test_submit_registers_a_pending_task_before_its_background_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches WebUI admission bypassing the core's one-active-task registry."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    task = _bugfix_task()
+    orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([]))
+
+    submitted = orchestrator.submit(task)
+
+    assert submitted is task
+    with pytest.raises(ValueError, match="another task is already active"):
+        orchestrator.submit(_bugfix_task())
+
+
 def test_scripted_loop_returns_failure_feedback_then_corrects_and_completes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

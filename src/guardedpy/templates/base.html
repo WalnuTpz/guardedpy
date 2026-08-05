@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GuardedPy · Local Harness</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">GuardedPy <span>LOCAL</span></a>
+      <nav aria-label="Primary navigation">
+        <a href="/">Setup</a>
+        <a href="/tasks/new">Tasks</a>
+        <a href="/memories">Memory</a>
+        <a href="/settings/credentials">Credentials</a>
+      </nav>
+      <span class="narrow-menu" aria-label="Menu">Menu: Setup · Tasks · Memory · Credentials</span>
+    </header>
+    <main class="canvas">
+      {% if page == 'credentials' %}
+      <section class="card">
+        <p class="eyebrow">LOCAL CREDENTIAL STORE</p>
+        <h1>Credentials</h1>
+        <p>DeepSeek credential status: {% if configured %}<span class="badge badge-green">Configured</span>{% else %}<span class="badge badge-amber">Not configured</span>{% endif %}</p>
+        <p class="muted">Keys are stored only in your operating-system keyring and are never displayed here.</p>
+      </section>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>
