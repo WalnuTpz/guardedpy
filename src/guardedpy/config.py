@@ -21,11 +21,20 @@ class HarnessConfig(BaseModel):
     model: str = "deepseek-chat"
     timeout_seconds: int = Field(default=30, ge=5, le=120)
 
+    @field_validator("source_dirs", "test_dirs", mode="before")
+    @classmethod
+    def path_tokens_are_not_blank(cls, paths: object) -> object:
+        if isinstance(paths, (list, tuple)) and any(
+            isinstance(path, str) and not path.strip() for path in paths
+        ):
+            raise ValueError("configured path tokens must be non-empty")
+        return paths
+
     @field_validator("source_dirs", "test_dirs")
     @classmethod
     def paths_stay_inside_project_root(cls, paths: tuple[Path, ...]) -> tuple[Path, ...]:
         for path in paths:
-            if path == Path(".") or path.is_absolute() or ".." in path.parts:
+            if path.is_absolute() or ".." in path.parts:
                 raise ValueError("configured paths must stay inside the project root")
         return paths
 

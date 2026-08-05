@@ -65,7 +65,7 @@ def test_load_config_returns_relative_directory_configuration(tmp_path: Path) ->
         {"source_dirs": [], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
         {"source_dirs": ["src"], "test_dirs": [], "pytest_command": ["pytest"]},
         {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": []},
-        {"source_dirs": ["."], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
+        {"source_dirs": [""], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
         {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest", " "]},
         {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest"], "model": "  "},
     ],

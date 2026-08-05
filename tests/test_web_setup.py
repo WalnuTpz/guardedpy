@@ -361,7 +361,7 @@ def test_missing_or_malformed_startup_state_fails_closed_to_setup(
         {"source_dirs": [], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
         {"source_dirs": ["src"], "test_dirs": [], "pytest_command": ["pytest"]},
         {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": []},
-        {"source_dirs": ["."], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
+        {"source_dirs": [""], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
         {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest", " "]},
         {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest"], "model": "  "},
     ],
