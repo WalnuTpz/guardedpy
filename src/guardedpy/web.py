@@ -11,7 +11,7 @@ import shlex
 import subprocess
 import tempfile
 from threading import Thread
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
@@ -53,41 +53,10 @@ from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.llm import DeepSeekClient
 from guardedpy.memory import MemoryStore
 from guardedpy.orchestrator import TaskOrchestrator
+from guardedpy.runtime import CredentialPort, OrchestratorFactory, OrchestratorPort, RuntimeServices
 
 
-class CredentialPort(Protocol):
-    """The non-secret credential operations needed by the local WebUI."""
-
-    def status(self) -> CredentialStatus: ...
-
-    def set_key(self, key: str) -> None: ...
-
-    def clear_key(self) -> None: ...
-
-
-class OrchestratorPort(Protocol):
-    """The task lifecycle operations owned by the harness core."""
-
-    def submit(self, task: TaskState) -> TaskState: ...
-
-    def run(self, task: TaskState) -> TaskState: ...
-
-    def cancel(self, task_id: UUID) -> TaskState: ...
-
-    def resolve_approval(
-        self, task_id: UUID, action_hash: str, *, decision: ApprovalDecision
-    ) -> bool: ...
-
-
-OrchestratorFactory = Callable[[Path, HarnessConfig, MemoryStore], OrchestratorPort]
-
-
-@dataclass(frozen=True, slots=True)
-class WebServices:
-    """Injectable local dependencies; ASGI tests never touch OS keyring or network."""
-
-    credentials: CredentialPort
-    orchestrator_factory: OrchestratorFactory
+WebServices = RuntimeServices
 
 
 @dataclass(slots=True)
