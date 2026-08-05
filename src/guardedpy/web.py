@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
 import shlex
 import subprocess
@@ -418,12 +419,28 @@ def local_services(*, transport_factory: Callable[[str], Any] | None = None, cur
     return WebServices(credentials=credentials, orchestrator_factory=orchestrator_factory)
 
 
+def server_main(argv: Sequence[str] | None = None) -> int:
+    """Run the local-control server on the fixed loopback address only."""
+    parser = argparse.ArgumentParser(prog="guardedpy-server")
+    parser.parse_args(argv)
+    uvicorn.run(create_app("local", local_services()), host="127.0.0.1")
+    return 0
+
+
+def demo_main(argv: Sequence[str] | None = None) -> int:
+    """Run the separately composed public fixed-scenario demonstration."""
+    parser = argparse.ArgumentParser(prog="guardedpy-demo")
+    parser.parse_args(argv)
+    uvicorn.run(create_demo_app(), host="127.0.0.1")
+    return 0
+
+
 def serve() -> None:
     """Run local controls by default or the separately composed public demo."""
     parser = argparse.ArgumentParser(prog="guardedpy")
     parser.add_argument("mode", choices=("serve", "demo"), default="serve", nargs="?")
     arguments = parser.parse_args()
     if arguments.mode == "demo":
-        uvicorn.run(create_demo_app(), host="127.0.0.1")
+        demo_main(())
         return
-    uvicorn.run(create_app("local", local_services()), host="127.0.0.1")
+    server_main(())
