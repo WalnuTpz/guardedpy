@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi.routing import APIRoute
 
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskStatus
 
@@ -61,6 +62,23 @@ def test_demo_routes_are_read_only_and_exclude_local_control_capabilities() -> N
     ):
         assert asyncio.run(_request(app, "GET", path)).status_code == 404
     assert asyncio.run(_request(app, "POST", "/demo/scenarios/dangerous_action_denied")).status_code == 405
+
+
+def test_demo_route_inventory_allows_only_the_fixed_get_surface() -> None:
+    """Catches any newly registered demo control route or non-GET method."""
+    from guardedpy.demo import create_demo_app
+
+    app = create_demo_app()
+
+    assert {
+        route.path: route.methods
+        for route in app.routes
+        if isinstance(route, APIRoute)
+    } == {
+        "/": {"GET"},
+        "/demo/scenarios": {"GET"},
+        "/demo/scenarios/{name}": {"GET"},
+    }
 
 
 def test_demo_runs_real_governance_feedback_and_workspace_fixtures_without_command_dispatch(

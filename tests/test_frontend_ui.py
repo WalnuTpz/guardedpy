@@ -70,6 +70,7 @@ class RenderedDocument(HTMLParser):
         super().__init__()
         self.lang: str | None = None
         self.landmarks: set[str] = set()
+        self.landmark_counts: dict[str, int] = {}
         self.navigation_hrefs: list[str] = []
         self.current_href: str | None = None
         self.forms: list[tuple[str, set[str]]] = []
@@ -81,6 +82,7 @@ class RenderedDocument(HTMLParser):
         self.task_link_hrefs: list[str] = []
         self.anchors: list[tuple[str, str]] = []
         self.header_texts: list[str] = []
+        self.header_count = 0
         self._anchor_captures: list[list[str]] = []
         self._header_captures: list[list[str]] = []
         self._inside_navigation = 0
@@ -96,9 +98,11 @@ class RenderedDocument(HTMLParser):
             self.lang = attributes.get("lang")
         if tag == "nav":
             self.landmarks.add("navigation")
+            self.landmark_counts["navigation"] = self.landmark_counts.get("navigation", 0) + 1
             self._inside_navigation += 1
         if tag == "main":
             self.landmarks.add("main")
+            self.landmark_counts["main"] = self.landmark_counts.get("main", 0) + 1
         if attributes.get("data-od-id"):
             self.data_od_ids.add(attributes["data-od-id"])
         if tag == "a" and self._inside_navigation and attributes.get("href"):
@@ -111,6 +115,7 @@ class RenderedDocument(HTMLParser):
         if tag == "a":
             self._anchor_captures.append([attributes.get("href", "")])
         if tag == "header":
+            self.header_count += 1
             self._header_captures.append([])
         if tag == "form":
             form = (attributes.get("action", ""), set())
@@ -505,6 +510,8 @@ def test_public_demo_is_a_chinese_read_only_surface_with_only_fixed_scenario_lin
     assert document.lang == "zh-CN"
     assert any("只读演示" in text for text in document.header_texts)
     assert document.landmarks == {"main"}
+    assert document.landmark_counts == {"main": 1}
+    assert document.header_count == 1
     assert document.forms == []
     assert document.anchors == [
         ("/demo/scenarios/dangerous_action_denied", "危险动作被拒绝"),
