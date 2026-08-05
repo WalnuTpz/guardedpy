@@ -6,14 +6,14 @@ import fcntl
 import os
 from pathlib import Path
 
-from guardedpy.config import app_state_dir
+from guardedpy.config import app_state_dir, local_state_path
 
 
-class ExecutionLease:
-    """Hold one non-blocking advisory lock for a selected project root."""
+class _FileLease:
+    """Hold one non-blocking advisory lock for one state file path."""
 
-    def __init__(self, project_root: Path) -> None:
-        self._path = app_state_dir(project_root) / "execution.lock"
+    def __init__(self, path: Path) -> None:
+        self._path = path
         self._fd: int | None = None
 
     @property
@@ -41,3 +41,17 @@ class ExecutionLease:
             return
         os.close(self._fd)
         self._fd = None
+
+
+class ExecutionLease(_FileLease):
+    """Hold one non-blocking advisory lock for a selected project root."""
+
+    def __init__(self, project_root: Path) -> None:
+        super().__init__(app_state_dir(project_root) / "execution.lock")
+
+
+class GlobalStateLease(_FileLease):
+    """Serialize mutations to application-global local state and keyring boundaries."""
+
+    def __init__(self) -> None:
+        super().__init__(local_state_path().parent / "global-state.lock")

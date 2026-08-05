@@ -16,7 +16,7 @@ from guardedpy.config import HarnessConfig, app_state_dir, local_state_path, pro
 from guardedpy.credentials import CredentialStatus
 from guardedpy.domain import ApprovalDecision, CommandApprovalRule, TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore, StoredRunEvent
-from guardedpy.lease import ExecutionLease
+from guardedpy.lease import ExecutionLease, GlobalStateLease
 from guardedpy.memory import MemoryEntry, MemoryStore
 
 
@@ -131,7 +131,9 @@ class LocalRuntime:
         lease = ExecutionLease(root)
         if not lease.try_acquire():
             raise RuntimeBusyError()
+        global_lease: GlobalStateLease | None = None
         try:
+            global_lease = self._acquire_global_state_lease()
             task_roots = _read_local_state()[1] if local_state_path().exists() else {}
             config_path = project_config_path(root)
             index_path = local_state_path()
@@ -152,6 +154,8 @@ class LocalRuntime:
             self._lease = lease
             self._task_roots = task_roots
         finally:
+            if global_lease is not None:
+                global_lease.release()
             lease.release()
 
     def create_task(
@@ -172,17 +176,23 @@ class LocalRuntime:
             raise RuntimeBusyError()
         registered = False
         index_written = False
+        global_lease: GlobalStateLease | None = None
         try:
             event_store = EventStore(root)
-            index_path = local_state_path()
-            previous_index = _snapshot_file(index_path)
             orchestrator = self._services.orchestrator_factory(root, config, memory_store)
-            event_store.register_task(task)
-            registered = True
-            task_roots = {**self._task_roots, task.id: root}
-            _write_local_state(root, task_roots)
-            index_written = True
-            orchestrator.submit(task)
+            global_lease = self._acquire_global_state_lease()
+            try:
+                index_path = local_state_path()
+                previous_index = _snapshot_file(index_path)
+                task_roots = _read_local_state()[1] if index_path.exists() else {}
+                event_store.register_task(task)
+                registered = True
+                task_roots[task.id] = root
+                _write_local_state(root, task_roots)
+                index_written = True
+                orchestrator.submit(task)
+            finally:
+                global_lease.release()
         except Exception:
             if index_written:
                 _restore_file(index_path, previous_index)
@@ -211,10 +221,13 @@ class LocalRuntime:
         task, orchestrator = self._owned_task(task_id)
         if not self._acquire_lease():
             raise RuntimeBusyError()
+        result = task
         try:
-            return orchestrator.run(task)
+            result = orchestrator.run(task)
+            self._tasks[task_id] = result
+            return result
         finally:
-            if task.status in _TERMINAL_STATUSES:
+            if result.status in _TERMINAL_STATUSES:
                 self._release_lease()
 
     def resolve_approval(
@@ -235,12 +248,13 @@ class LocalRuntime:
         task, orchestrator = self._owned_task(task_id)
         if not self._acquire_lease():
             raise RuntimeBusyError()
+        cancelled = task
         try:
             cancelled = orchestrator.cancel(task_id)
             self._tasks[task_id] = cancelled
             return cancelled
         finally:
-            if task.status in _TERMINAL_STATUSES:
+            if cancelled.status in _TERMINAL_STATUSES:
                 self._release_lease()
 
     def tasks(self) -> list[TaskState]:
@@ -309,18 +323,26 @@ class LocalRuntime:
     def update_credential(self, api_key: str) -> None:
         """Store a credential through the injected keyring boundary under the lease."""
         release_after = self._require_mutation_lease()
+        global_lease: GlobalStateLease | None = None
         try:
+            global_lease = self._acquire_global_state_lease()
             self._services.credentials.set_key(api_key)
         finally:
+            if global_lease is not None:
+                global_lease.release()
             if release_after:
                 self._release_lease()
 
     def clear_credential(self) -> None:
         """Clear the credential through the injected keyring boundary under the lease."""
         release_after = self._require_mutation_lease()
+        global_lease: GlobalStateLease | None = None
         try:
+            global_lease = self._acquire_global_state_lease()
             self._services.credentials.clear_key()
         finally:
+            if global_lease is not None:
+                global_lease.release()
             if release_after:
                 self._release_lease()
 
@@ -382,6 +404,13 @@ class LocalRuntime:
     def _release_lease(self) -> None:
         if self._lease is not None:
             self._lease.release()
+
+    @staticmethod
+    def _acquire_global_state_lease() -> GlobalStateLease:
+        lease = GlobalStateLease()
+        if not lease.try_acquire():
+            raise RuntimeBusyError()
+        return lease
 
 
 def _write_snapshot(project_root: Path, config: HarnessConfig) -> None:
