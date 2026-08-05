@@ -102,7 +102,7 @@ The [GitHub Actions workflow](.github/workflows/ci.yml) and [.gitlab-ci.yml](.gi
 
 ## Open Design attribution
 
-The local templates and CSS follow the selected [Open Design Agentic direction](https://open-design.ai/plugins/design-system-agentic/): clear task outcomes, restrained controls, semantic status badges, and readable local-console surfaces. GuardedPy uses handwritten Jinja, CSS, and JavaScript; it does not bundle Open Design assets. See the [Open Design project](https://open-design.ai/) for its local-first, BYOK design workflow and licensing information.
+The local templates and CSS were handwritten to follow the selected [Open Design Agentic direction](https://open-design.ai/plugins/design-system-agentic/): clear task outcomes, restrained controls, semantic status badges, and readable local-console surfaces. The repository has no recorded Open Design project-generation or `web-design-guidelines` review run, so it does not claim that an Open Design tool generated or approved this WebUI. GuardedPy does not bundle Open Design assets. See the [Open Design project](https://open-design.ai/) for its local-first, BYOK design workflow and licensing information.
 
 ## Third-party software and licenses
 
