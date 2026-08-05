@@ -30,6 +30,25 @@ def test_proposed_memory_is_not_persisted_until_approved(
     ]
 
 
+def test_proposals_are_in_process_only_and_exclude_approved_or_deleted_candidates(
+    store: MemoryStore, tmp_path: Path
+) -> None:
+    """Catches a proposal queue that persists or keeps consumed candidates visible."""
+    first = store.propose(uuid4(), "Remember the parser layout")
+    second = store.propose(uuid4(), "Keep test feedback concise")
+
+    assert store.proposals() == [first, second]
+    assert MemoryStore(tmp_path / "project").proposals() == []
+
+    store.approve(first.id)
+    store.delete(second.id)
+
+    assert store.proposals() == []
+    assert MemoryStore(tmp_path / "project").search("parser") == [
+        store.search("parser")[0]
+    ]
+
+
 def test_search_orders_keyword_overlap_then_recency_and_limits_to_five(
     store: MemoryStore,
 ) -> None:
