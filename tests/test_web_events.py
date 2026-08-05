@@ -1079,17 +1079,83 @@ def test_fresh_app_marks_indexed_unfinished_task_interrupted_without_resuming_it
     assert created.headers["location"] != "/tasks/new"
     task_id = UUID(created.headers["location"].rsplit("/", 1)[-1])
     assert len(factory_calls) == 1
+    app.state.runtime._release_lease()
 
     fresh_app = web.create_app("local", web.WebServices(credentials, factory))
     detail = asyncio.run(_request(fresh_app, "GET", f"/tasks/{task_id}"))
     feed = asyncio.run(_request(fresh_app, "GET", f"/tasks/{task_id}/events"))
+    api_task = asyncio.run(_request(fresh_app, "GET", f"/api/v1/tasks/{task_id}"))
+    next_task = asyncio.run(
+        _request(
+            fresh_app,
+            "POST",
+            "/tasks",
+            data={"mode": "feature", "description": "Not blocked after recovery"},
+        )
+    )
 
-    assert len(factory_calls) == 1
+    assert len(factory_calls) == 2
     assert detail.status_code == 200
     assert "interrupted" in detail.text
     assert feed.status_code == 200
     assert feed.json()[-1]["task_status"] == "interrupted"
     assert feed.json()[-1]["stop_reason"] == "service_restarted"
+    assert api_task.json()["status"] == "interrupted"
+    assert next_task.status_code == 303
+
+
+def test_fresh_server_does_not_interrupt_a_live_task_owned_by_another_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches startup recovery overwriting a task while its original server still owns it."""
+    import guardedpy.web as web
+
+    root = _project_root(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    class DormantThread:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def start(self) -> None:
+            return None
+
+    class PendingOrchestrator:
+        def submit(self, task: Any) -> Any:
+            return task
+
+        def run(self, task: Any) -> Any:
+            raise AssertionError("the live task must not be resumed")
+
+        def cancel(self, task_id: UUID) -> Any:
+            raise AssertionError(task_id)
+
+        def resolve_approval(self, task_id: UUID, action_hash: str, *, decision: str) -> bool:
+            raise AssertionError((task_id, action_hash, decision))
+
+    monkeypatch.setattr(web, "Thread", DormantThread)
+    services = web.WebServices(
+        FakeCredentials(),
+        lambda project_root, config, memory: PendingOrchestrator(),
+    )
+    owner = web.create_app("local", services)
+    assert asyncio.run(_request(owner, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    created = asyncio.run(
+        _request(owner, "POST", "/tasks", data={"mode": "feature", "description": "Live task"})
+    )
+    task_id = UUID(created.headers["location"].rsplit("/", 1)[-1])
+
+    observer = web.create_app("local", services)
+    detail = asyncio.run(_request(observer, "GET", f"/tasks/{task_id}"))
+    feed = asyncio.run(_request(observer, "GET", f"/tasks/{task_id}/events"))
+    next_task = asyncio.run(
+        _request(observer, "POST", "/tasks", data={"mode": "feature", "description": "Must wait"})
+    )
+
+    assert detail.status_code == 200
+    assert feed.json() == []
+    assert "pending" in detail.text
+    assert next_task.status_code == 409
 
 
 def test_memory_controls_keep_proposals_pending_until_approval_and_404_unknown_ids(

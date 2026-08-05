@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tomllib
+import venv
 import zipfile
 
 import pytest
@@ -20,11 +22,15 @@ def _text(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-def test_package_metadata_declares_web_console_entrypoint_and_ui_assets() -> None:
-    """Catches a wheel that omits the installed WebUI entrypoint or templates."""
+def test_package_metadata_declares_cli_and_loopback_server_entrypoints() -> None:
+    """Catches a wheel that routes either public command away from its local adapter."""
     project = tomllib.loads(_text("pyproject.toml"))
 
-    assert project["project"]["scripts"] == {"guardedpy": "guardedpy.web:serve"}
+    assert project["project"]["scripts"] == {
+        "guardedpy": "guardedpy.cli:main",
+        "guardedpy-cli": "guardedpy.cli:main",
+        "guardedpy-server": "guardedpy.cli:server_main",
+    }
     assert project["tool"]["setuptools"]["package-data"]["guardedpy"] == [
         "templates/*.html",
         "static/*.css",
@@ -74,12 +80,112 @@ def test_distribution_wheel_includes_pytest_required_by_the_public_demo(tmp_path
     assert "Requires-Dist: pytest\n" in metadata
 
 
+def test_cli_check_runs_each_installed_console_entrypoint_without_composition(tmp_path: Path) -> None:
+    """Catches cli-check bypassing the three installed local console scripts."""
+    project_copy = tmp_path / "project"
+    shutil.copytree(
+        ROOT,
+        project_copy,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".pytest_cache",
+            ".superpowers",
+            "__pycache__",
+            "*.egg-info",
+            "build",
+            "dist",
+        ),
+    )
+    wheelhouse = tmp_path / "wheelhouse"
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(wheelhouse),
+        ],
+        cwd=project_copy,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+
+    environment = tmp_path / "environment"
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = environment / "bin" / "python"
+    install = subprocess.run(
+        [str(python), "-m", "pip", "install", "--no-deps", str(next(wheelhouse.glob("*.whl")))],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": ""},
+    )
+    assert install.returncode == 0, install.stderr
+
+    sitecustomize = tmp_path / "instrumentation" / "sitecustomize.py"
+    sitecustomize.parent.mkdir()
+    sitecustomize.write_text(
+        "from guardedpy import web\n"
+        "def fail(*args, **kwargs):\n"
+        "    raise AssertionError('help must not compose local services')\n"
+        "web.local_services = fail\n"
+        "web.uvicorn.run = fail\n",
+        encoding="utf-8",
+    )
+    entrypoint_bin = tmp_path / "entrypoints"
+    entrypoint_bin.mkdir()
+    entrypoint_log = tmp_path / "entrypoints.log"
+    entrypoint_log.touch()
+    for name in ("guardedpy", "guardedpy-cli", "guardedpy-server"):
+        wrapper = entrypoint_bin / name
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' {name} >> \"$GUARDEDPY_ENTRYPOINT_LOG\"\n"
+            f"exec \"$GUARDEDPY_ENTRYPOINT_BIN/{name}\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+    dependency_paths = [path for path in sys.path if "site-packages" in path]
+    environment_variables = {
+        **os.environ,
+        "GUARDEDPY_ENTRYPOINT_BIN": str(environment / "bin"),
+        "GUARDEDPY_ENTRYPOINT_LOG": str(entrypoint_log),
+        "PATH": f"{entrypoint_bin}{os.pathsep}{os.environ['PATH']}",
+        "PYTHON": str(python),
+        "PYTHONPATH": os.pathsep.join([str(sitecustomize.parent), *dependency_paths]),
+    }
+    result = subprocess.run(
+        ["make", "cli-check"],
+        cwd=project_copy,
+        capture_output=True,
+        text=True,
+        env=environment_variables,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert entrypoint_log.read_text(encoding="utf-8").splitlines() == [
+        "guardedpy",
+        "guardedpy-cli",
+        "guardedpy-server",
+    ]
+
+
 def test_delivery_automation_runs_the_same_offline_test_demo_and_build_contract() -> None:
     """Catches drift between local Make targets and the two CI definitions."""
     makefile = _text("Makefile")
     assert "test:" in makefile
     assert "demo:" in makefile
     assert "build:" in makefile
+    assert "cli-check:" in makefile
+    assert "\tguardedpy --help" in makefile
+    assert "\tguardedpy-cli --help" in makefile
+    assert "\tguardedpy-server --help" in makefile
     assert "pytest tests -q" in makefile
     for scenario in (
         "dangerous_action_denied",
@@ -144,6 +250,17 @@ def test_readme_documents_real_local_demo_security_delivery_and_course_context()
     assert "present-time reconstruction records" in readme
     assert "src/guardedpy/" in readme
     assert "tests/" in readme
+
+
+def test_readme_documents_local_cli_server_and_pending_release_assets() -> None:
+    """Catches an operator guide that promotes a public UI or invents a release asset."""
+    readme = _text("README.md")
+
+    assert "guardedpy-cli" in readme
+    assert "guardedpy-server" in readme
+    assert "公网 WebUI" in readme
+    assert "Release asset URL is pending" in readme
+    assert "releases/download" not in readme
 
 
 @pytest.mark.parametrize("mode", ["serve", "demo"])

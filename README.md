@@ -1,6 +1,6 @@
 # GuardedPy
 
-GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its own loop builds context, requests one structured LLM action, applies deterministic policy, runs restricted tools, returns objective feedback, and stops on a bounded result. It also includes a separate, fixed-scenario demo that requires neither a project nor a credential.
+GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its own loop builds context, requests one structured LLM action, applies deterministic policy, runs restricted tools, returns objective feedback, and stops on a bounded result. The release-facing interfaces are a terminal client and a loopback-only local server; the existing WebUI remains a local compatibility surface. It also includes a separate, fixed-scenario demo that requires neither a project nor a credential.
 
 ## Installation
 
@@ -12,17 +12,29 @@ python3 -m venv .venv
 python -m pip install -e ".[dev]"
 ```
 
-To test the distribution form after `make build`, install the wheel with `pipx install dist/guardedpy-*.whl`. This repository does not claim that GuardedPy is published to PyPI.
+To test the distribution form after `make build`, install the wheel with `pipx install dist/guardedpy-*.whl`. This repository does not claim that GuardedPy is published to PyPI. Release asset URL is pending: no wheel or sdist has been uploaded to a GitHub Release, so use a locally built artifact until that happens.
 
 ## Local operation
 
-Run the complete local harness with:
+On Linux or WSL, GuardedPy requires Python 3.11+, an OS keyring backend, and `fcntl` support for its local execution lease. Start the interactive client with either entrypoint:
 
 ```bash
+guardedpy
+# or
+guardedpy-cli
+```
+
+Run `/init` to choose a project root, source/test directories, pytest command, model, timeout and hidden DeepSeek key. The key is never a command-line argument, is not echoed, and is stored only in the OS keyring. Use `/help` to list `/task`, `/status`, `/tasks`, `/memory`, `/rules`, `/credentials`, `/clear` and `/exit`; `--prompt` supports one local task invocation. A real DeepSeek-compatible provider is used only after setup; there is no `.env` file or environment-variable credential fallback.
+
+Start the compatibility WebUI and versioned local JSON API only when needed:
+
+```bash
+guardedpy-server
+# compatible alias
 guardedpy serve
 ```
 
-Local mode binds to `127.0.0.1` only. The setup page asks for a target project, source/test directories, a pytest command, model name, timeout, and a hidden DeepSeek key. It can use a real DeepSeek-compatible provider only after setup; it does not use a `.env` file or any environment-variable fallback for credentials.
+The server is fixed to `127.0.0.1`. It shares the CLI's execution lease, so while either entrypoint owns an active task or configuration mutation, the other may read history but cannot create a task or change setup. GuardedPy does not deploy or advertise a 公网 WebUI.
 
 ## Demo operation
 
@@ -51,9 +63,10 @@ make test
 make demo
 make demo-assets
 make build
+make cli-check
 ```
 
-`make test` runs the offline pytest suite. `make demo` executes the three literal demo scenarios and exits nonzero if their statuses differ from the expected deterministic result. `make demo-assets` verifies the rendered public demo surface, its fixed route boundary, and its shared responsive CSS contracts. `make build` runs `python -m build --no-isolation` to create a wheel and sdist in `dist/`.
+`make test` runs the offline pytest suite. `make demo` executes the three literal demo scenarios and exits nonzero if their statuses differ from the expected deterministic result. `make demo-assets` verifies the rendered public demo surface, its fixed route boundary, and its shared responsive CSS contracts. `make build` runs `python -m build --no-isolation` to create a wheel and sdist in `dist/`. `make cli-check` runs all three console entrypoint help paths without composing a provider, keyring, or Uvicorn server.
 
 ## Directory structure
 
@@ -65,7 +78,7 @@ make build
 ├── tests/                  # offline unit, integration, UI, demo, and packaging contracts
 ├── docs/                   # course requirements plus Superpowers plans, specs, and reviews
 ├── Makefile                # one-command tests, mechanism demo, and package build
-├── pyproject.toml          # package metadata, runtime dependencies, and console entry point
+├── pyproject.toml          # package metadata, runtime dependencies, and CLI/server entry points
 ├── render.yaml             # public fixed-scenario demo blueprint only
 ├── .github/workflows/ci.yml
 └── .gitlab-ci.yml
@@ -129,7 +142,9 @@ Transitive dependencies are installed through these distributions and retain the
 ## Known limitations
 
 - Local mode supports one active task and Python 3.11+ projects that use pytest; it is not a multi-user, remote, or multi-project runner.
+- The CLI/server lease relies on Linux/WSL `fcntl`; this release does not support a Windows-native lease implementation.
 - The public demo is evidence of fixed mechanisms, not a hosted version of the local coding harness.
 - Local mode needs a functioning OS keyring; an unavailable backend does not fall back to plaintext credentials.
-- The Render blueprint is deployment preparation only: it has not been deployed, and no public URL is available yet.
+- The Render blueprint is deployment preparation only: it has not been deployed, no public URL is available, and it is not a public WebUI delivery path.
+- A GitHub Release asset has not been uploaded; the only available installation route is a source checkout or locally built wheel.
 - GitHub Actions has been exercised; GitLab CI and the Render deployment have not.
