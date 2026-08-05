@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 import json
 from pathlib import Path
+import re
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -142,19 +143,153 @@ class _TaskDetailDom(HTMLParser):
         return None
 
 
-def _javascript_block(source: str, marker: str) -> str:
-    """Return one balanced JavaScript block so ordering checks stay branch-scoped."""
-    start = source.index(marker)
-    opening = source.index("{", start)
-    depth = 0
-    for index in range(opening, len(source)):
-        if source[index] == "{":
-            depth += 1
-        elif source[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return source[opening + 1:index]
-    raise AssertionError(f"unterminated block after {marker!r}")
+@dataclass(frozen=True)
+class _PollEffects:
+    operations: tuple[str, ...]
+    visible_status: str | None = None
+
+
+class _PollingScriptHarness:
+    """Parse the complete polling IIFE and execute its observable control flow."""
+
+    _POLL = re.compile(
+        r"""\s*
+        const\s+response\s*=\s*await\s+fetch\(timeline\.dataset\.eventsUrl,\s*\{\s*headers:\s*\{\s*Accept:\s*\"application/json\"\s*\}\s*\}\);\s*
+        if\s*\(!response\.ok\)\s*\{\s*return;\s*\}\s*
+        const\s+events\s*=\s*await\s+response\.json\(\);\s*
+        const\s+latest\s*=\s*events\.at\(-1\);\s*
+        if\s*\(!latest\)\s*\{\s*return;\s*\}\s*
+        if\s*\(terminal\.has\(latest\.task_status\)\)\s*\{\s*clearInterval\(interval\);\s*\}\s*
+        if\s*\(timeline\.dataset\.currentStatus\s*!==\s*latest\.task_status\)\s*\{\s*window\.location\.reload\(\);\s*return;\s*\}\s*
+        if\s*\(status\)\s*\{\s*status\.textContent\s*=\s*statusLabel\(latest\.task_status\);\s*status\.dataset\.status\s*=\s*latest\.task_status;\s*\}\s*
+        if\s*\(list\)\s*\{\s*list\.replaceChildren\(\.\.\.events\.map\(renderEvent\)\);\s*\}\s*
+        """,
+        re.VERBOSE | re.DOTALL,
+    )
+
+    def __init__(self, source: str) -> None:
+        self._validate_balanced_source(source)
+        stripped = source.strip()
+        assert stripped.startswith("(() => {") and stripped.endswith("})();")
+        assert source.count("const poll = async () =>") == 1
+        assert source.count("const interval = window.setInterval(poll, 2000);") == 1
+        assert source.count("poll();") == 1
+        assert re.search(
+            r'const timeline = document\.querySelector\("\[data-events-url\]"\);\s*'
+            r'if \(!timeline \|\| timeline\.dataset\.terminal === "true"\) \{\s*return;\s*\}',
+            source,
+        )
+        labels_match = re.search(
+            r"const STATUS_LABELS = Object\.freeze\(\{(?P<body>.*?)\}\);", source, re.DOTALL
+        )
+        assert labels_match is not None
+        self.labels = dict(
+            re.findall(r'(\w+):\s*"([^"]+)"', labels_match.group("body"))
+        )
+        assert self.labels == {
+            "pending": "待处理",
+            "running": "运行中",
+            "waiting_approval": "等待审批",
+            "completed": "已完成",
+            "blocked": "已阻止",
+            "cancelled": "已取消",
+            "interrupted": "已中断",
+        }
+        terminal_match = re.search(r"const terminal = new Set\(\[(?P<body>.*?)\]\);", source)
+        assert terminal_match is not None
+        self.terminal = frozenset(re.findall(r'"([^"]+)"', terminal_match.group("body")))
+        assert self.terminal == {"completed", "blocked", "cancelled", "interrupted"}
+        detail_span = self._block_after(source, "const detailSpan = (className, text) =>")
+        render_event = self._block_after(source, "const renderEvent = (event) =>")
+        poll = self._block_after(source, "const poll = async () =>")
+        assert "span.textContent = text;" in detail_span
+        assert not {"innerHTML", "outerHTML", "insertAdjacentHTML"}.intersection(
+            set(re.findall(r"[A-Za-z_$][\w$]*", detail_span + render_event))
+        )
+        assert set(re.findall(r"event\.(\w+)", render_event)) == {
+            "task_status",
+            "action_summary",
+            "action_projection",
+            "affected_project",
+            "policy_verdict",
+            "policy_rule_id",
+            "policy_reason",
+            "approval_granted",
+            "feedback_excerpt",
+            "feedback_node_id",
+            "stop_reason",
+        }
+        assert self._POLL.fullmatch(poll)
+
+    def poll(
+        self,
+        *,
+        current_status: str,
+        latest_status: str | None,
+        response_ok: bool = True,
+    ) -> _PollEffects:
+        operations = ["fetch"]
+        if not response_ok:
+            return _PollEffects(tuple(operations))
+        if latest_status is None:
+            return _PollEffects(tuple(operations))
+        if latest_status in self.terminal:
+            operations.append("clearInterval")
+        if current_status != latest_status:
+            operations.append("reload")
+            return _PollEffects(tuple(operations))
+        operations.extend(("updateStatus", "replaceChildren"))
+        return _PollEffects(tuple(operations), self.labels.get(latest_status, latest_status))
+
+    @staticmethod
+    def _validate_balanced_source(source: str) -> None:
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack: list[str] = []
+        quote: str | None = None
+        escaped = False
+        for character in source:
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'", "`"}:
+                quote = character
+            elif character in pairs:
+                stack.append(pairs[character])
+            elif character in pairs.values():
+                assert stack and stack.pop() == character
+        assert quote is None and not stack
+
+    @staticmethod
+    def _block_after(source: str, marker: str) -> str:
+        start = source.index(marker)
+        opening = source.index("{", start)
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        for index in range(opening, len(source)):
+            character = source[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'", "`"}:
+                quote = character
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[opening + 1 : index]
+        raise AssertionError(f"unterminated block after {marker!r}")
 
 
 def _project_root(tmp_path: Path) -> Path:
@@ -250,7 +385,6 @@ def test_task_detail_and_events_expose_only_stored_audit_projection(
 
     page = asyncio.run(_request(app, "GET", f"/tasks/{task.id}"))
     events = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
-    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
 
     assert page.status_code == 200
     assert "apply source patch" in page.text
@@ -270,8 +404,6 @@ def test_task_detail_and_events_expose_only_stored_audit_projection(
         "stop_reason", "id", "created_at",
     } for event in payload)
     assert "--- a/secret.py" not in events.text
-    assert "clearInterval(interval)" in script
-    assert "terminal" in script
 
 
 def test_approval_requires_the_exact_waiting_hash_and_starts_one_continuation(
@@ -485,27 +617,35 @@ def test_polling_protocol_reloads_running_page_when_latest_event_requires_approv
         RunEvent(task_id=task.id, task_status=TaskStatus.WAITING_APPROVAL)
     )
     feed = asyncio.run(_request(app, "GET", f"/tasks/{task.id}/events"))
-    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    harness = _PollingScriptHarness(
+        (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    )
 
     assert running_page.status_code == 200
     assert 'data-current-status="running"' in running_page.text
     assert "ACTION APPROVAL REQUIRED" not in running_page.text
     assert feed.json()[-1]["task_status"] == "waiting_approval"
-    assert "timeline.dataset.currentStatus !== latest.task_status" in script
-    assert "window.location.reload()" in script
-
-
-def test_terminal_event_cleanup_precedes_the_status_change_reload_branch() -> None:
-    """Catches a terminal status change returning from reload before interval cleanup."""
-    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
-    poll = _javascript_block(script, "const poll = async () =>")
-    cleanup = _javascript_block(poll, "if (terminal.has(latest.task_status))")
-
-    assert "clearInterval(interval)" in cleanup
-    assert poll.index("if (terminal.has(latest.task_status))") < poll.index(
-        "if (timeline.dataset.currentStatus !== latest.task_status)"
+    assert harness.poll(current_status="running", latest_status="waiting_approval") == _PollEffects(
+        ("fetch", "reload")
     )
-    assert poll.index("clearInterval(interval)") < poll.index("window.location.reload()")
+
+
+def test_polling_harness_executes_cleanup_reload_update_and_error_branches() -> None:
+    """Catches broken whole-script wiring or any polling branch with the wrong effects."""
+    harness = _PollingScriptHarness(
+        (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    )
+
+    assert harness.poll(current_status="running", latest_status="completed") == _PollEffects(
+        ("fetch", "clearInterval", "reload")
+    )
+    assert harness.poll(current_status="running", latest_status="running") == _PollEffects(
+        ("fetch", "updateStatus", "replaceChildren"), "运行中"
+    )
+    assert harness.poll(
+        current_status="running", latest_status="running", response_ok=False
+    ) == _PollEffects(("fetch",))
+    assert harness.poll(current_status="running", latest_status=None) == _PollEffects(("fetch",))
 
 
 def test_task_detail_renders_bounded_feedback_node_id_without_raw_output(
@@ -696,12 +836,9 @@ def test_waiting_and_resolved_approval_timeline_persists_actual_decision_metadat
     assert expected_reason in page.text
     assert "MODEL-SUMMARY-MUST-STAY-HIDDEN" not in page.text + feed.text
 
-    script = (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
-    assert "approval_granted" in script
-    assert "action_projection" in script
-    assert "affected_project" in script
-    assert "policy_rule_id" in script
-    assert "policy_reason" in script
+    _PollingScriptHarness(
+        (Path(__file__).parents[1] / "src" / "guardedpy" / "static" / "app.js").read_text()
+    )
 
 
 def test_terminal_task_page_does_not_load_polling_script(

@@ -6,14 +6,17 @@ import asyncio
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
+import re
 from typing import Any
 from uuid import uuid4
 
 import httpx
+import pytest
 
 from guardedpy.actions import RunCommandAction
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.credentials import CredentialBackendUnavailableError, CredentialStatus
+from guardedpy.domain import TaskStatus
 
 
 @dataclass
@@ -83,12 +86,20 @@ class RenderedDocument(HTMLParser):
         self.anchors: list[tuple[str, str]] = []
         self.header_texts: list[str] = []
         self.header_count = 0
+        self.rail_hrefs: list[str] = []
+        self.rail_brand_names: list[str] = []
+        self.skip_link_hrefs: list[str] = []
+        self.mono_input_names: set[str] = set()
+        self.status_labels: list[tuple[str, str]] = []
         self._anchor_captures: list[list[str]] = []
         self._header_captures: list[list[str]] = []
         self._inside_navigation = 0
+        self._inside_rail = 0
+        self._inside_rail_brand = 0
         self._form_stack: list[tuple[str, set[str]]] = []
         self._script_fragments: list[str] = []
         self._mono_text_captures: list[tuple[str, list[str]]] = []
+        self._status_text_captures: list[tuple[str, str, list[str]]] = []
         self.mono_texts: list[str] = []
         self._inside_script = False
 
@@ -103,6 +114,10 @@ class RenderedDocument(HTMLParser):
         if tag == "main":
             self.landmarks.add("main")
             self.landmark_counts["main"] = self.landmark_counts.get("main", 0) + 1
+        if tag == "aside" and "rail" in attributes.get("class", "").split():
+            self._inside_rail += 1
+        if tag == "div" and "rail-brand" in attributes.get("class", "").split():
+            self._inside_rail_brand += 1
         if attributes.get("data-od-id"):
             self.data_od_ids.add(attributes["data-od-id"])
         if tag == "a" and self._inside_navigation and attributes.get("href"):
@@ -112,6 +127,10 @@ class RenderedDocument(HTMLParser):
                 self.current_href = href
         if tag == "a" and "task-link" in attributes.get("class", "").split():
             self.task_link_hrefs.append(attributes.get("href", ""))
+        if tag == "a" and self._inside_rail:
+            self.rail_hrefs.append(attributes.get("href", ""))
+        if tag == "a" and "skip-link" in attributes.get("class", "").split():
+            self.skip_link_hrefs.append(attributes.get("href", ""))
         if tag == "a":
             self._anchor_captures.append([attributes.get("href", "")])
         if tag == "header":
@@ -124,6 +143,8 @@ class RenderedDocument(HTMLParser):
         if tag in {"input", "select", "textarea"} and attributes.get("name"):
             if self._form_stack:
                 self._form_stack[-1][1].add(attributes["name"])
+        if tag == "input" and "mono" in attributes.get("class", "").split():
+            self.mono_input_names.add(attributes.get("name", ""))
         if tag == "select" and "data-task-mode" in attributes:
             self.has_task_mode_control = True
         if tag == "label" and attributes.get("data-feature-copy"):
@@ -131,6 +152,7 @@ class RenderedDocument(HTMLParser):
             self.bugfix_target_copies.add(attributes["data-bugfix-copy"])
         if "badge" in attributes.get("class", "").split() and attributes.get("data-status"):
             self.badge_statuses.add(attributes["data-status"])
+            self._status_text_captures.append((tag, attributes["data-status"], []))
         if tag == "section" and attributes.get("aria-label"):
             self.section_labels.add(attributes["aria-label"])
         if "mono" in attributes.get("class", "").split():
@@ -141,11 +163,18 @@ class RenderedDocument(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag == "nav":
             self._inside_navigation -= 1
+        if tag == "aside" and self._inside_rail:
+            self._inside_rail -= 1
+        if tag == "div" and self._inside_rail_brand:
+            self._inside_rail_brand -= 1
         if tag == "form":
             self._form_stack.pop()
         if self._mono_text_captures and self._mono_text_captures[-1][0] == tag:
             _, fragments = self._mono_text_captures.pop()
             self.mono_texts.append("".join(fragments).strip())
+        if self._status_text_captures and self._status_text_captures[-1][0] == tag:
+            _, status, fragments = self._status_text_captures.pop()
+            self.status_labels.append((status, "".join(fragments).strip()))
         if tag == "script":
             self._inside_script = False
         if tag == "a":
@@ -161,6 +190,10 @@ class RenderedDocument(HTMLParser):
             fragments.append(data)
         for fragments in self._header_captures:
             fragments.append(data)
+        for _, _, fragments in self._status_text_captures:
+            fragments.append(data)
+        if self._inside_rail_brand:
+            self.rail_brand_names.append(data.strip())
         if self._inside_script:
             self._script_fragments.append(data)
 
@@ -170,6 +203,52 @@ class RenderedDocument(HTMLParser):
     @property
     def task_mode_wiring(self) -> str:
         return "".join(self._script_fragments)
+
+
+@dataclass(frozen=True)
+class _TaskModeState:
+    copy: str
+    required: bool
+
+
+class _TaskModeScriptHarness:
+    """Parse the complete inline IIFE and execute its two observable mode states."""
+
+    _SCRIPT = re.compile(
+        r"""\s*\(\(\)\s*=>\s*\{\s*
+        const\s+mode\s*=\s*document\.querySelector\(\"(?P<mode_selector>[^\"]+)\"\);\s*
+        const\s+copy\s*=\s*document\.querySelector\(\"(?P<copy_selector>[^\"]+)\"\);\s*
+        const\s+target\s*=\s*document\.querySelector\(\"(?P<target_selector>[^\"]+)\"\);\s*
+        if\s*\(\s*!mode\s*\|\|\s*!copy\s*\|\|\s*!target\s*\)\s*return;\s*
+        const\s+updateBugfixTarget\s*=\s*\(\)\s*=>\s*\{\s*
+        const\s+isBugfix\s*=\s*mode\.value\s*===\s*\"(?P<bugfix_value>[^\"]+)\";\s*
+        copy\.textContent\s*=\s*isBugfix\s*\?\s*copy\.parentElement\.dataset\.(?P<bugfix_copy>\w+)\s*:\s*copy\.parentElement\.dataset\.(?P<feature_copy>\w+);\s*
+        target\.required\s*=\s*isBugfix;\s*
+        \};\s*
+        mode\.addEventListener\(\"(?P<event>[^\"]+)\",\s*updateBugfixTarget\);\s*
+        updateBugfixTarget\(\);\s*
+        \}\)\(\);\s*""",
+        re.VERBOSE | re.DOTALL,
+    )
+
+    def __init__(self, source: str) -> None:
+        match = self._SCRIPT.fullmatch(source)
+        assert match is not None, "inline task-mode script must match the complete supported IIFE"
+        self.wiring = match.groupdict()
+        assert self.wiring == {
+            "mode_selector": "[data-task-mode]",
+            "copy_selector": "[data-bugfix-target-copy]",
+            "target_selector": "[name=bugfix_target]",
+            "bugfix_value": "bugfix",
+            "bugfix_copy": "bugfixCopy",
+            "feature_copy": "featureCopy",
+            "event": "change",
+        }
+
+    def run(self, mode: str, *, feature_copy: str, bugfix_copy: str) -> _TaskModeState:
+        is_bugfix = mode == self.wiring["bugfix_value"]
+        copy = bugfix_copy if is_bugfix else feature_copy
+        return _TaskModeState(copy=copy, required=is_bugfix)
 
 
 async def _request(app: Any, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -284,8 +363,11 @@ def test_shell_exposes_chinese_landmarks_navigation_and_explicit_current_page(
         assert document.lang == "zh-CN"
         assert document.landmarks == {"navigation", "main"}
         assert document.navigation_hrefs == expected_navigation
+        assert document.rail_hrefs == expected_navigation
+        assert document.skip_link_hrefs == ["#main-content"]
         assert document.current_href == expected_current_href
         assert document.forms == expected_forms
+        assert "GuardedPy" in document.rail_brand_names
     assert {"app-rail", "primary-navigation", "context-header", "main-content"} <= _document(task_page).data_od_ids
     assert _document(credentials_page).badge_statuses == {"configured"}
 
@@ -307,6 +389,7 @@ def test_setup_keeps_one_submission_form_with_its_security_fields(
         "api_key",
     })]
     assert {"项目边界", "测试策略", "模型运行时"} <= document.section_labels
+    assert "model" in document.mono_input_names
 
 
 def test_task_workspace_keeps_submission_contract_in_three_labelled_regions(
@@ -326,23 +409,68 @@ def test_task_workspace_keeps_submission_contract_in_three_labelled_regions(
     assert {"task-current", "task-create", "task-history"} <= document.data_od_ids
 
 
-def test_task_mode_copy_and_requiredness_wiring_is_complete(tmp_path: Path, monkeypatch: Any) -> None:
-    """Catches mode changes leaving stale copy or bugfix target requiredness behind."""
+def test_task_mode_script_executes_initial_and_changed_mode_behavior(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Catches any broken selector, guard, listener, branch, copy, or required assignment."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     app = _app()
     root = _project_root(tmp_path)
     assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
-    wiring = _document(asyncio.run(_request(app, "GET", "/tasks/new"))).task_mode_wiring
-
-    assert all(
-        fragment in wiring
-        for fragment in (
-            'mode.addEventListener("change", updateBugfixTarget)',
-            'mode.value === "bugfix"',
-            "copy.textContent = isBugfix",
-            "target.required = isBugfix",
-        )
+    harness = _TaskModeScriptHarness(
+        _document(asyncio.run(_request(app, "GET", "/tasks/new"))).task_mode_wiring
     )
+
+    feature = harness.run(
+        "feature",
+        feature_copy="功能开发不需要缺陷测试目标。",
+        bugfix_copy="缺陷修复必须填写唯一的 pytest 测试目标。",
+    )
+    bugfix = harness.run(
+        "bugfix",
+        feature_copy="功能开发不需要缺陷测试目标。",
+        bugfix_copy="缺陷修复必须填写唯一的 pytest 测试目标。",
+    )
+    assert feature == _TaskModeState(copy="功能开发不需要缺陷测试目标。", required=False)
+    assert bugfix == _TaskModeState(
+        copy="缺陷修复必须填写唯一的 pytest 测试目标。", required=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "label"),
+    [
+        pytest.param(TaskStatus.PENDING, "待处理", id="pending"),
+        pytest.param(TaskStatus.RUNNING, "运行中", id="running"),
+        pytest.param(TaskStatus.WAITING_APPROVAL, "等待审批", id="waiting-approval"),
+        pytest.param(TaskStatus.COMPLETED, "已完成", id="completed"),
+        pytest.param(TaskStatus.BLOCKED, "已阻止", id="blocked"),
+        pytest.param(TaskStatus.CANCELLED, "已取消", id="cancelled"),
+        pytest.param(TaskStatus.INTERRUPTED, "已中断", id="interrupted"),
+    ],
+)
+def test_all_task_statuses_use_the_authoritative_label_on_workspace_and_detail(
+    tmp_path: Path, monkeypatch: Any, status: TaskStatus, label: str
+) -> None:
+    """Catches either rendered task surface drifting from the authoritative status map."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    root = _project_root(tmp_path)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    created = asyncio.run(
+        _request(app, "POST", "/tasks", data={"mode": "feature", "description": "状态映射"})
+    )
+    task = app.state.local.task
+    assert task is not None
+    task.status = status
+
+    workspace = _document(asyncio.run(_request(app, "GET", "/tasks/new")))
+    detail = _document(asyncio.run(_request(app, "GET", created.headers["location"])))
+
+    for document in (workspace, detail):
+        labels = [visible for raw, visible in document.status_labels if raw == status.value]
+        assert labels
+        assert set(labels) == {label}
 
 
 def test_task_workspace_detail_links_have_the_local_44px_target_contract(
@@ -368,10 +496,10 @@ def test_task_workspace_detail_links_have_the_local_44px_target_contract(
     assert _css_rules(stylesheet)[".task-link"]["min-height"] == "44px"
 
 
-def test_task14_pages_render_the_complete_fixed_error_set_in_chinese(
+def test_task13_pages_render_the_complete_fixed_error_set_in_chinese(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """Catches Task 14 surfaces exposing fixed English errors after the Chinese rebuild."""
+    """Catches Task 13 surfaces exposing fixed English errors after the Chinese rebuild."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     app = _app()
     root = _project_root(tmp_path)
@@ -400,6 +528,62 @@ def test_task14_pages_render_the_complete_fixed_error_set_in_chinese(
         assert response.status_code == status_code
         assert chinese in response.text
         assert english not in response.text
+
+
+def test_all_local_webui_http_exception_routes_return_chinese_details(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Catches pre-setup navigation, missing resources, or stale forms leaking English."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    app = _app()
+    unknown = uuid4()
+    pre_setup = [
+        asyncio.run(_request(app, "GET", "/memories")),
+        asyncio.run(_request(app, "POST", f"/memories/{unknown}/approve")),
+        asyncio.run(_request(app, "POST", f"/memories/{unknown}/delete")),
+        asyncio.run(_request(app, "GET", "/settings/command-rules")),
+        asyncio.run(_request(app, "POST", "/settings/command-rules/missing/delete")),
+    ]
+    root = _project_root(tmp_path)
+    assert asyncio.run(_request(app, "POST", "/setup", data=_setup_data(root))).status_code == 303
+    created = asyncio.run(
+        _request(app, "POST", "/tasks", data={"mode": "feature", "description": "保持任务"})
+    )
+    task_id = created.headers["location"].rsplit("/", 1)[1]
+    configured = [
+        asyncio.run(_request(app, "GET", f"/tasks/{unknown}")),
+        asyncio.run(_request(app, "GET", f"/tasks/{unknown}/events")),
+        asyncio.run(_request(app, "POST", f"/tasks/{unknown}/approval", data={})),
+        asyncio.run(
+            _request(
+                app,
+                "POST",
+                f"/tasks/{task_id}/approval",
+                data={"action_hash": "stale", "decision": "invalid"},
+            )
+        ),
+        asyncio.run(_request(app, "POST", f"/memories/{unknown}/approve")),
+        asyncio.run(_request(app, "POST", f"/memories/{unknown}/delete")),
+        asyncio.run(_request(app, "POST", "/settings/command-rules/missing/delete")),
+    ]
+
+    expected = [
+        (pre_setup[0], 404, "未找到记忆存储。"),
+        (pre_setup[1], 404, "未找到记忆。"),
+        (pre_setup[2], 404, "未找到记忆。"),
+        (pre_setup[3], 404, "未找到项目。"),
+        (pre_setup[4], 404, "未找到项目。"),
+        (configured[0], 404, "未找到任务。"),
+        (configured[1], 404, "未找到任务。"),
+        (configured[2], 404, "未找到任务。"),
+        (configured[3], 409, "审批请求已失效。"),
+        (configured[4], 404, "未找到记忆。"),
+        (configured[5], 404, "未找到记忆。"),
+        (configured[6], 404, "未找到命令规则。"),
+    ]
+    for response, status_code, detail in expected:
+        assert response.status_code == status_code
+        assert response.json() == {"detail": detail}
 
 
 def test_memory_review_uses_chinese_pending_and_approved_regions(
@@ -488,6 +672,17 @@ def test_shared_stylesheet_provides_neutral_modern_accessible_shell_primitives()
         assert root[token] == value
     assert rules[".rail"]["position"] == "fixed"
     assert rules[".rail"]["width"] == "var(--rail-width)"
+    for selector in (
+        ".skip-link",
+        ".rail-nav a",
+        "input",
+        "select",
+        "button",
+        ".task-link",
+        ".demo-scenario-link",
+    ):
+        assert rules[selector]["min-height"] == "44px"
+    assert int(rules["textarea"]["min-height"].removesuffix("px")) >= 44
     assert rules[".task-link"]["min-height"] == "44px"
     assert rules["a:focus-visible"]["box-shadow"] == "var(--focus-ring)"
     assert rules["input:focus-visible"]["border-color"] == "var(--accent)"

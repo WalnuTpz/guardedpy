@@ -117,6 +117,11 @@ _ACTIVE_TASK_ERROR = "已有任务正在运行。"
 _TASK_START_ERROR = "无法启动任务。"
 _TASK_NOT_FOUND_ERROR = "未找到任务。"
 _CREDENTIAL_UPDATE_ERROR = "无法更新凭据。"
+_APPROVAL_STALE_ERROR = "审批请求已失效。"
+_MEMORY_STORE_NOT_FOUND_ERROR = "未找到记忆存储。"
+_MEMORY_NOT_FOUND_ERROR = "未找到记忆。"
+_PROJECT_NOT_FOUND_ERROR = "未找到项目。"
+_COMMAND_RULE_NOT_FOUND_ERROR = "未找到命令规则。"
 
 
 def create_app(mode: str, services: WebServices) -> FastAPI:
@@ -195,14 +200,14 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     def task_for(task_id: UUID) -> TaskState:
         task = app.state.local.tasks.get(task_id)
         if task is None:
-            raise HTTPException(status_code=404, detail="Task was not found.")
+            raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND_ERROR)
         return task
 
     def task_events(task_id: UUID) -> list[StoredRunEvent]:
         state: _LocalState = app.state.local
         project_root = state.task_roots.get(task_id)
         if project_root is None:
-            raise HTTPException(status_code=404, detail="Task was not found.")
+            raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND_ERROR)
         return EventStore(project_root).events_for(task_id)
 
     @app.get("/", response_class=HTMLResponse)
@@ -372,12 +377,12 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
         task = task_for(task_id)
         orchestrator = state.orchestrators.get(task_id)
         if orchestrator is None:
-            raise HTTPException(status_code=404, detail="Task was not found.")
+            raise HTTPException(status_code=404, detail=_TASK_NOT_FOUND_ERROR)
         form = await request.form()
         action_hash = str(form.get("action_hash", ""))
         decision = str(form.get("decision", ""))
         if not is_approval_decision(decision):
-            raise HTTPException(status_code=409, detail="Approval is stale.")
+            raise HTTPException(status_code=409, detail=_APPROVAL_STALE_ERROR)
 
         was_waiting = task.status is TaskStatus.WAITING_APPROVAL
         accepted = orchestrator.resolve_approval(task_id, action_hash, decision=decision)
@@ -388,7 +393,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
             return RedirectResponse(f"/tasks/{task_id}", status_code=303)
         if decision == "reject" and was_waiting and task.status is TaskStatus.BLOCKED:
             return RedirectResponse(f"/tasks/{task_id}", status_code=303)
-        raise HTTPException(status_code=409, detail="Approval is stale.")
+        raise HTTPException(status_code=409, detail=_APPROVAL_STALE_ERROR)
 
     @app.post("/tasks/{task_id}/cancel", response_class=HTMLResponse)
     async def cancel_task(task_id: UUID, request: Request) -> Response:
@@ -407,7 +412,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def memories(request: Request) -> HTMLResponse:
         memory_store = app.state.local.memory_store
         if memory_store is None:
-            raise HTTPException(status_code=404, detail="Memory store was not found.")
+            raise HTTPException(status_code=404, detail=_MEMORY_STORE_NOT_FOUND_ERROR)
         return _TEMPLATES.TemplateResponse(
             request,
             "memory.html",
@@ -422,22 +427,22 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def approve_memory(memory_id: UUID) -> Response:
         memory_store = app.state.local.memory_store
         if memory_store is None:
-            raise HTTPException(status_code=404, detail="Memory was not found.")
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR)
         try:
             memory_store.approve(memory_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Memory was not found.") from None
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR) from None
         return RedirectResponse("/memories", status_code=303)
 
     @app.post("/memories/{memory_id}/delete", response_class=HTMLResponse)
     async def delete_memory(memory_id: UUID) -> Response:
         memory_store = app.state.local.memory_store
         if memory_store is None:
-            raise HTTPException(status_code=404, detail="Memory was not found.")
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR)
         try:
             memory_store.delete(memory_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Memory was not found.") from None
+            raise HTTPException(status_code=404, detail=_MEMORY_NOT_FOUND_ERROR) from None
         return RedirectResponse("/memories", status_code=303)
 
     @app.get("/settings/credentials", response_class=HTMLResponse)
@@ -470,7 +475,7 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def command_rules(request: Request) -> HTMLResponse:
         project_root = app.state.local.project_root
         if project_root is None:
-            raise HTTPException(status_code=404, detail="Project was not found.")
+            raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_ERROR)
         rules = [
             (rule, _command_rule_projection(rule))
             for rule in CommandRuleStore(project_root).list_rules()
@@ -485,9 +490,9 @@ def create_app(mode: str, services: WebServices) -> FastAPI:
     async def delete_command_rule(rule_id: str) -> Response:
         project_root = app.state.local.project_root
         if project_root is None:
-            raise HTTPException(status_code=404, detail="Project was not found.")
+            raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND_ERROR)
         if not CommandRuleStore(project_root).delete(rule_id):
-            raise HTTPException(status_code=404, detail="Command rule was not found.")
+            raise HTTPException(status_code=404, detail=_COMMAND_RULE_NOT_FOUND_ERROR)
         return RedirectResponse("/settings/command-rules", status_code=303)
 
     return app

@@ -63,6 +63,9 @@ def test_demo_routes_are_read_only_and_exclude_local_control_capabilities() -> N
         assert asyncio.run(_request(app, "GET", path)).status_code == 404
     assert asyncio.run(_request(app, "POST", "/demo/scenarios/dangerous_action_denied")).status_code == 405
 
+    missing = asyncio.run(_request(app, "GET", "/demo/scenarios/not-a-scenario"))
+    assert missing.json() == {"detail": "未找到演示场景。"}
+
 
 def test_demo_route_inventory_allows_only_the_fixed_get_surface() -> None:
     """Catches any newly registered demo control route or non-GET method."""

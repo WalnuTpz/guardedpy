@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-{% set status_labels = {'pending': '待处理', 'running': '运行中', 'waiting_approval': '等待审批', 'completed': '已完成', 'blocked': '已阻塞', 'cancelled': '已取消', 'interrupted': '已中断'} %}
+{% set status_labels = {'pending': '待处理', 'running': '运行中', 'waiting_approval': '等待审批', 'completed': '已完成', 'blocked': '已阻止', 'cancelled': '已取消', 'interrupted': '已中断'} %}
 <section class="card" aria-label="当前任务" data-od-id="task-current">
   <p class="eyebrow">受治理任务</p>
   <h1>当前任务</h1>
