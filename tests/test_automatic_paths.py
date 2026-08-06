@@ -33,6 +33,8 @@ from guardedpy.domain import (
 )
 from guardedpy.orchestrator import TaskOrchestrator
 from guardedpy.policy import PolicyEngine
+from guardedpy.feedback import PytestRun
+from guardedpy.workspace import Workspace
 
 
 class RecordingLLM:
@@ -191,6 +193,62 @@ def test_mixed_assertion_and_execution_failure_baseline_blocks_without_llm(
     (tests / "test_mixed.py").write_text(
         "def test_runtime_error() -> None:\n    raise TypeError('broken runtime')\n\n"
         "def test_assertion() -> None:\n    assert 1 == 2\n"
+    )
+    llm = RecordingLLM()
+    task = _task(tmp_path)
+
+    result = TaskOrchestrator(tmp_path, llm).run(task)
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.repair_targets == ()
+    assert llm.contexts == []
+
+
+def test_mixed_assertion_and_fixture_error_baseline_blocks_without_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a real pytest ERROR phase being promoted to a repair baseline."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_mixed.py").write_text(
+        "import pytest\n\n"
+        "@pytest.fixture\n"
+        "def broken_fixture() -> None:\n"
+        "    raise RuntimeError('fixture setup failed')\n\n"
+        "def test_fixture(broken_fixture: None) -> None:\n"
+        "    assert True\n\n"
+        "def test_assertion() -> None:\n"
+        "    assert 1 == 2\n"
+    )
+    llm = RecordingLLM()
+    task = _task(tmp_path)
+
+    result = TaskOrchestrator(tmp_path, llm).run(task)
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.repair_targets == ()
+    assert llm.contexts == []
+
+
+def test_oversized_baseline_node_is_blocked_before_task_state_or_llm_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an unbounded pytest node entering the repair state and model context."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_feedback.py").write_text("def test_feedback() -> None:\n    assert True\n")
+    oversized_suffix = "x" * 100_000
+    monkeypatch.setattr(
+        Workspace,
+        "run_pytest",
+        lambda *_args: PytestRun(
+            1,
+            f"FAILED tests/test_feedback.py::{oversized_suffix} - AssertionError\n",
+            "",
+            False,
+        ),
     )
     llm = RecordingLLM()
     task = _task(tmp_path)

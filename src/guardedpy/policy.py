@@ -249,22 +249,22 @@ class PolicyEngine:
                 if feedback.node_ids and set(feedback.node_ids).issubset(task.repair_targets):
                     return self._allow(
                         task,
-                        None,
+                        action,
                         "tdd.repair_failure_observed",
                         "repair-target assertion failure remains observable during iteration",
                     )
                 return self._deny(
                     task,
-                    None,
+                    action,
                     "tdd.repair_target_required",
                     "repair iteration must fail only nodes from the automatic repair set",
                 )
             if task.tdd_phase is not TddPhase.TEST_DESIGN:
-                return self._deny(task, None, "tdd.red_out_of_sequence", "red result is out of sequence")
+                return self._deny(task, action, "tdd.red_out_of_sequence", "red result is out of sequence")
             if task.path is TaskPath.FEATURE and not self._changed_test_paths.get(task.id):
                 return self._deny(
                     task,
-                    None,
+                    action,
                     "tdd.test_change_required",
                     "a feature task must change a test before observing red",
                 )
@@ -273,26 +273,26 @@ class PolicyEngine:
             ):
                 return self._deny(
                     task,
-                    None,
+                    action,
                     "tdd.changed_test_required",
                     "a feature red result must target its successfully changed test",
                 )
             task.tdd_phase = TddPhase.RED_OBSERVED
-            return self._allow(task, None, "tdd.red_recorded", "red pytest result recorded")
+            return self._allow(task, action, "tdd.red_recorded", "red pytest result recorded")
         if feedback.kind is not FeedbackKind.PASSED:
             return self._deny(
                 task,
-                None,
+                action,
                 "tdd.assertion_failure_required",
                 "a red result must be an assertion failure",
             )
         if task.tdd_phase is TddPhase.IMPLEMENTATION:
             task.tdd_phase = TddPhase.GREEN_OBSERVED
         elif task.tdd_phase is not TddPhase.GREEN_OBSERVED:
-            return self._deny(task, None, "tdd.green_out_of_sequence", "green result is out of sequence")
+            return self._deny(task, action, "tdd.green_out_of_sequence", "green result is out of sequence")
         if not action.targets:
             self._full_suite_green.add(task.id)
-        return self._allow(task, None, "tdd.green_recorded", "green pytest result recorded")
+        return self._allow(task, action, "tdd.green_recorded", "green pytest result recorded")
 
     def _record_starting_baseline(
         self, task: TaskState, action: RunPytestAction, feedback: PytestFeedback
@@ -301,7 +301,7 @@ class PolicyEngine:
         if action.targets:
             return self._deny(
                 task,
-                None,
+                action,
                 "tdd.baseline_required",
                 "a target-free configured suite run is required before changes",
             )
@@ -310,7 +310,7 @@ class PolicyEngine:
             task.path = TaskPath.FEATURE
             return self._allow(
                 task,
-                None,
+                action,
                 "tdd.baseline_recorded",
                 "passing task-start baseline recorded",
             )
@@ -319,10 +319,10 @@ class PolicyEngine:
             task.path = TaskPath.REPAIR
             task.repair_targets = feedback.node_ids
             task.tdd_phase = TddPhase.RED_OBSERVED
-            return self._allow(task, None, "tdd.red_recorded", "red pytest result recorded")
+            return self._allow(task, action, "tdd.red_recorded", "red pytest result recorded")
         return self._deny(
             task,
-            None,
+            action,
             "tdd.baseline_invalid",
             "a coding baseline must pass or contain assertion failures",
         )

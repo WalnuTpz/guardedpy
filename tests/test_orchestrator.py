@@ -15,6 +15,7 @@ from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
 from guardedpy.domain import (
     ApprovalDecision,
+    PolicyVerdict,
     TaskIntent,
     TaskPath,
     TaskState,
@@ -108,6 +109,60 @@ def test_scripted_loop_returns_failure_feedback_then_corrects_and_completes(
     events = EventStore(tmp_path).events_for(task.id)
     assert any(event.feedback_kind and event.feedback_kind.value == "assertion_failure" for event in events)
     assert events[-1].stop_reason is StopReason.COMPLETED
+
+
+def test_stateful_pytest_denial_is_audited_and_not_promoted_to_llm_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a feature red without a test change advancing the loop as trusted feedback."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "value.py").write_text("VALUE = 'unchanged'\n")
+    task = _feature_task(tmp_path)
+    pytest_runs = iter(
+        (
+            PytestRun(0, "1 passed\n", "", False),
+            PytestRun(
+                1,
+                "FAILED tests/test_guardedpy_baseline.py::test_guardedpy_baseline - AssertionError\n",
+                "",
+                False,
+            ),
+        )
+    )
+    monkeypatch.setattr(Workspace, "run_pytest", lambda *_args: next(pytest_runs))
+    llm = ScriptedLLM(
+        [
+            _action(kind="run_pytest", summary="observe unmodified red", targets=[]),
+            _action(
+                kind="apply_patch",
+                summary="attempt source patch",
+                diff="--- a/src/value.py\n+++ b/src/value.py\n@@ -1 +1 @@\n-VALUE = 'unchanged'\n+VALUE = 'changed'\n",
+            ),
+            _action(kind="finish", summary="report blocked", status="blocked"),
+        ]
+    )
+
+    result = TaskOrchestrator(tmp_path, llm).run(task)
+
+    denial_context = json.loads(llm.contexts[1])
+    assert result.status is TaskStatus.BLOCKED
+    assert denial_context["context"]["feedback"] == {
+        "type": "policy_denial",
+        "rule_id": "tdd.test_change_required",
+        "reason": "a feature task must change a test before observing red",
+    }
+    assert (tmp_path / "src" / "value.py").read_text() == "VALUE = 'unchanged'\n"
+    pytest_event = next(
+        event
+        for event in EventStore(tmp_path).events_for(task.id)
+        if event.policy_rule_id == "tdd.test_change_required"
+    )
+    assert (pytest_event.policy_verdict, pytest_event.policy_rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.test_change_required",
+    )
 
 
 def test_orchestrator_injects_relevant_approved_memories_into_the_llm_context(

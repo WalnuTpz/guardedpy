@@ -48,6 +48,22 @@ def test_collector_treats_failed_runtime_with_node_as_execution_error() -> None:
     assert result.node_ids == ("tests/test_parser.py::test_bad_input",)
 
 
+def test_collector_treats_noncollection_error_as_execution_error_before_assertion() -> None:
+    """Catches an ERROR-phase fixture failure being mistaken for an assertion-only suite."""
+    run = PytestRun(
+        1,
+        "FAILED tests/test_example.py::test_assertion - AssertionError: assert 0\n"
+        "ERROR tests/test_example.py::test_fixture\n",
+        "",
+        False,
+    )
+
+    result = FeedbackCollector().collect(run)
+
+    assert result.kind is FeedbackKind.EXECUTION_ERROR
+    assert result.node_ids == ()
+
+
 def test_collector_does_not_treat_source_assert_in_a_runtime_traceback_as_assertion_evidence() -> None:
     """Catches a source assertion line making a TypeError look like an assertion failure."""
     run = PytestRun(

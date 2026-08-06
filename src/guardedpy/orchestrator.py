@@ -381,8 +381,16 @@ class TaskOrchestrator:
         if isinstance(action, RunPytestAction):
             run = workspace.run_pytest(action.targets)
             feedback = self._normalized_feedback(task, run)
-            self._policy.record_pytest(task, action, feedback)
-            self._feedback[task.id] = self._pytest_feedback(feedback)
+            recorded = self._policy.record_pytest(task, action, feedback)
+            self._feedback[task.id] = (
+                self._pytest_feedback(feedback)
+                if recorded.verdict is PolicyVerdict.ALLOW
+                else {
+                    "type": "policy_denial",
+                    "rule_id": recorded.rule_id,
+                    "reason": recorded.reason,
+                }
+            )
             feedback_node = (
                 self._policy.audit_feedback_node(task, feedback.node_ids[0])
                 if feedback.node_ids
@@ -392,7 +400,7 @@ class TaskOrchestrator:
                 self._decision_event(
                     task,
                     action,
-                    decision,
+                    recorded,
                     feedback=FeedbackAudit(
                         kind=feedback.kind,
                         node_id=(
@@ -437,7 +445,15 @@ class TaskOrchestrator:
             )
             return False
         recorded = self._policy.record_pytest(task, action, feedback)
-        self._feedback[task.id] = self._pytest_feedback(feedback)
+        self._feedback[task.id] = (
+            self._pytest_feedback(feedback)
+            if recorded.verdict is PolicyVerdict.ALLOW
+            else {
+                "type": "policy_denial",
+                "rule_id": recorded.rule_id,
+                "reason": recorded.reason,
+            }
+        )
         valid = feedback.kind in {FeedbackKind.PASSED, FeedbackKind.ASSERTION_FAILURE} and (
             feedback.kind is FeedbackKind.PASSED or bool(feedback.node_ids)
         )
@@ -452,7 +468,7 @@ class TaskOrchestrator:
             self._decision_event(
                 task,
                 action,
-                decision,
+                recorded,
                 feedback=FeedbackAudit(
                     kind=feedback.kind,
                     node_id=(

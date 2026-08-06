@@ -10,8 +10,13 @@ from guardedpy.domain import FeedbackKind
 
 
 _MAX_EXCERPT_CHARS = 800
+# Pytest output is untrusted; keep repair state and model context bounded.
+_MAX_NORMALIZED_NODE_IDS = 100
+_MAX_NORMALIZED_NODE_ID_CHARS = 500
+_MAX_NORMALIZED_NODE_CHARS = 20_000
 _FAILED_NODE = re.compile(r"^FAILED (?P<node>\S+)(?P<detail>[^\n]*)$", re.MULTILINE)
 _COLLECTION_NODE = re.compile(r"^ERROR collecting (?P<node>\S+)(?:\s|$)", re.MULTILINE)
+_ERROR_PHASE = re.compile(r"^ERROR(?:\s|$)", re.MULTILINE)
 _USEFUL_OUTPUT = re.compile(
     r"^(FAILED |ERROR collecting |INTERNALERROR|E\s{7}|.*(?:AssertionError|assert ).*)"
 )
@@ -53,6 +58,8 @@ class FeedbackCollector:
             return PytestFeedback(
                 FeedbackKind.COLLECTION_ERROR, collection_nodes, self._excerpt(output)
             )
+        if _ERROR_PHASE.search(output):
+            return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), self._excerpt(output))
 
         failed_matches = tuple(_FAILED_NODE.finditer(output))
         failed_nodes = tuple(match.group("node") for match in failed_matches)
@@ -83,6 +90,8 @@ class FeedbackCollector:
         roots = tuple((root / directory).resolve() for directory in test_dirs)
         normalized: list[str] = []
         for node_id in feedback.node_ids:
+            if len(node_id) > _MAX_NORMALIZED_NODE_ID_CHARS:
+                return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), feedback.excerpt)
             path_text, separator, suffix = node_id.partition("::")
             candidate = (root / path_text).resolve()
             if (
@@ -93,7 +102,15 @@ class FeedbackCollector:
                 projected = candidate.relative_to(root).as_posix()
                 if separator:
                     projected = f"{projected}::{suffix}"
+                if len(projected) > _MAX_NORMALIZED_NODE_ID_CHARS:
+                    return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), feedback.excerpt)
                 if projected not in normalized:
+                    if (
+                        len(normalized) == _MAX_NORMALIZED_NODE_IDS
+                        or sum(len(node) for node in normalized) + len(projected)
+                        > _MAX_NORMALIZED_NODE_CHARS
+                    ):
+                        return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), feedback.excerpt)
                     normalized.append(projected)
         return PytestFeedback(feedback.kind, tuple(normalized), feedback.excerpt)
 
