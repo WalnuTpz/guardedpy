@@ -280,6 +280,33 @@ def test_tui_status_command_renders_without_using_a_removed_widget_property(tmp_
     asyncio.run(check())
 
 
+@pytest.mark.parametrize(
+    "command",
+    ("/new unexpected", "/credentials unexpected", "/status unexpected", "/help unexpected"),
+)
+def test_tui_rejects_trailing_arguments_for_no_argument_commands(
+    tmp_path: Path, command: str
+) -> None:
+    """Catches a typo after a no-argument command changing the interactive session."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import RichLog
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            transcript = app.query_one("#transcript", RichLog)
+            transcript.write("保留的会话记录")
+            app.submit(command)
+            await pilot.pause()
+
+            assert transcript.lines[0].text == "保留的会话记录"
+            assert transcript.lines[-1].text == "未知命令。"
+
+    asyncio.run(check())
+
+
 def test_tui_approval_modal_shows_only_safe_projection(tmp_path: Path) -> None:
     """Catches the approval dialog exposing an action hash or raw model payload."""
     from guardedpy.tui import GuardedPyApp
@@ -304,6 +331,126 @@ def test_tui_approval_modal_shows_only_safe_projection(tmp_path: Path) -> None:
             assert "must-not-render" not in str(projection.render())
             with pytest.raises(NoMatches, match="approval-always"):
                 app.screen.query_one("#approval-always")
+
+    asyncio.run(check())
+
+
+def test_tui_rejected_approval_closes_modal_and_renders_the_blocked_task(tmp_path: Path) -> None:
+    """Catches a valid rejection being treated like an invalid approval response."""
+    from guardedpy.tui import GuardedPyApp
+
+    class RejectingRuntime(_Runtime):
+        def resolve_approval(self, task_id: object, action_hash: str, decision: object) -> bool:
+            assert task_id == task.id
+            assert action_hash == "approval-hash"
+            assert decision == "reject"
+            task.status = TaskStatus.BLOCKED
+            return False
+
+    profile = _profile(tmp_path)
+    task = TaskState(description="reject delete", config=HarnessConfig(profile=profile))
+    task.status = TaskStatus.WAITING_APPROVAL
+    app = GuardedPyApp(RejectingRuntime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app._active_task = task
+            app.request_approval(
+                task,
+                action_projection="删除项目内文件",
+                rule_id="delete.approval_required",
+                raw_action_hash="approval-hash",
+            )
+            await pilot.pause()
+            await pilot.click("#approval-reject")
+            await pilot.pause()
+
+            assert app._active_task is None
+            assert "任务：blocked" in str(app.query_one("#status").render())
+
+    asyncio.run(check())
+
+
+def test_tui_runs_blocking_approval_continuation_off_loop_and_keeps_cancel_reachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches approval resolution or its resumed run freezing the Textual event loop."""
+    from guardedpy.tui import GuardedPyApp
+
+    class BlockingApprovalOrchestrator:
+        def __init__(self) -> None:
+            self.task: TaskState | None = None
+            self.resolution_started = Event()
+            self.release = Event()
+            self.cancel_before_release = False
+
+        def submit(self, task: TaskState) -> TaskState:
+            self.task = task
+            return task
+
+        def run(self, task: TaskState) -> TaskState:
+            self.release.wait()
+            return task
+
+        def cancel(self, task_id: object) -> TaskState:
+            assert self.task is not None
+            assert task_id == self.task.id
+            self.cancel_before_release = not self.release.is_set()
+            self.task.status = TaskStatus.CANCELLED
+            self.release.set()
+            return self.task
+
+        def resolve_approval(self, task_id: object, action_hash: str, *, decision: object) -> bool:
+            assert self.task is not None
+            assert task_id == self.task.id
+            assert action_hash == "approval-hash"
+            assert decision == "once"
+            self.task.status = TaskStatus.RUNNING
+            self.resolution_started.set()
+            self.release.wait()
+            return True
+
+    profile = _profile(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    orchestrator = BlockingApprovalOrchestrator()
+    runtime = LocalRuntime(
+        RuntimeServices(
+            credentials=_Credentials(),
+            orchestrator_factory=lambda root, config, memory: orchestrator,
+        )
+    )
+    runtime.setup(profile, api_key=None)
+    task = runtime.create_task("approve command", TaskIntent.CODING)
+    task.status = TaskStatus.WAITING_APPROVAL
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        timer = Timer(1, orchestrator.release.set)
+        timer.start()
+        try:
+            async with app.run_test() as pilot:
+                app._active_task = task
+                app.request_approval(
+                    task,
+                    action_projection="运行已批准命令",
+                    rule_id="command.approval_required",
+                    raw_action_hash="approval-hash",
+                    permanent_eligible=True,
+                )
+                await pilot.pause()
+                await pilot.click("#approval-once")
+                await pilot.pause()
+                assert orchestrator.resolution_started.is_set()
+                assert orchestrator.release.is_set() is False
+
+                await pilot.press("ctrl+c")
+                assert orchestrator.cancel_before_release is True
+                app.submit("/status")
+                await pilot.pause()
+                assert "项目：" in str(app.query_one("#status").render())
+        finally:
+            timer.cancel()
+            orchestrator.release.set()
 
     asyncio.run(check())
 

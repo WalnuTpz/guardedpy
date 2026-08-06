@@ -335,17 +335,17 @@ class TaskOrchestrator:
                     "approved": True,
                 }
                 return True
-            try:
-                self._execute_allowed(task, action, approval, round_number)
-            except Exception:
-                self._stop(
-                    task,
-                    StopReason.UNRECOVERABLE_ERROR,
-                    round_number,
-                    action=action,
-                    decision=approval,
-                )
-            return True
+        try:
+            self._execute_allowed(task, action, approval, round_number)
+        except Exception:
+            self._stop(
+                task,
+                StopReason.UNRECOVERABLE_ERROR,
+                round_number,
+                action=action,
+                decision=approval,
+            )
+        return True
 
     def _execute_allowed(
         self, task: TaskState, action: Action, decision: PolicyDecision, round_number: int

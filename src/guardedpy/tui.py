@@ -18,6 +18,14 @@ from guardedpy.mechanism_demo import ScenarioName, run_scenario
 from guardedpy.terminal import COMMANDS, lifecycle_lines, run_plain_session
 
 
+_NO_ARGUMENT_COMMANDS = frozenset(
+    {
+        "/new", "/clear", "/history", "/exit", "/tests", "/diff",
+        "/credentials", "/status", "/doctor", "/help",
+    }
+)
+
+
 class ApprovalScreen(ModalScreen[str | None]):
     """A focused decision surface that receives only a safe action projection."""
 
@@ -108,6 +116,16 @@ class TaskRunFinished(Message):
     def __init__(self, task_id: UUID, result: TaskState | None) -> None:
         self.task_id = task_id
         self.result = result
+        super().__init__()
+
+
+class ApprovalResolutionFinished(Message):
+    """Deliver one approval resolution and any resumed run result to the event loop."""
+
+    def __init__(self, task_id: UUID, result: TaskState | None, accepted: bool) -> None:
+        self.task_id = task_id
+        self.result = result
+        self.accepted = accepted
         super().__init__()
 
 
@@ -202,15 +220,28 @@ class GuardedPyApp(App[None]):
             return
         task, action_hash = self._pending_approval
         self._pending_approval = None
+        worker = Thread(
+            target=self._resolve_approval_in_thread,
+            args=(task, action_hash, decision),
+            daemon=True,
+        )
+        self._run_threads[task.id] = worker
+        worker.start()
+
+    def _resolve_approval_in_thread(
+        self, task: TaskState, action_hash: str, decision: str
+    ) -> None:
         try:
-            if self.runtime.resolve_approval(task.id, action_hash, decision):
-                self._render_task(self.runtime.run(task.id))
+            accepted = self.runtime.resolve_approval(task.id, action_hash, decision)
+            result = self.runtime.run(task.id) if accepted else task
         except Exception:
-            self._write("审批请求已失效。")
+            self.post_message(ApprovalResolutionFinished(task.id, None, False))
+            return
+        self.post_message(ApprovalResolutionFinished(task.id, result, accepted))
 
     def _submit_command(self, command: str) -> None:
         name, _, argument = command.partition(" ")
-        if name not in COMMANDS:
+        if name not in COMMANDS or (name in _NO_ARGUMENT_COMMANDS and argument):
             self._write("未知命令。")
             return
         if name in {"/new", "/clear"}:
@@ -307,6 +338,20 @@ class GuardedPyApp(App[None]):
         self._run_threads.pop(event.task_id, None)
         if event.result is None:
             self._task_run_failed(event.task_id)
+            return
+        self._task_run_finished(event.result)
+
+    def on_approval_resolution_finished(self, event: ApprovalResolutionFinished) -> None:
+        self._run_threads.pop(event.task_id, None)
+        if event.result is None:
+            self._write("审批请求已失效。")
+            return
+        if not event.accepted and event.result.status not in {
+            TaskStatus.BLOCKED,
+            TaskStatus.CANCELLED,
+            TaskStatus.INTERRUPTED,
+        }:
+            self._write("审批请求已失效。")
             return
         self._task_run_finished(event.result)
 

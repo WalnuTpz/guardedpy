@@ -158,6 +158,67 @@ def test_cancel_reaches_a_blocking_local_runtime_run_before_the_run_is_released(
     assert runtime.task(task.id).status is TaskStatus.CANCELLED
 
 
+def test_runtime_rejects_a_duplicate_run_while_the_first_run_is_in_flight(
+    tmp_path: Path,
+) -> None:
+    """Catches two concurrent callers entering one task's orchestrator run."""
+
+    class BlockingOrchestrator:
+        def __init__(self) -> None:
+            self.task: TaskState | None = None
+            self.first_entered = Event()
+            self.release = Event()
+            self.entries = 0
+
+        def submit(self, task: TaskState) -> TaskState:
+            self.task = task
+            return task
+
+        def run(self, task: TaskState) -> TaskState:
+            self.entries += 1
+            if self.entries == 1:
+                task.status = TaskStatus.RUNNING
+                self.first_entered.set()
+                self.release.wait()
+            return task
+
+        def cancel(self, task_id: object) -> TaskState:
+            assert self.task is not None
+            assert task_id == self.task.id
+            self.task.status = TaskStatus.CANCELLED
+            self.release.set()
+            return self.task
+
+        def resolve_approval(self, task_id: object, action_hash: str, *, decision: object) -> bool:
+            del task_id, action_hash, decision
+            return False
+
+    orchestrator = BlockingOrchestrator()
+    runtime = LocalRuntime(
+        RuntimeServices(
+            credentials=FakeCredentials(),
+            orchestrator_factory=lambda root, config, memory: orchestrator,
+        )
+    )
+    runtime.setup(_profile(tmp_path), api_key=None)
+    task = runtime.create_task("long-running repair", TaskIntent.CODING)
+    first_run = Thread(target=runtime.run, args=(task.id,))
+    try:
+        first_run.start()
+        assert orchestrator.first_entered.wait(timeout=1)
+
+        with pytest.raises(RuntimeBusyError, match="已有任务正在运行"):
+            runtime.run(task.id)
+
+        assert orchestrator.entries == 1
+        assert runtime.cancel(task.id).status is TaskStatus.CANCELLED
+    finally:
+        orchestrator.release.set()
+        first_run.join(timeout=1)
+
+    assert first_run.is_alive() is False
+
+
 def test_task_snapshot_retains_model_and_effort_after_default_changes(tmp_path: Path) -> None:
     runtime = _replacing_runtime(FakeCredentials())
     runtime.setup(_profile(tmp_path), api_key=None)
