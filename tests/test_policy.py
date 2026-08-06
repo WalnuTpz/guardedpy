@@ -422,10 +422,10 @@ def test_complete_assertion_baseline_records_all_repair_targets_and_red(
         description="Persisted red without baseline evidence",
         intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
-        path=TaskPath.REPAIR,
-        repair_targets=targets,
-        tdd_phase=TddPhase.RED_OBSERVED,
     )
+    unbaselined.path = TaskPath.REPAIR
+    unbaselined.repair_targets = targets
+    unbaselined.tdd_phase = TddPhase.RED_OBSERVED
     policy.record_read(
         unbaselined,
         ReadFileAction(kind="read_file", summary="read parser", path="src/example.py"),

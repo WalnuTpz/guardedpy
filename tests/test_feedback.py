@@ -131,6 +131,22 @@ def test_normalize_nodes_keeps_ordered_existing_test_nodes_and_drops_unsafe_toke
     )
 
 
+def test_collector_keeps_every_observed_assertion_node_beyond_twenty() -> None:
+    """Catches automatic repair discovery silently truncating a large repair set."""
+    nodes = tuple(f"tests/test_many.py::test_{index}" for index in range(25))
+    run = PytestRun(
+        1,
+        "\n".join(f"FAILED {node} - AssertionError" for node in nodes),
+        "",
+        False,
+    )
+
+    feedback = FeedbackCollector().collect(run)
+
+    assert feedback.kind is FeedbackKind.ASSERTION_FAILURE
+    assert feedback.node_ids == nodes
+
+
 def test_run_pytest_uses_the_selected_root_as_its_working_directory(tmp_path: Path) -> None:
     """Catches a runner that executes project tests from the harness process directory."""
     tests_dir = tmp_path / "tests"

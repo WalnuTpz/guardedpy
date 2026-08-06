@@ -241,14 +241,15 @@ class EventStore:
             connection.execute(
                 """
                 INSERT INTO task_metadata (
-                    task_id, description, intent, config_json
-                ) VALUES (?, ?, ?, ?)
+                    task_id, description, intent, config_json, review_path
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     str(task.id),
                     task.description,
                     task.intent.value,
                     task.config.model_dump_json(),
+                    task.review_path,
                 ),
             )
             connection.execute(
@@ -267,7 +268,7 @@ class EventStore:
                 """
                 SELECT task_metadata.task_id, task_metadata.description,
                        task_metadata.intent, task_metadata.config_json,
-                       task_states.task_status
+                       task_states.task_status, task_metadata.review_path
                 FROM task_metadata
                 JOIN task_states ON task_states.task_id = task_metadata.task_id
                 ORDER BY task_metadata.rowid
@@ -280,6 +281,7 @@ class EventStore:
                 intent=TaskIntent(row[2]),
                 config=HarnessConfig.model_validate_json(row[3]),
                 status=TaskStatus(row[4]),
+                review_path=row[5],
             )
             for row in rows
         ]
@@ -393,7 +395,8 @@ class EventStore:
                     task_id TEXT PRIMARY KEY,
                     description TEXT NOT NULL,
                     intent TEXT NOT NULL,
-                    config_json TEXT NOT NULL
+                    config_json TEXT NOT NULL,
+                    review_path TEXT
                 );
                 CREATE TABLE IF NOT EXISTS event_policies (
                     event_id INTEGER PRIMARY KEY,
@@ -432,12 +435,17 @@ class EventStore:
                         task_id TEXT PRIMARY KEY,
                         description TEXT NOT NULL,
                         intent TEXT NOT NULL,
-                        config_json TEXT NOT NULL
+                        config_json TEXT NOT NULL,
+                        review_path TEXT
                     );
-                    INSERT INTO task_metadata (task_id, description, intent, config_json)
-                    SELECT task_id, description, 'coding', config_json
+                    INSERT INTO task_metadata (
+                        task_id, description, intent, config_json, review_path
+                    )
+                    SELECT task_id, description, 'coding', config_json, NULL
                     FROM task_metadata_manual_mode;
                     DROP TABLE task_metadata_manual_mode;
                     """
                 )
+            elif "review_path" not in metadata_columns:
+                connection.execute("ALTER TABLE task_metadata ADD COLUMN review_path TEXT")
             connection.commit()

@@ -119,6 +119,7 @@ def test_two_baseline_assertion_failures_create_repair_set_before_first_llm_call
         "intent": "coding",
         "path": "repair",
         "repair_targets": expected,
+        "review_path": None,
     }
     assert result.path is TaskPath.REPAIR
     assert result.repair_targets == expected
@@ -155,6 +156,88 @@ def test_invalid_complete_baseline_blocks_without_calling_llm(
     assert result.status is TaskStatus.BLOCKED
     assert result.path is TaskPath.BASELINE_PENDING
     assert llm.contexts == []
+
+
+def test_caller_supplied_coding_path_cannot_bypass_automatic_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches mutable/caller-supplied path state skipping the mandatory preflight."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_invalid.py").write_text("from missing_dependency import value\n")
+    llm = RecordingLLM()
+    task = TaskState(
+        description="Cannot bypass baseline",
+        intent=TaskIntent.CODING,
+        config=_config(tmp_path),
+        path=TaskPath.FEATURE,
+    )
+    task.path = TaskPath.FEATURE
+
+    result = TaskOrchestrator(tmp_path, llm).run(task)
+
+    assert result.status is TaskStatus.BLOCKED
+    assert llm.contexts == []
+
+
+def test_mixed_assertion_and_execution_failure_baseline_blocks_without_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches one assertion line turning a mixed invalid baseline into a repair set."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_mixed.py").write_text(
+        "def test_runtime_error() -> None:\n    raise TypeError('broken runtime')\n\n"
+        "def test_assertion() -> None:\n    assert 1 == 2\n"
+    )
+    llm = RecordingLLM()
+    task = _task(tmp_path)
+
+    result = TaskOrchestrator(tmp_path, llm).run(task)
+
+    assert result.status is TaskStatus.BLOCKED
+    assert result.repair_targets == ()
+    assert llm.contexts == []
+
+
+def test_review_intent_validates_and_retains_only_existing_project_path(
+    tmp_path: Path,
+) -> None:
+    """Catches review tasks accepting missing/root-escaping paths or losing their scope."""
+    config = _config(tmp_path)
+    (tmp_path / "src" / "value.py").write_text("VALUE = 1\n")
+
+    task = TaskState(
+        description="Review value",
+        intent=TaskIntent.REVIEW,
+        review_path="src/value.py",
+        config=config,
+    )
+
+    assert task.review_path == "src/value.py"
+    with pytest.raises(ValidationError, match="review path"):
+        TaskState(
+            description="Escape",
+            intent=TaskIntent.REVIEW,
+            review_path="../outside.py",
+            config=config,
+        )
+    with pytest.raises(ValidationError, match="review path"):
+        TaskState(
+            description="Missing",
+            intent=TaskIntent.REVIEW,
+            review_path="src/missing.py",
+            config=config,
+        )
+    with pytest.raises(ValidationError, match="review path"):
+        TaskState(
+            description="Plan",
+            intent=TaskIntent.PLAN,
+            review_path="src/value.py",
+            config=config,
+        )
 
 
 @pytest.mark.parametrize("intent", (TaskIntent.PLAN, TaskIntent.REVIEW))

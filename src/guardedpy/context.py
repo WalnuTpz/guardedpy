@@ -70,6 +70,7 @@ class ContextBuilder:
                     "intent": task.intent.value,
                     "path": task.path.value,
                     "repair_targets": task.repair_targets,
+                    "review_path": task.review_path,
                 },
                 "tdd_phase": task.tdd_phase.value,
                 "project_tree": self._project_tree(),

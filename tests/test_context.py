@@ -11,14 +11,15 @@ from guardedpy.memory import MemoryEntry
 
 
 def _task() -> TaskState:
-    return TaskState(
+    task = TaskState(
         description="Repair the parser",
         intent=TaskIntent.CODING,
         config=safe_config(Path.cwd()),
-        path=TaskPath.REPAIR,
-        repair_targets=("tests/test_parser.py::test_bad_input",),
-        tdd_phase=TddPhase.RED_OBSERVED,
     )
+    task.path = TaskPath.REPAIR
+    task.repair_targets = ("tests/test_parser.py::test_bad_input",)
+    task.tdd_phase = TddPhase.RED_OBSERVED
+    return task
 
 
 def test_context_keeps_read_file_body_out_of_trusted_rules(tmp_path: Path) -> None:

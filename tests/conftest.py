@@ -33,14 +33,15 @@ def feature_task(tmp_path: Path) -> TaskState:
 
 @pytest.fixture
 def ready_bugfix_task(tmp_path: Path) -> TaskState:
-    return TaskState(
+    task = TaskState(
         description="Fix a failing test",
         intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
-        path=TaskPath.REPAIR,
-        repair_targets=("tests/test_example.py::test_before",),
-        tdd_phase=TddPhase.RED_OBSERVED,
     )
+    task.path = TaskPath.REPAIR
+    task.repair_targets = ("tests/test_example.py::test_before",)
+    task.tdd_phase = TddPhase.RED_OBSERVED
+    return task
 
 
 SOURCE_DIFF = """--- a/src/example.py

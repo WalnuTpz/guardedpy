@@ -249,6 +249,24 @@ def test_register_task_persists_static_metadata_and_forces_pending_state(
     assert restored[0].status is TaskStatus.PENDING
 
 
+def test_register_task_persists_validated_review_scope(store: EventStore) -> None:
+    """Catches restart history dropping the immutable path that scopes a review task."""
+    (store.project_root / "src").mkdir(exist_ok=True)
+    (store.project_root / "src" / "value.py").write_text("VALUE = 1\n")
+    task = TaskState(
+        description="Review value",
+        intent=TaskIntent.REVIEW,
+        review_path="src/value.py",
+        config=safe_config(store.project_root),
+    )
+
+    store.register_task(task)
+
+    restored = EventStore(store.project_root).tasks()[0]
+    assert restored.intent is TaskIntent.REVIEW
+    assert restored.review_path == "src/value.py"
+
+
 def test_existing_event_database_adds_task_metadata_without_losing_events(
     store: EventStore,
 ) -> None:

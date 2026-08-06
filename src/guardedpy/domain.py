@@ -111,8 +111,28 @@ class TaskState(BaseModel):
     tdd_phase: TddPhase = TddPhase.TEST_DESIGN
     path: TaskPath = TaskPath.BASELINE_PENDING
     repair_targets: tuple[str, ...] = ()
+    review_path: str | None = Field(default=None, frozen=True)
 
     def model_post_init(self, __context: object) -> None:
-        """Select the read-only path without admitting user-selected coding paths."""
-        if self.intent in {TaskIntent.PLAN, TaskIntent.REVIEW}:
-            self.path = TaskPath.READ_ONLY
+        """Derive internal path state and validate the optional review scope."""
+        if self.intent is TaskIntent.CODING:
+            self.path = TaskPath.BASELINE_PENDING
+            self.repair_targets = ()
+            self.tdd_phase = TddPhase.TEST_DESIGN
+            if self.review_path is not None:
+                raise ValueError("review path is valid only for review intent")
+            return
+        self.path = TaskPath.READ_ONLY
+        if self.intent is TaskIntent.PLAN:
+            if self.review_path is not None:
+                raise ValueError("review path is valid only for review intent")
+            return
+        if self.review_path is None:
+            return
+        if not self.review_path.strip():
+            raise ValueError("review path must be a nonblank existing project path")
+        root = self.config.profile.root.resolve()
+        candidate = (root / self.review_path).resolve()
+        if not candidate.is_relative_to(root) or not candidate.exists():
+            raise ValueError("review path must be an existing path inside the project root")
+        object.__setattr__(self, "review_path", candidate.relative_to(root).as_posix())

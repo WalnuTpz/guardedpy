@@ -38,6 +38,7 @@ from guardedpy.domain import (
     TaskPath,
     TaskState,
     TaskStatus,
+    TddPhase,
     is_approval_decision,
 )
 from guardedpy.events import (
@@ -91,6 +92,7 @@ class TaskOrchestrator:
         self._loop_by_task: dict[UUID, _LoopState] = {}
         self._pending: dict[tuple[UUID, str], tuple[Action, PolicyDecision, int]] = {}
         self._cancelled_task_ids: set[UUID] = set()
+        self._baseline_attempted_task_ids: set[UUID] = set()
         self._state_lock = RLock()
         self._events = EventStore(self._project_root)
         self._events.mark_unfinished_interrupted()
@@ -115,7 +117,11 @@ class TaskOrchestrator:
                 task.status = TaskStatus.RUNNING
                 self._events.append(RunEvent(task_id=task.id, task_status=task.status))
         loop = self._loop_by_task.setdefault(task.id, _LoopState())
-        if task.intent is TaskIntent.CODING and task.path is TaskPath.BASELINE_PENDING:
+        if task.intent is TaskIntent.CODING and task.id not in self._baseline_attempted_task_ids:
+            self._baseline_attempted_task_ids.add(task.id)
+            task.path = TaskPath.BASELINE_PENDING
+            task.repair_targets = ()
+            task.tdd_phase = TddPhase.TEST_DESIGN
             if not self._run_coding_baseline(task):
                 return task
 

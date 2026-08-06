@@ -220,6 +220,22 @@ def test_runtime_registers_a_task_after_orchestrator_startup_recovery(tmp_path: 
     assert EventStore(tmp_path).events_for(task.id) == []
 
 
+def test_runtime_registers_review_intent_with_validated_project_scope(tmp_path: Path) -> None:
+    """Catches the runtime dropping the review path before task persistence and policy use."""
+    runtime = _runtime(tmp_path)
+    runtime.setup(_profile(tmp_path), api_key=None)
+    (tmp_path / "src" / "value.py").write_text("VALUE = 1\n")
+
+    task = runtime.create_task(
+        "Review value",
+        TaskIntent.REVIEW,
+        review_path="src/value.py",
+    )
+
+    assert task.review_path == "src/value.py"
+    assert EventStore(tmp_path).tasks()[0].review_path == "src/value.py"
+
+
 def test_invalid_task_intent_releases_the_lease_before_another_runtime_mutates(
     tmp_path: Path,
 ) -> None:

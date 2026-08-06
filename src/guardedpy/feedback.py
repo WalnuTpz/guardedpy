@@ -9,14 +9,14 @@ import re
 from guardedpy.domain import FeedbackKind
 
 
-_MAX_NODE_IDS = 20
 _MAX_EXCERPT_CHARS = 800
-_FAILED_NODE = re.compile(r"^FAILED (?P<node>\S+)(?:\s|$)", re.MULTILINE)
+_FAILED_NODE = re.compile(r"^FAILED (?P<node>\S+)(?P<detail>[^\n]*)$", re.MULTILINE)
 _COLLECTION_NODE = re.compile(r"^ERROR collecting (?P<node>\S+)(?:\s|$)", re.MULTILINE)
 _USEFUL_OUTPUT = re.compile(
     r"^(FAILED |ERROR collecting |INTERNALERROR|E\s{7}|.*(?:AssertionError|assert ).*)"
 )
 _ASSERTION_EVIDENCE = re.compile(r"^E\s+(?:AssertionError\b|assert\b)", re.MULTILINE)
+_ASSERTION_SUMMARY = re.compile(r"(?:AssertionError\b|\bassert(?:ion failed)?\b)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -54,10 +54,18 @@ class FeedbackCollector:
                 FeedbackKind.COLLECTION_ERROR, collection_nodes, self._excerpt(output)
             )
 
-        failed_nodes = self._node_ids(_FAILED_NODE, output)
+        failed_matches = tuple(_FAILED_NODE.finditer(output))
+        failed_nodes = tuple(match.group("node") for match in failed_matches)
         if failed_nodes:
             excerpt = self._excerpt(output)
-            if not _ASSERTION_EVIDENCE.search(excerpt):
+            per_node_assertions = tuple(
+                bool(_ASSERTION_SUMMARY.search(match.group("detail")))
+                for match in failed_matches
+            )
+            all_assertions = all(per_node_assertions) or (
+                len(failed_nodes) == 1 and _ASSERTION_EVIDENCE.search(excerpt) is not None
+            )
+            if not all_assertions:
                 return PytestFeedback(FeedbackKind.EXECUTION_ERROR, failed_nodes, excerpt)
             return PytestFeedback(
                 FeedbackKind.ASSERTION_FAILURE, failed_nodes, excerpt
@@ -91,7 +99,7 @@ class FeedbackCollector:
 
     @staticmethod
     def _node_ids(pattern: re.Pattern[str], output: str) -> tuple[str, ...]:
-        return tuple(match.group("node") for match in pattern.finditer(output))[:_MAX_NODE_IDS]
+        return tuple(match.group("node") for match in pattern.finditer(output))
 
     @staticmethod
     def _excerpt(output: str) -> str:

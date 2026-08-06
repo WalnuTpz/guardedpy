@@ -204,13 +204,18 @@ class LocalRuntime:
                     self._release_lease()
 
     def create_task(
-        self, description: str, intent: TaskIntent = TaskIntent.CODING
+        self,
+        description: str,
+        intent: TaskIntent = TaskIntent.CODING,
+        review_path: str | None = None,
     ) -> TaskState:
         """Register one pending task and retain the execution lease for its lifecycle."""
         with self._lifecycle_lock:
-            return self._create_task(description, intent)
+            return self._create_task(description, intent, review_path)
 
-    def _create_task(self, description: str, intent: TaskIntent) -> TaskState:
+    def _create_task(
+        self, description: str, intent: TaskIntent, review_path: str | None
+    ) -> TaskState:
         root, config, memory_store = self._configured()
         description = description.strip()
         if not description:
@@ -220,6 +225,7 @@ class LocalRuntime:
             description=description,
             intent=intent,
             config=snapshot,
+            review_path=review_path,
         )
         if self._has_active_task() or not self._acquire_lease():
             raise RuntimeBusyError()
