@@ -8,14 +8,13 @@ import sys
 from threading import Event, Thread
 
 import pytest
-from pydantic import ValidationError
 
 import guardedpy.runtime as runtime_module
 from guardedpy.actions import RunCommandAction
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig, project_config_path
 from guardedpy.credentials import CredentialStatus
-from guardedpy.domain import TaskMode, TaskState, TaskStatus
+from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.discovery import ProjectProfile
 from guardedpy.events import EventStore
 from guardedpy.lease import ExecutionLease, GlobalStateLease
@@ -93,7 +92,7 @@ def test_task_snapshot_retains_model_and_effort_after_default_changes(tmp_path: 
     runtime = _replacing_runtime(FakeCredentials())
     runtime.setup(_profile(tmp_path), api_key=None)
     runtime.update_future_defaults(model="deepseek-v4-pro", reasoning_effort="max")
-    task = runtime.create_task("first", TaskMode.FEATURE, None)
+    task = runtime.create_task("first", TaskIntent.CODING)
 
     assert task.config is not runtime.config
     runtime.cancel(task.id)
@@ -109,7 +108,7 @@ def test_task_snapshot_retains_model_and_effort_after_default_changes(tmp_path: 
 def test_future_default_update_is_rejected_while_task_is_active(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     runtime.setup(_profile(tmp_path), api_key=None)
-    runtime.create_task("active", TaskMode.FEATURE, None)
+    runtime.create_task("active", TaskIntent.CODING)
 
     with pytest.raises(RuntimeBusyError):
         runtime.update_future_defaults(model="deepseek-v4-pro")
@@ -135,7 +134,7 @@ def test_task_creation_refreshes_defaults_persisted_by_another_runtime(
     stale = _replacing_runtime(FakeCredentials())
 
     first.update_future_defaults(model="deepseek-v4-pro", reasoning_effort="max")
-    task = stale.create_task("fresh snapshot", TaskMode.FEATURE, None)
+    task = stale.create_task("fresh snapshot", TaskIntent.CODING)
 
     assert task.config.model == "deepseek-v4-pro"
     assert task.config.reasoning_effort == "max"
@@ -164,10 +163,10 @@ def test_second_runtime_cannot_create_a_task_while_first_runtime_holds_active_le
     first.setup(_profile(tmp_path), api_key=None)
     second.setup(_profile(tmp_path), api_key=None)
 
-    task = first.create_task("repair value", TaskMode.BUGFIX, "tests/test_value.py::test_value")
+    task = first.create_task("repair value", TaskIntent.CODING)
 
     with pytest.raises(RuntimeBusyError, match="已有任务正在运行"):
-        second.create_task("another task", TaskMode.FEATURE, None)
+        second.create_task("another task", TaskIntent.CODING)
 
     assert first.task(task.id) is task
     assert [stored.id for stored in second.tasks()] == [task.id]
@@ -179,10 +178,10 @@ def test_terminal_run_releases_task_lease_for_another_runtime(tmp_path: Path) ->
     second = _runtime(tmp_path)
     first.setup(_profile(tmp_path), api_key=None)
     second.setup(_profile(tmp_path), api_key=None)
-    task = first.create_task("finish", TaskMode.FEATURE, None)
+    task = first.create_task("finish", TaskIntent.CODING)
 
     assert first.run(task.id).status is TaskStatus.BLOCKED
-    assert second.create_task("next task", TaskMode.FEATURE, None).status is TaskStatus.PENDING
+    assert second.create_task("next task", TaskIntent.CODING).status is TaskStatus.PENDING
 
 
 def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate(
@@ -191,7 +190,7 @@ def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate
     """Catches restart recovery leaving persisted work active in the runtime cache."""
     first = _runtime(tmp_path)
     first.setup(_profile(tmp_path), api_key=None)
-    task = first.create_task("interrupted", TaskMode.FEATURE, None)
+    task = first.create_task("interrupted", TaskIntent.CODING)
     first._release_lease()
 
     recovered = _runtime(tmp_path)
@@ -199,7 +198,7 @@ def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate
 
     assert interrupted == (task.id,)
     assert recovered.task(task.id).status is TaskStatus.INTERRUPTED
-    assert recovered.create_task("next", TaskMode.FEATURE, None).status is TaskStatus.PENDING
+    assert recovered.create_task("next", TaskIntent.CODING).status is TaskStatus.PENDING
 
 
 def test_runtime_rejects_a_blank_task_description(tmp_path: Path) -> None:
@@ -207,21 +206,21 @@ def test_runtime_rejects_a_blank_task_description(tmp_path: Path) -> None:
     runtime.setup(_profile(tmp_path), api_key=None)
 
     with pytest.raises(ValueError, match="description"):
-        runtime.create_task("  ", TaskMode.FEATURE, None)
+        runtime.create_task("  ", TaskIntent.CODING)
 
 
 def test_runtime_registers_a_task_after_orchestrator_startup_recovery(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     runtime.setup(_profile(tmp_path), api_key=None)
 
-    task = runtime.create_task("keep pending", TaskMode.FEATURE, None)
+    task = runtime.create_task("keep pending", TaskIntent.CODING)
 
     assert EventStore(tmp_path).tasks()[0].id == task.id
     assert EventStore(tmp_path).tasks()[0].status is TaskStatus.PENDING
     assert EventStore(tmp_path).events_for(task.id) == []
 
 
-def test_invalid_bugfix_target_releases_the_lease_before_another_runtime_mutates(
+def test_invalid_task_intent_releases_the_lease_before_another_runtime_mutates(
     tmp_path: Path,
 ) -> None:
     first = _runtime(tmp_path)
@@ -229,10 +228,10 @@ def test_invalid_bugfix_target_releases_the_lease_before_another_runtime_mutates
     first.setup(_profile(tmp_path), api_key=None)
     second.setup(_profile(tmp_path), api_key=None)
 
-    with pytest.raises(ValidationError):
-        first.create_task("repair", TaskMode.BUGFIX, "  ")
+    with pytest.raises(ValueError):
+        first.create_task("repair", "bugfix")  # type: ignore[arg-type]
 
-    assert second.create_task("another task", TaskMode.FEATURE, None).status is TaskStatus.PENDING
+    assert second.create_task("another task", TaskIntent.CODING).status is TaskStatus.PENDING
 
 
 def test_runtime_returns_event_store_safe_projection_without_pending_action_body(
@@ -243,7 +242,7 @@ def test_runtime_returns_event_store_safe_projection_without_pending_action_body
         [['{"kind":"finish","summary":"PRIVATE","status":"blocked"}']],
     )
     runtime.setup(_profile(tmp_path), api_key=None)
-    task = runtime.create_task("inspect", TaskMode.FEATURE, None)
+    task = runtime.create_task("inspect", TaskIntent.CODING)
 
     runtime.run(task.id)
 
@@ -251,11 +250,14 @@ def test_runtime_returns_event_store_safe_projection_without_pending_action_body
 
 
 def test_runtime_exposes_memory_rule_and_nonsecret_credential_operations(tmp_path: Path) -> None:
+    (tmp_path / "tests" / "test_baseline.py").write_text(
+        "def test_baseline() -> None:\n    assert True\n"
+    )
     proposal = '{"kind":"propose_memory","summary":"remember","text":"Use focused tests"}'
     finish = '{"kind":"finish","summary":"stop","status":"completed"}'
     runtime = _runtime(tmp_path, [[proposal, finish]])
     runtime.setup(_profile(tmp_path), api_key=None)
-    task = runtime.create_task("remember a convention", TaskMode.FEATURE, None)
+    task = runtime.create_task("remember a convention", TaskIntent.CODING)
 
     runtime.run(task.id)
     memory = runtime.memory_proposals()[0]
@@ -295,10 +297,10 @@ def test_global_execution_lease_blocks_a_second_project_task_but_preserves_index
     first.setup(_profile(first_root), api_key=None)
     second.setup(_profile(second_root), api_key=None)
 
-    first_task = first.create_task("first task", TaskMode.FEATURE, None)
+    first_task = first.create_task("first task", TaskIntent.CODING)
 
     with pytest.raises(RuntimeBusyError):
-        second.create_task("second task", TaskMode.FEATURE, None)
+        second.create_task("second task", TaskIntent.CODING)
 
     reader = _runtime(second_root)
     assert [task.id for task in reader.tasks()] == [first_task.id]
@@ -311,7 +313,7 @@ def test_setup_rejects_a_second_project_while_a_global_task_is_active(tmp_path: 
     first = _runtime(first_root)
     second = _runtime(second_root)
     first.setup(_profile(first_root), api_key=None)
-    first.create_task("first task", TaskMode.FEATURE, None)
+    first.create_task("first task", TaskIntent.CODING)
 
     with pytest.raises(RuntimeBusyError):
         second.setup(_profile(second_root), api_key=None)
@@ -428,7 +430,7 @@ def test_failing_submit_keeps_global_index_locked_until_rollback_finishes(
 
     def create_failing_task() -> None:
         try:
-            first.create_task("fail", TaskMode.FEATURE, None)
+            first.create_task("fail", TaskIntent.CODING)
         except RuntimeError as error:
             errors.append(error)
 
@@ -438,13 +440,13 @@ def test_failing_submit_keeps_global_index_locked_until_rollback_finishes(
     assert restore_started.wait(1)
     try:
         with pytest.raises(RuntimeBusyError):
-            second.create_task("interleaved", TaskMode.FEATURE, None)
+            second.create_task("interleaved", TaskIntent.CODING)
     finally:
         allow_restore.set()
         failing_thread.join()
 
     assert errors and str(errors[0]) == "submit failed"
-    second_task = second.create_task("after rollback", TaskMode.FEATURE, None)
+    second_task = second.create_task("after rollback", TaskIntent.CODING)
     reader = _runtime(second_root)
     assert [task.id for task in reader.tasks()] == [second_task.id]
 
@@ -484,12 +486,12 @@ def test_same_runtime_task_rollback_cannot_release_a_serialized_winner_lease(
 
     def create_failed_task() -> None:
         try:
-            first.create_task("fail", TaskMode.FEATURE, None)
+            first.create_task("fail", TaskIntent.CODING)
         except RuntimeError as error:
             failed.append(error)
 
     def create_winning_task() -> None:
-        winners.append(first.create_task("winner", TaskMode.FEATURE, None))
+        winners.append(first.create_task("winner", TaskIntent.CODING))
 
     monkeypatch.setattr(runtime_module, "_restore_file", blocked_restore)
     failing_thread = Thread(target=create_failed_task)
@@ -504,7 +506,7 @@ def test_same_runtime_task_rollback_cannot_release_a_serialized_winner_lease(
     assert [str(error) for error in failed] == ["submit failed"]
     assert [task.description for task in winners] == ["winner"]
     with pytest.raises(RuntimeBusyError):
-        second.create_task("must remain blocked", TaskMode.FEATURE, None)
+        second.create_task("must remain blocked", TaskIntent.CODING)
 
 
 @dataclass
@@ -543,13 +545,13 @@ def test_run_caches_a_replacement_terminal_task_and_releases_its_lease(tmp_path:
     second = _runtime(tmp_path)
     first.setup(_profile(tmp_path), api_key=None)
     second.setup(_profile(tmp_path), api_key=None)
-    task = first.create_task("finish", TaskMode.FEATURE, None)
+    task = first.create_task("finish", TaskIntent.CODING)
 
     returned = first.run(task.id)
 
     assert first.task(task.id) is returned
     assert returned.status is TaskStatus.COMPLETED
-    assert second.create_task("next", TaskMode.FEATURE, None).status is TaskStatus.PENDING
+    assert second.create_task("next", TaskIntent.CODING).status is TaskStatus.PENDING
 
 
 def test_cancel_caches_a_replacement_terminal_task_and_releases_its_lease(tmp_path: Path) -> None:
@@ -558,10 +560,10 @@ def test_cancel_caches_a_replacement_terminal_task_and_releases_its_lease(tmp_pa
     second = _runtime(tmp_path)
     first.setup(_profile(tmp_path), api_key=None)
     second.setup(_profile(tmp_path), api_key=None)
-    task = first.create_task("cancel", TaskMode.FEATURE, None)
+    task = first.create_task("cancel", TaskIntent.CODING)
 
     returned = first.cancel(task.id)
 
     assert first.task(task.id) is returned
     assert returned.status is TaskStatus.CANCELLED
-    assert second.create_task("next", TaskMode.FEATURE, None).status is TaskStatus.PENDING
+    assert second.create_task("next", TaskIntent.CODING).status is TaskStatus.PENDING

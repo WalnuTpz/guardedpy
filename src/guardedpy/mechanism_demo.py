@@ -13,7 +13,7 @@ from typing import Iterator, Literal
 from guardedpy.actions import RunCommandAction
 from guardedpy.config import HarnessConfig
 from guardedpy.context import LlmContext
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState
+from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskIntent, TaskState
 from guardedpy.discovery import discover_project
 from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.llm import ScriptedLLM
@@ -58,11 +58,13 @@ class FeedbackAwareDemoLLM(ScriptedLLM):
         super().__init__(_corrective_responses())
 
     def complete(self, context: LlmContext) -> str:
-        if len(self.contexts) == 2:
+        if len(self.contexts) in {0, 2}:
             feedback = context.trusted_data.get("feedback")
-            assert isinstance(feedback, dict) and feedback.get("type") == "pytest_feedback" and (
-                feedback.get("kind") == "assertion_failure"
-            ), "repair requires trusted assertion feedback"
+            assert feedback == {
+                "type": "pytest_feedback",
+                "kind": "assertion_failure",
+                "node_ids": ("tests/test_value.py::test_value_is_fixed",),
+            }, "repair requires trusted pytest_feedback assertion_failure repair target"
         return super().complete(context)
 
 
@@ -84,11 +86,10 @@ def run_scenario(name: ScenarioName) -> ScenarioResult:
         raise KeyError(name)
 
     with _isolated_demo_root() as root:
-        _write_fixture(root)
+        _write_fixture(root, name)
         task = TaskState(
             description=_description_for(name),
-            mode=TaskMode.BUGFIX,
-            bugfix_target="tests/test_value.py::test_value_is_fixed",
+            intent=TaskIntent.CODING,
             config=HarnessConfig(profile=discover_project(root)),
         )
         llm = FeedbackAwareDemoLLM() if name == "failure_feedback_corrects" else ScriptedLLM(
@@ -141,14 +142,15 @@ def _isolated_demo_root() -> Iterator[Path]:
                     os.environ[name] = value
 
 
-def _write_fixture(root: Path) -> None:
+def _write_fixture(root: Path, name: ScenarioName) -> None:
     (root / "src").mkdir()
     (root / "tests").mkdir()
     (root / "src" / "value.py").write_text("broken\n")
+    expected = "broken" if name == "tdd_source_patch_denied" else "fixed"
     (root / "tests" / "test_value.py").write_text(
         "from pathlib import Path\n\n"
         "def test_value_is_fixed() -> None:\n"
-        "    assert Path('src/value.py').read_text() == 'fixed\\n'\n"
+        f"    assert Path('src/value.py').read_text() == '{expected}\\n'\n"
     )
 
 

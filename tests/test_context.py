@@ -6,16 +6,17 @@ from pathlib import Path
 
 from conftest import safe_config
 from guardedpy.context import ContextBuilder
-from guardedpy.domain import TaskMode, TaskState, TddPhase
+from guardedpy.domain import TaskIntent, TaskPath, TaskState, TddPhase
 from guardedpy.memory import MemoryEntry
 
 
 def _task() -> TaskState:
     return TaskState(
         description="Repair the parser",
-        mode=TaskMode.BUGFIX,
-        bugfix_target="tests/test_parser.py::test_bad_input",
+        intent=TaskIntent.CODING,
         config=safe_config(Path.cwd()),
+        path=TaskPath.REPAIR,
+        repair_targets=("tests/test_parser.py::test_bad_input",),
         tdd_phase=TddPhase.RED_OBSERVED,
     )
 

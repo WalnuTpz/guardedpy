@@ -11,7 +11,7 @@ from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.discovery import ProjectProfile
 from guardedpy.domain import FeedbackKind
-from guardedpy.feedback import FeedbackCollector, PytestRun
+from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
 from guardedpy.workspace import Workspace
 
 
@@ -100,6 +100,35 @@ def test_collector_classifies_the_remaining_pytest_outcomes(
 
     assert result.kind is expected_kind
     assert result.node_ids == expected_nodes
+
+
+def test_normalize_nodes_keeps_ordered_existing_test_nodes_and_drops_unsafe_tokens(
+    tmp_path: Path,
+) -> None:
+    """Catches automatic repair targets retaining duplicates, missing files, or root escapes."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_a.py").write_text("def test_a() -> None:\n    assert False\n")
+    feedback = PytestFeedback(
+        FeedbackKind.ASSERTION_FAILURE,
+        (
+            "tests/test_a.py::test_a",
+            "tests/test_a.py::test_a",
+            "tests/missing.py::test_missing",
+            "../outside.py::test_outside",
+        ),
+        "assert False",
+    )
+
+    normalized = FeedbackCollector.normalize_nodes(
+        feedback, tmp_path, (PurePosixPath("tests"),)
+    )
+
+    assert normalized == PytestFeedback(
+        FeedbackKind.ASSERTION_FAILURE,
+        ("tests/test_a.py::test_a",),
+        "assert False",
+    )
 
 
 def test_run_pytest_uses_the_selected_root_as_its_working_directory(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 import re
 
 from guardedpy.domain import FeedbackKind
@@ -62,6 +63,31 @@ class FeedbackCollector:
                 FeedbackKind.ASSERTION_FAILURE, failed_nodes, excerpt
             )
         return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), self._excerpt(output))
+
+    @staticmethod
+    def normalize_nodes(
+        feedback: PytestFeedback,
+        project_root: Path,
+        test_dirs: tuple[PurePosixPath, ...],
+    ) -> PytestFeedback:
+        """Keep ordered, existing pytest nodes contained by configured test roots."""
+        root = project_root.resolve()
+        roots = tuple((root / directory).resolve() for directory in test_dirs)
+        normalized: list[str] = []
+        for node_id in feedback.node_ids:
+            path_text, separator, suffix = node_id.partition("::")
+            candidate = (root / path_text).resolve()
+            if (
+                candidate.is_file()
+                and candidate.is_relative_to(root)
+                and any(candidate.is_relative_to(test_root) for test_root in roots)
+            ):
+                projected = candidate.relative_to(root).as_posix()
+                if separator:
+                    projected = f"{projected}::{suffix}"
+                if projected not in normalized:
+                    normalized.append(projected)
+        return PytestFeedback(feedback.kind, tuple(normalized), feedback.excerpt)
 
     @staticmethod
     def _node_ids(pattern: re.Pattern[str], output: str) -> tuple[str, ...]:

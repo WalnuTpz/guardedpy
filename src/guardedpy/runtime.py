@@ -25,7 +25,7 @@ from guardedpy.config import (
 )
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import ApprovalDecision, CommandApprovalRule, TaskMode, TaskState, TaskStatus
+from guardedpy.domain import ApprovalDecision, CommandApprovalRule, TaskIntent, TaskState, TaskStatus
 from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.lease import ExecutionLease, GlobalExecutionLease, GlobalStateLease
 from guardedpy.memory import MemoryEntry, MemoryStore
@@ -204,15 +204,13 @@ class LocalRuntime:
                     self._release_lease()
 
     def create_task(
-        self, description: str, mode: TaskMode, bugfix_target: str | None
+        self, description: str, intent: TaskIntent = TaskIntent.CODING
     ) -> TaskState:
         """Register one pending task and retain the execution lease for its lifecycle."""
         with self._lifecycle_lock:
-            return self._create_task(description, mode, bugfix_target)
+            return self._create_task(description, intent)
 
-    def _create_task(
-        self, description: str, mode: TaskMode, bugfix_target: str | None
-    ) -> TaskState:
+    def _create_task(self, description: str, intent: TaskIntent) -> TaskState:
         root, config, memory_store = self._configured()
         description = description.strip()
         if not description:
@@ -220,8 +218,7 @@ class LocalRuntime:
         snapshot = config.model_copy(deep=True)
         task = TaskState(
             description=description,
-            mode=mode,
-            bugfix_target=bugfix_target if mode is TaskMode.BUGFIX else None,
+            intent=intent,
             config=snapshot,
         )
         if self._has_active_task() or not self._acquire_lease():

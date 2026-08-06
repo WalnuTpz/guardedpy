@@ -17,7 +17,7 @@ from openai import OpenAI
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialService
 from guardedpy.discovery import ProjectDiscoveryError, discover_project
-from guardedpy.domain import TaskMode, TaskState, TaskStatus, is_approval_decision
+from guardedpy.domain import TaskIntent, TaskState, TaskStatus, is_approval_decision
 from guardedpy.llm import DeepSeekClient
 from guardedpy.orchestrator import TaskOrchestrator
 from guardedpy.runtime import LocalRuntime, RuntimeServices
@@ -108,11 +108,6 @@ def main(
     except SystemExit as error:
         return int(error.code)
 
-    if arguments.mode == TaskMode.BUGFIX.value and not (
-        arguments.target and arguments.target.strip()
-    ):
-        return 2
-
     output = stdout or sys.stdout
     source = stdin or sys.stdin
     try:
@@ -126,8 +121,7 @@ def main(
         return _run_task(
             runtime,
             arguments.prompt,
-            TaskMode(arguments.mode),
-            arguments.target,
+            TaskIntent.CODING,
             output,
             source.readline,
         )
@@ -175,15 +169,13 @@ def run_repl(
         if line.startswith("/"):
             stdout.write("未知命令。\n")
             continue
-        _run_task(runtime, line, TaskMode.FEATURE, None, stdout, stdin.readline)
+        _run_task(runtime, line, TaskIntent.CODING, stdout, stdin.readline)
     return 0
 
 
 def _parser() -> _ArgumentParser:
     parser = _ArgumentParser(prog="guardedpy", add_help=True)
     parser.add_argument("--prompt")
-    parser.add_argument("--mode", choices=tuple(mode.value for mode in TaskMode), default="feature")
-    parser.add_argument("--target")
     return parser
 
 
@@ -204,25 +196,14 @@ def _current_git_branch(project_root: Path) -> str | None:
 
 
 def _interactive_task(runtime: LocalRuntime, stdout: TextIO, read_line: Callable[[], str]) -> int:
-    mode_text = _prompt(stdout, read_line, "任务类型（feature/bugfix）: ")
-    if mode_text not in {mode.value for mode in TaskMode}:
-        stdout.write("任务类型无效。\n")
-        return 2
     description = _prompt(stdout, read_line, "任务描述: ")
-    target: str | None = None
-    if mode_text == TaskMode.BUGFIX.value:
-        target = _prompt(stdout, read_line, "pytest node: ")
-        if not target.strip():
-            stdout.write("缺陷修复任务必须提供 pytest node。\n")
-            return 2
-    return _run_task(runtime, description, TaskMode(mode_text), target, stdout, read_line)
+    return _run_task(runtime, description, TaskIntent.CODING, stdout, read_line)
 
 
 def _run_task(
     runtime: LocalRuntime,
     description: str,
-    mode: TaskMode,
-    target: str | None,
+    intent: TaskIntent,
     stdout: TextIO,
     read_line: Callable[[], str],
 ) -> int:
@@ -231,7 +212,7 @@ def _run_task(
         return 2
     task: TaskState | None = None
     try:
-        task = runtime.create_task(description, mode, target)
+        task = runtime.create_task(description, intent)
         result = runtime.run(task.id)
     except KeyboardInterrupt:
         return _cancel_task(runtime, task.id if task is not None else None, stdout)

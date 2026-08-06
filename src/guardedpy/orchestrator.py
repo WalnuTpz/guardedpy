@@ -33,6 +33,9 @@ from guardedpy.domain import (
     ApprovalDecision,
     PolicyDecision,
     PolicyVerdict,
+    FeedbackKind,
+    TaskIntent,
+    TaskPath,
     TaskState,
     TaskStatus,
     is_approval_decision,
@@ -45,7 +48,7 @@ from guardedpy.events import (
     StopReason,
     safe_action_projection,
 )
-from guardedpy.feedback import FeedbackCollector, PytestFeedback
+from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
 from guardedpy.llm import LLMClient, TemporaryProviderFailure
 from guardedpy.memory import MemoryStore
 from guardedpy.policy import PolicyEngine
@@ -112,6 +115,9 @@ class TaskOrchestrator:
                 task.status = TaskStatus.RUNNING
                 self._events.append(RunEvent(task_id=task.id, task_status=task.status))
         loop = self._loop_by_task.setdefault(task.id, _LoopState())
+        if task.intent is TaskIntent.CODING and task.path is TaskPath.BASELINE_PENDING:
+            if not self._run_coding_baseline(task):
+                return task
 
         while loop.next_round < self._max_rounds:
             if task.status is TaskStatus.CANCELLED:
@@ -368,7 +374,7 @@ class TaskOrchestrator:
             return
         if isinstance(action, RunPytestAction):
             run = workspace.run_pytest(action.targets)
-            feedback = self._feedback_collector.collect(run)
+            feedback = self._normalized_feedback(task, run)
             self._policy.record_pytest(task, action, feedback)
             self._feedback[task.id] = self._pytest_feedback(feedback)
             feedback_node = (
@@ -403,6 +409,65 @@ class TaskOrchestrator:
             self._record_decision(task, action, decision, round_number)
             return
         raise TypeError(f"unsupported allowed action: {type(action).__name__}")
+
+    def _run_coding_baseline(self, task: TaskState) -> bool:
+        """Classify one coding task from a complete suite before any model call."""
+        action = RunPytestAction(
+            kind="run_pytest",
+            summary="automatic complete-suite baseline",
+            targets=(),
+        )
+        decision = self._policy.decide(task, action)
+        try:
+            run = self._workspace_by_task[task.id].run_pytest(())
+            feedback = self._normalized_feedback(task, run)
+        except Exception:
+            self._stop(
+                task,
+                StopReason.UNRECOVERABLE_ERROR,
+                0,
+                action=action,
+                decision=decision,
+            )
+            return False
+        recorded = self._policy.record_pytest(task, action, feedback)
+        self._feedback[task.id] = self._pytest_feedback(feedback)
+        valid = feedback.kind in {FeedbackKind.PASSED, FeedbackKind.ASSERTION_FAILURE} and (
+            feedback.kind is FeedbackKind.PASSED or bool(feedback.node_ids)
+        )
+        if not valid or recorded.verdict is PolicyVerdict.DENY:
+            task.status = TaskStatus.BLOCKED
+        feedback_node = (
+            self._policy.audit_feedback_node(task, feedback.node_ids[0])
+            if feedback.node_ids
+            else None
+        )
+        self._events.append(
+            self._decision_event(
+                task,
+                action,
+                decision,
+                feedback=FeedbackAudit(
+                    kind=feedback.kind,
+                    node_id=(
+                        feedback_node[:FEEDBACK_NODE_ID_MAX_LENGTH]
+                        if feedback_node is not None
+                        else None
+                    ),
+                ),
+                retry_count=0,
+                stop_reason=StopReason.BLOCKED if task.status is TaskStatus.BLOCKED else None,
+            )
+        )
+        return task.status is TaskStatus.RUNNING
+
+    def _normalized_feedback(self, task: TaskState, run: PytestRun) -> PytestFeedback:
+        feedback = self._feedback_collector.collect(run)
+        return self._feedback_collector.normalize_nodes(
+            feedback,
+            self._project_root,
+            task.config.test_dirs,
+        )
 
     def _record_tool_result(
         self,

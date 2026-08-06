@@ -21,7 +21,8 @@ from guardedpy.domain import (
     FeedbackKind,
     PolicyDecision,
     PolicyVerdict,
-    TaskMode,
+    TaskIntent,
+    TaskPath,
     TaskState,
     TddPhase,
 )
@@ -81,14 +82,17 @@ def _record_passing_baseline(policy: PolicyEngine, task: TaskState) -> None:
 
 
 def _record_bugfix_red_baseline(policy: PolicyEngine, task: TaskState) -> None:
+    assert task.repair_targets
+    target = task.repair_targets[0]
+    task.path = TaskPath.BASELINE_PENDING
+    task.repair_targets = ()
     task.tdd_phase = TddPhase.TEST_DESIGN
-    assert task.bugfix_target is not None
     decision = policy.record_pytest(
         task,
         RunPytestAction(kind="run_pytest", summary="establish broken baseline", targets=()),
         PytestFeedback(
             FeedbackKind.ASSERTION_FAILURE,
-            (task.bugfix_target,),
+            (target,),
             "assert actual == expected",
         ),
     )
@@ -381,7 +385,7 @@ def test_feature_red_from_modified_existing_test_unlocks_source_patch(
 
     unrelated_task = TaskState(
         description="Reject unrelated feature red",
-        mode=TaskMode.FEATURE,
+        intent=TaskIntent.CODING,
         config=feature_task.config,
     )
     _record_passing_baseline(policy, unrelated_task)
@@ -406,85 +410,20 @@ def test_feature_red_from_modified_existing_test_unlocks_source_patch(
     assert unrelated_task.tdd_phase is TddPhase.TEST_DESIGN
 
 
-def test_bugfix_only_selected_assertion_failure_records_red(
-    policy: PolicyEngine, feature_task: TaskState
-) -> None:
-    """Catches bugfix red evidence that omits its selected target or assertion classification."""
-    feature_task.mode = TaskMode.BUGFIX
-    feature_task.bugfix_target = "tests/test_parser.py::test_bad_input"
-    pytest_action = RunPytestAction(
-        kind="run_pytest", summary="run configured suite", targets=()
-    )
-
-    decision = policy.record_pytest(
-        feature_task,
-        pytest_action,
-        feedback=PytestFeedback(
-            FeedbackKind.EXECUTION_ERROR,
-            ("tests/test_parser.py::test_bad_input",),
-            "TypeError",
-        ),
-    )
-
-    assert decision.rule_id == "tdd.bugfix_target_assertion_required"
-    assert feature_task.tdd_phase is TddPhase.TEST_DESIGN
-
-
-def test_bugfix_requires_a_nonblank_target_at_creation(tmp_path: Path) -> None:
-    """Catches a bugfix task being admitted without a user-selected pytest node."""
-    with pytest.raises(ValidationError, match="bugfix target"):
-        TaskState(
-            description="Repair a test",
-            mode=TaskMode.BUGFIX,
-            bugfix_target="  ",
-            config=safe_config(tmp_path),
-        )
-
-
-def test_bugfix_red_requires_exactly_the_selected_assertion_node(
+def test_complete_assertion_baseline_records_all_repair_targets_and_red(
     policy: PolicyEngine, tmp_path: Path
 ) -> None:
-    """Catches a selected bugfix target being bypassed by an unrelated assertion failure."""
-    config = safe_config(tmp_path)
-    selected = "tests/test_parser.py::test_bad_input"
-    action = RunPytestAction(kind="run_pytest", summary="run configured suite", targets=())
-    target_task = TaskState(
-        description="Repair parser", mode=TaskMode.BUGFIX, bugfix_target=selected, config=config
+    """Catches automatic repair classification dropping a baseline assertion node."""
+    targets = (
+        "tests/test_parser.py::test_bad_input",
+        "tests/test_parser.py::test_empty_input",
     )
-    unrelated_task = TaskState(
-        description="Repair parser", mode=TaskMode.BUGFIX, bugfix_target=selected, config=config
-    )
-    selected_decision = policy.record_pytest(
-        target_task,
-        action,
-        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert input == expected"),
-    )
-    unrelated_decision = policy.record_pytest(
-        unrelated_task,
-        action,
-        PytestFeedback(
-            FeedbackKind.ASSERTION_FAILURE,
-            ("tests/test_parser.py::test_other_input",),
-            "assert input == expected",
-        ),
-    )
-
-    assert selected_decision.rule_id == "tdd.red_recorded"
-    assert target_task.tdd_phase is TddPhase.RED_OBSERVED
-    assert unrelated_decision.rule_id == "tdd.bugfix_target_assertion_required"
-    assert unrelated_task.tdd_phase is TddPhase.TEST_DESIGN
-
-
-def test_bugfix_target_free_sole_selected_failure_records_baseline_and_red(
-    policy: PolicyEngine, tmp_path: Path
-) -> None:
-    """Catches a valid broken baseline failing to unlock bugfix implementation."""
-    selected = "tests/test_parser.py::test_bad_input"
     unbaselined = TaskState(
         description="Persisted red without baseline evidence",
-        mode=TaskMode.BUGFIX,
-        bugfix_target=selected,
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
+        path=TaskPath.REPAIR,
+        repair_targets=targets,
         tdd_phase=TddPhase.RED_OBSERVED,
     )
     policy.record_read(
@@ -504,15 +443,14 @@ def test_bugfix_target_free_sole_selected_failure_records_baseline_and_red(
 
     task = TaskState(
         description="Repair parser",
-        mode=TaskMode.BUGFIX,
-        bugfix_target=selected,
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
     )
 
     recorded = policy.record_pytest(
         task,
         RunPytestAction(kind="run_pytest", summary="run configured suite", targets=()),
-        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert actual == expected"),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, targets, "assert actual == expected"),
     )
     policy.record_read(
         task,
@@ -525,18 +463,19 @@ def test_bugfix_target_free_sole_selected_failure_records_baseline_and_red(
         "tdd.red_recorded",
     )
     assert task.tdd_phase is TddPhase.RED_OBSERVED
+    assert task.path is TaskPath.REPAIR
+    assert task.repair_targets == targets
     assert source.verdict is PolicyVerdict.ALLOW
 
 
-def test_bugfix_targeted_selected_failure_does_not_establish_baseline_or_red(
+def test_targeted_assertion_failure_does_not_establish_automatic_baseline(
     policy: PolicyEngine, tmp_path: Path
 ) -> None:
     """Catches a targeted run claiming that the unrelated starting suite is healthy."""
     selected = "tests/test_parser.py::test_bad_input"
     task = TaskState(
         description="Repair parser",
-        mode=TaskMode.BUGFIX,
-        bugfix_target=selected,
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
     )
 
@@ -553,53 +492,47 @@ def test_bugfix_targeted_selected_failure_does_not_establish_baseline_or_red(
     assert task.tdd_phase is TddPhase.TEST_DESIGN
 
 
-def test_bugfix_target_free_unrelated_failure_does_not_establish_baseline_or_red(
+def test_repair_iteration_rejects_assertion_outside_automatic_repair_set(
     policy: PolicyEngine, tmp_path: Path
 ) -> None:
-    """Catches an unrelated broken baseline authorizing changes outside the selected bug."""
+    """Catches later pytest feedback expanding the immutable automatic repair set."""
     selected = "tests/test_parser.py::test_bad_input"
     task = TaskState(
         description="Repair parser",
-        mode=TaskMode.BUGFIX,
-        bugfix_target=selected,
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
     )
-
-    unrelated = policy.record_pytest(
+    baseline = policy.record_pytest(
         task,
         RunPytestAction(kind="run_pytest", summary="run configured suite", targets=()),
+        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert actual == expected"),
+    )
+    unrelated = policy.record_pytest(
+        task,
+        RunPytestAction(kind="run_pytest", summary="retry suite", targets=()),
         PytestFeedback(
             FeedbackKind.ASSERTION_FAILURE,
             ("tests/test_parser.py::test_other_input",),
             "assert actual == expected",
         ),
     )
-    targeted_retry = policy.record_pytest(
-        task,
-        RunPytestAction(kind="run_pytest", summary="retry selected target", targets=(selected,)),
-        PytestFeedback(FeedbackKind.ASSERTION_FAILURE, (selected,), "assert actual == expected"),
-    )
 
+    assert baseline.verdict is PolicyVerdict.ALLOW
     assert (unrelated.verdict, unrelated.rule_id) == (
         PolicyVerdict.DENY,
-        "tdd.bugfix_target_assertion_required",
+        "tdd.repair_target_required",
     )
-    assert task.tdd_phase is TddPhase.TEST_DESIGN
-    assert (targeted_retry.verdict, targeted_retry.rule_id) == (
-        PolicyVerdict.DENY,
-        "tdd.baseline_required",
-    )
+    assert task.repair_targets == (selected,)
 
 
-def test_bugfix_policy_refuses_runtime_feedback_with_a_source_assert_line(
+def test_automatic_policy_refuses_runtime_feedback_with_a_source_assert_line(
     policy: PolicyEngine, tmp_path: Path
 ) -> None:
     """Catches a source assertion in a TypeError traceback advancing the bugfix red gate."""
     target = "tests/test_parser.py::test_bad_input"
     task = TaskState(
         description="Repair parser",
-        mode=TaskMode.BUGFIX,
-        bugfix_target=target,
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
     )
     feedback = FeedbackCollector().collect(
@@ -619,7 +552,7 @@ def test_bugfix_policy_refuses_runtime_feedback_with_a_source_assert_line(
     )
 
     assert feedback.kind is FeedbackKind.EXECUTION_ERROR
-    assert decision.rule_id == "tdd.bugfix_target_assertion_required"
+    assert decision.rule_id == "tdd.baseline_invalid"
     assert task.tdd_phase is TddPhase.TEST_DESIGN
 
 

@@ -28,7 +28,8 @@ from guardedpy.domain import (
     FeedbackKind,
     PolicyDecision,
     PolicyVerdict,
-    TaskMode,
+    TaskIntent,
+    TaskPath,
     TaskState,
     TddPhase,
     is_approval_decision,
@@ -147,6 +148,15 @@ class PolicyEngine:
 
     def decide(self, task: TaskState, action: Action) -> PolicyDecision:
         """Return the deterministic result for one action without executing it."""
+        if task.intent in {TaskIntent.PLAN, TaskIntent.REVIEW} and not isinstance(
+            action, (ListFilesAction, ReadFileAction, FinishAction)
+        ):
+            return self._deny(
+                task,
+                action,
+                "read_only.action_denied",
+                "read-only tasks permit only project listing, reading, and finish",
+            )
         if isinstance(action, (ListFilesAction, ReadFileAction)):
             return self._read_decision(task, action.path, action)
         if isinstance(action, ApplyPatchAction):
@@ -232,19 +242,33 @@ class PolicyEngine:
         decision = self.decide(task, action)
         if decision.verdict is not PolicyVerdict.ALLOW:
             return decision
-        if task.tdd_phase is TddPhase.TEST_DESIGN and task.id not in self._baseline_recorded:
+        if task.path is TaskPath.BASELINE_PENDING and task.id not in self._baseline_recorded:
             return self._record_starting_baseline(task, action, feedback)
         if feedback.kind is FeedbackKind.ASSERTION_FAILURE:
+            if task.path is TaskPath.REPAIR and task.tdd_phase is TddPhase.RED_OBSERVED:
+                if feedback.node_ids and set(feedback.node_ids).issubset(task.repair_targets):
+                    return self._allow(
+                        task,
+                        None,
+                        "tdd.repair_failure_observed",
+                        "repair-target assertion failure remains observable during iteration",
+                    )
+                return self._deny(
+                    task,
+                    None,
+                    "tdd.repair_target_required",
+                    "repair iteration must fail only nodes from the automatic repair set",
+                )
             if task.tdd_phase is not TddPhase.TEST_DESIGN:
                 return self._deny(task, None, "tdd.red_out_of_sequence", "red result is out of sequence")
-            if task.mode is TaskMode.FEATURE and not self._changed_test_paths.get(task.id):
+            if task.path is TaskPath.FEATURE and not self._changed_test_paths.get(task.id):
                 return self._deny(
                     task,
                     None,
                     "tdd.test_change_required",
                     "a feature task must change a test before observing red",
                 )
-            if task.mode is TaskMode.FEATURE and not self._feature_red_matches_changed_test(
+            if task.path is TaskPath.FEATURE and not self._feature_red_matches_changed_test(
                 task, action, feedback
             ):
                 return self._deny(
@@ -253,29 +277,14 @@ class PolicyEngine:
                     "tdd.changed_test_required",
                     "a feature red result must target its successfully changed test",
                 )
-            if task.mode is TaskMode.BUGFIX and (
-                action.targets
-                or task.bugfix_target is None
-                or feedback.node_ids != (task.bugfix_target,)
-            ):
-                return self._deny(
-                    task,
-                    None,
-                    "tdd.bugfix_target_assertion_required",
-                    "a bugfix red result must be an assertion failure for its selected target",
-                )
             task.tdd_phase = TddPhase.RED_OBSERVED
             return self._allow(task, None, "tdd.red_recorded", "red pytest result recorded")
         if feedback.kind is not FeedbackKind.PASSED:
             return self._deny(
                 task,
                 None,
-                "tdd.bugfix_target_assertion_required"
-                if task.mode is TaskMode.BUGFIX
-                else "tdd.assertion_failure_required",
-                "a red result must be an assertion failure"
-                if task.mode is TaskMode.FEATURE
-                else "a bugfix red result must be an assertion failure for its selected target",
+                "tdd.assertion_failure_required",
+                "a red result must be an assertion failure",
             )
         if task.tdd_phase is TddPhase.IMPLEMENTATION:
             task.tdd_phase = TddPhase.GREEN_OBSERVED
@@ -298,33 +307,24 @@ class PolicyEngine:
             )
         if feedback.kind is FeedbackKind.PASSED:
             self._baseline_recorded.add(task.id)
+            task.path = TaskPath.FEATURE
             return self._allow(
                 task,
                 None,
                 "tdd.baseline_recorded",
                 "passing task-start baseline recorded",
             )
-        if (
-            task.mode is TaskMode.BUGFIX
-            and feedback.kind is FeedbackKind.ASSERTION_FAILURE
-            and task.bugfix_target is not None
-            and feedback.node_ids == (task.bugfix_target,)
-        ):
+        if feedback.kind is FeedbackKind.ASSERTION_FAILURE and feedback.node_ids:
             self._baseline_recorded.add(task.id)
+            task.path = TaskPath.REPAIR
+            task.repair_targets = feedback.node_ids
             task.tdd_phase = TddPhase.RED_OBSERVED
             return self._allow(task, None, "tdd.red_recorded", "red pytest result recorded")
-        if task.mode is TaskMode.BUGFIX:
-            return self._deny(
-                task,
-                None,
-                "tdd.bugfix_target_assertion_required",
-                "a bugfix baseline must pass or fail only its selected assertion target",
-            )
         return self._deny(
             task,
             None,
-            "tdd.baseline_pass_required",
-            "a feature baseline must pass before tests change",
+            "tdd.baseline_invalid",
+            "a coding baseline must pass or contain assertion failures",
         )
 
     def request_approval(
@@ -460,7 +460,7 @@ class PolicyEngine:
             return self._deny(task, action, "tdd.red_required", "source patch requires an observed red test")
         if category == "test" and task.tdd_phase is not TddPhase.TEST_DESIGN:
             return self._deny(task, action, "tdd.test_design_required", "test changes must start the TDD sequence")
-        if category == "test" and task.mode is TaskMode.FEATURE and task.id not in self._baseline_recorded:
+        if category == "test" and task.id not in self._baseline_recorded:
             return self._deny(
                 task,
                 action,
@@ -513,7 +513,7 @@ class PolicyEngine:
                 "tdd.test_delete_phase",
                 "tests may be deleted only during test design",
             )
-        if category == "test" and task.mode is TaskMode.FEATURE and task.id not in self._baseline_recorded:
+        if category == "test" and task.id not in self._baseline_recorded:
             return self._deny(
                 task,
                 action,
@@ -618,6 +618,9 @@ class PolicyEngine:
         return self._allow(task, action, "memory.proposal_allowed", "memory proposal is queued for user review")
 
     def _finish_decision(self, task: TaskState, action: FinishAction) -> PolicyDecision:
+        if task.intent in {TaskIntent.PLAN, TaskIntent.REVIEW}:
+            task.tdd_phase = TddPhase.FINISHED
+            return self._allow(task, action, "finish.allowed", "read-only task may finish")
         if action.status == "completed" and task.tdd_phase is not TddPhase.GREEN_OBSERVED:
             return self._deny(task, action, "tdd.green_required", "completed finish requires observed green")
         if action.status == "completed" and task.id not in self._full_suite_green:

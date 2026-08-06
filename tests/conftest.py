@@ -5,7 +5,7 @@ import pytest
 
 from guardedpy.config import HarnessConfig
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import TaskMode, TaskState, TddPhase
+from guardedpy.domain import TaskIntent, TaskPath, TaskState, TddPhase
 
 
 def safe_config(tmp_path: Path) -> HarnessConfig:
@@ -26,7 +26,7 @@ def safe_config(tmp_path: Path) -> HarnessConfig:
 def feature_task(tmp_path: Path) -> TaskState:
     return TaskState(
         description="Add a feature",
-        mode=TaskMode.FEATURE,
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
     )
 
@@ -35,9 +35,10 @@ def feature_task(tmp_path: Path) -> TaskState:
 def ready_bugfix_task(tmp_path: Path) -> TaskState:
     return TaskState(
         description="Fix a failing test",
-        mode=TaskMode.BUGFIX,
-        bugfix_target="tests/test_example.py::test_before",
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
+        path=TaskPath.REPAIR,
+        repair_targets=("tests/test_example.py::test_before",),
         tdd_phase=TddPhase.RED_OBSERVED,
     )
 

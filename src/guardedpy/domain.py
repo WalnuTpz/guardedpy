@@ -7,14 +7,26 @@ from enum import StrEnum
 from typing import Literal, TypeAlias, TypeGuard
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from guardedpy.config import HarnessConfig
 
 
-class TaskMode(StrEnum):
+class TaskIntent(StrEnum):
+    """The immutable user intent, independent of automatic coding classification."""
+
+    CODING = "coding"
+    PLAN = "plan"
+    REVIEW = "review"
+
+
+class TaskPath(StrEnum):
+    """The deterministic path selected by intent and complete-suite evidence."""
+
+    BASELINE_PENDING = "baseline_pending"
     FEATURE = "feature"
-    BUGFIX = "bugfix"
+    REPAIR = "repair"
+    READ_ONLY = "read_only"
 
 
 class TaskStatus(StrEnum):
@@ -92,16 +104,15 @@ class TaskState(BaseModel):
     """The persisted state needed to govern one coding task."""
 
     description: str
-    mode: TaskMode
+    intent: TaskIntent = Field(default=TaskIntent.CODING, frozen=True)
     config: HarnessConfig
     id: UUID = Field(default_factory=uuid4)
     status: TaskStatus = TaskStatus.PENDING
     tdd_phase: TddPhase = TddPhase.TEST_DESIGN
-    bugfix_target: str | None = None
+    path: TaskPath = TaskPath.BASELINE_PENDING
+    repair_targets: tuple[str, ...] = ()
 
-    @model_validator(mode="after")
-    def require_bugfix_target(self) -> "TaskState":
-        """Require one explicit pytest node before admitting a bugfix task."""
-        if self.mode is TaskMode.BUGFIX and not (self.bugfix_target and self.bugfix_target.strip()):
-            raise ValueError("bugfix target must be a nonblank pytest node")
-        return self
+    def model_post_init(self, __context: object) -> None:
+        """Select the read-only path without admitting user-selected coding paths."""
+        if self.intent in {TaskIntent.PLAN, TaskIntent.REVIEW}:
+            self.path = TaskPath.READ_ONLY
