@@ -30,7 +30,7 @@ class ConversationStore:
     def __init__(self, project_root: Path) -> None:
         self.database_path = app_state_dir(project_root) / "conversations.sqlite3"
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS conversations (
@@ -39,7 +39,7 @@ class ConversationStore:
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS conversation_tasks (
-                    conversation_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id),
                     task_id TEXT NOT NULL,
                     position INTEGER NOT NULL,
                     PRIMARY KEY (conversation_id, task_id)
@@ -50,7 +50,7 @@ class ConversationStore:
     def create(self) -> ConversationSummary:
         conversation_id = uuid4()
         now = datetime.now(timezone.utc)
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 "INSERT INTO conversations (id, created_at, updated_at) VALUES (?, ?, ?)",
                 (str(conversation_id), now.isoformat(), now.isoformat()),
@@ -60,7 +60,11 @@ class ConversationStore:
 
     def attach_task(self, conversation_id: UUID, task_id: UUID) -> None:
         now = datetime.now(timezone.utc)
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
+            if connection.execute(
+                "SELECT 1 FROM conversations WHERE id = ?", (str(conversation_id),)
+            ).fetchone() is None:
+                raise ValueError("conversation does not exist")
             cursor = connection.execute(
                 "SELECT COALESCE(MAX(position), -1) + 1 FROM conversation_tasks WHERE conversation_id = ?",
                 (str(conversation_id),),
@@ -72,22 +76,20 @@ class ConversationStore:
             )
             if result.rowcount == 0:
                 return
-            changed = connection.execute(
+            connection.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?", (now.isoformat(), str(conversation_id))
             )
-            if changed.rowcount == 0:
-                raise ValueError("conversation does not exist")
             connection.commit()
 
     def list(self) -> tuple[ConversationSummary, ...]:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT id, created_at, updated_at FROM conversations ORDER BY updated_at DESC"
             ).fetchall()
         return tuple(self._summary(UUID(row[0]), row[1], row[2]) for row in rows)
 
     def tasks(self, conversation_id: UUID) -> tuple[UUID, ...]:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT task_id FROM conversation_tasks WHERE conversation_id = ? ORDER BY position",
                 (str(conversation_id),),
@@ -101,3 +103,8 @@ class ConversationStore:
             updated_at=datetime.fromisoformat(updated_at),
             task_ids=self.tasks(conversation_id),
         )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection

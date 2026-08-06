@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 
 def test_conversation_store_survives_restart_and_isolates_project_roots(
     tmp_path: Path, monkeypatch: object
@@ -31,3 +33,21 @@ def test_conversation_store_survives_restart_and_isolates_project_roots(
     assert recovered.tasks(conversation.id) == (task_id,)
     assert ConversationStore(other_root).list() == ()
     assert set(summaries[0].model_dump()) == {"id", "created_at", "updated_at", "task_ids"}
+
+
+def test_conversation_store_rejects_unknown_conversation_without_orphan_reference(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """Catches a failed attach leaving a task reference with no conversation owner."""
+    from guardedpy.conversations import ConversationStore
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
+    store = ConversationStore(tmp_path / "project")
+    unknown_id = uuid4()
+    task_id = uuid4()
+
+    with pytest.raises(ValueError, match="conversation does not exist"):
+        store.attach_task(unknown_id, task_id)
+
+    assert store.list() == ()
+    assert store.tasks(unknown_id) == ()
