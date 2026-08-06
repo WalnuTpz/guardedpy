@@ -129,6 +129,15 @@ class ApprovalResolutionFinished(Message):
         super().__init__()
 
 
+class SessionCommandFinished(Message):
+    """Deliver fixed safe terminal-command output back to the Textual event loop."""
+
+    def __init__(self, command: str, lines: tuple[str, ...]) -> None:
+        self.command = command
+        self.lines = lines
+        super().__init__()
+
+
 class GuardedPyApp(App[None]):
     """The single-project interactive terminal session."""
 
@@ -148,6 +157,7 @@ class GuardedPyApp(App[None]):
         self._active_task: TaskState | None = None
         self._cancelled_task_ids: set[UUID] = set()
         self._run_threads: dict[UUID, Thread] = {}
+        self._session_command_workers: dict[str, Thread] = {}
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
@@ -273,11 +283,30 @@ class GuardedPyApp(App[None]):
             else:
                 self.push_screen(ExitScreen(), self._exit_resolved)
             return
-        if name in {"/tests", "/diff", "/permissions", "/memory", "/model", "/effort", "/history", "/doctor"}:
+        if name in {"/tests", "/diff"}:
+            self._start_session_command(name)
+            return
+        if name in {"/permissions", "/memory", "/model", "/effort", "/history", "/doctor"}:
             output = StringIO()
             run_plain_session(self.runtime, StringIO(f"{command}\n"), output)
             for line in output.getvalue().splitlines():
                 self._write(line)
+
+    def _start_session_command(self, command: str) -> None:
+        if command in self._session_command_workers:
+            self._write("命令正在运行。")
+            return
+        worker = Thread(target=self._run_session_command_in_thread, args=(command,), daemon=True)
+        self._session_command_workers[command] = worker
+        worker.start()
+
+    def _run_session_command_in_thread(self, command: str) -> None:
+        output = StringIO()
+        try:
+            run_plain_session(self.runtime, StringIO(f"{command}\n"), output)
+        except Exception:
+            output.write("命令执行失败。\n")
+        self.post_message(SessionCommandFinished(command, tuple(output.getvalue().splitlines())))
 
     def _credential_resolved(self, result: tuple[str, str | None] | None) -> None:
         if result is None:
@@ -354,6 +383,11 @@ class GuardedPyApp(App[None]):
             self._write("审批请求已失效。")
             return
         self._task_run_finished(event.result)
+
+    def on_session_command_finished(self, event: SessionCommandFinished) -> None:
+        self._session_command_workers.pop(event.command, None)
+        for line in event.lines:
+            self._write(line)
 
     def _task_run_failed(self, task_id: UUID) -> None:
         if task_id in self._cancelled_task_ids:

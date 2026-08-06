@@ -223,6 +223,56 @@ def test_tui_cancels_a_real_blocking_local_runtime_without_freezing_the_session(
     asyncio.run(check())
 
 
+def test_tui_runs_blocking_tests_command_off_loop_without_an_active_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches `/tests` freezing Textual while its bounded subprocess is still running."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import RichLog
+
+    entered = Event()
+    release = Event()
+
+    class CompletedRun:
+        returncode = 0
+        stdout = ""
+
+    def blocking_run(*args: object, **kwargs: object) -> CompletedRun:
+        del args, kwargs
+        entered.set()
+        release.wait()
+        return CompletedRun()
+
+    monkeypatch.setattr("guardedpy.terminal.subprocess.run", blocking_run)
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+
+    async def check() -> None:
+        timer = Timer(1, release.set)
+        timer.start()
+        try:
+            async with app.run_test() as pilot:
+                app.submit("/tests")
+                await pilot.pause()
+                assert entered.is_set()
+                assert release.is_set() is False
+
+                await pilot.press("ctrl+c")
+                app.submit("/status")
+                await pilot.pause()
+                assert "项目：" in str(app.query_one("#status").render())
+
+                release.set()
+                await pilot.pause()
+                transcript = app.query_one("#transcript", RichLog)
+                assert any("完整测试：passed" in line.text for line in transcript.lines)
+        finally:
+            timer.cancel()
+            release.set()
+
+    asyncio.run(check())
+
+
 def test_tui_unmount_cancels_its_active_worker_and_discards_late_completion(
     tmp_path: Path,
 ) -> None:

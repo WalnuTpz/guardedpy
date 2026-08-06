@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+import subprocess
 from uuid import uuid4
+
+import pytest
 
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
@@ -158,3 +161,28 @@ def test_plain_session_manages_only_explicit_permission_and_memory_identifiers(t
     assert runtime.revoked == [runtime.rule_id]
     assert runtime.approved == [runtime.memory_id]
     assert runtime.removed == [runtime.memory_id]
+
+
+@pytest.mark.parametrize("command", ("/tests", "/diff"))
+def test_plain_read_only_subprocess_commands_use_the_configured_time_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """Catches a redirected read-only command waiting indefinitely for its subprocess."""
+    from guardedpy.terminal import run_plain_session
+
+    runtime = _Runtime(_profile(tmp_path))
+    runtime.config = runtime.config.model_copy(update={"timeout_seconds": 5})
+    captured: dict[str, object] = {}
+
+    def bounded_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args
+        captured["timeout"] = kwargs["timeout"]
+        return subprocess.CompletedProcess(args[0], 0, stdout="")
+
+    monkeypatch.setattr("guardedpy.terminal.subprocess.run", bounded_run)
+    output = StringIO()
+
+    code = run_plain_session(runtime, StringIO(f"{command}\n/exit\n"), output)
+
+    assert code == 0
+    assert captured["timeout"] == 5

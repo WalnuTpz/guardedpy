@@ -147,13 +147,36 @@ def _render_history(runtime: Any, output: TextIO) -> None:
 
 def _run_tests(runtime: Any, output: TextIO) -> None:
     profile = runtime.config.profile
-    result = subprocess.run(profile.pytest_command, cwd=profile.root, capture_output=True, text=True, check=False, shell=False)
+    try:
+        result = subprocess.run(
+            profile.pytest_command,
+            cwd=profile.root,
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=runtime.config.timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        output.write("完整测试：timeout\n")
+        return
     output.write(f"完整测试：{'passed' if result.returncode == 0 else 'failed'}\n")
 
 
 def _run_diff(runtime: Any, output: TextIO) -> None:
     root = runtime.project_root
-    result = subprocess.run(("git", "-C", str(root), "diff", "--"), capture_output=True, text=True, check=False, shell=False)
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(root), "diff", "--"),
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=runtime.config.timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        output.write("当前差异读取超时。\n")
+        return
     if result.returncode:
         output.write("当前目录不是可用 Git 仓库。\n")
         return
