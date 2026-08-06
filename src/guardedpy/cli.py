@@ -6,7 +6,6 @@ import argparse
 from collections.abc import Callable, Sequence
 from getpass import getpass
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 from typing import Any, TextIO
@@ -29,7 +28,7 @@ _TERMINAL_STATUSES = {
     TaskStatus.CANCELLED,
     TaskStatus.INTERRUPTED,
 }
-_HELP = "可用命令：/init /task /help /status /tasks /memory /rules /credentials /clear /exit\n"
+_HELP = "可用命令：/task /help /status /tasks /memory /rules /credentials /clear /exit\n"
 
 
 class _ArgumentError(ValueError):
@@ -144,9 +143,6 @@ def run_repl(
         if line == "/help":
             stdout.write(_HELP)
             continue
-        if line == "/init":
-            _initialize(runtime, stdout, stdin.readline, isatty)
-            continue
         if line == "/task":
             _interactive_task(runtime, stdout, stdin.readline)
             continue
@@ -198,43 +194,6 @@ def _current_git_branch(project_root: Path) -> str | None:
         return None
     branch = completed.stdout.strip()
     return branch if completed.returncode == 0 and branch else None
-
-
-def _initialize(
-    runtime: LocalRuntime,
-    stdout: TextIO,
-    read_line: Callable[[], str],
-    isatty: Callable[[], bool],
-) -> None:
-    if not isatty():
-        stdout.write("非交互终端不能录入凭据。\n")
-        return
-    project_root = Path(_prompt(stdout, read_line, "项目目录: ")).expanduser()
-    source_dirs_text = _prompt(stdout, read_line, "源码目录（空格分隔）: ")
-    test_dirs_text = _prompt(stdout, read_line, "测试目录（空格分隔）: ")
-    pytest_command_text = _prompt(stdout, read_line, "pytest 命令（空格分隔）: ")
-    model = _prompt(stdout, read_line, "模型: ")
-    timeout = _prompt(stdout, read_line, "超时秒数: ")
-    key = getpass("DeepSeek API Key（留空保留已有凭据）: ")
-    if not key and not _credential_configured(runtime):
-        stdout.write("尚未配置凭据。\n")
-        return
-    try:
-        config = HarnessConfig(
-            source_dirs=tuple(Path(value) for value in _tokens(source_dirs_text)),
-            test_dirs=tuple(Path(value) for value in _tokens(test_dirs_text)),
-            pytest_command=_tokens(pytest_command_text),
-            model=model,
-            timeout_seconds=int(timeout),
-        )
-        runtime.setup(project_root, config, key if key else None)
-    except (TypeError, ValueError):
-        stdout.write("初始化参数无效。\n")
-        return
-    except Exception:
-        stdout.write("无法保存设置。\n")
-        return
-    stdout.write("设置已保存。\n")
 
 
 def _interactive_task(runtime: LocalRuntime, stdout: TextIO, read_line: Callable[[], str]) -> int:
@@ -446,7 +405,3 @@ def _credential_configured(runtime: LocalRuntime) -> bool:
 def _prompt(stdout: TextIO, read_line: Callable[[], str], label: str) -> str:
     stdout.write(label)
     return read_line().strip()
-
-
-def _tokens(value: str) -> tuple[str, ...]:
-    return tuple(shlex.split(value))

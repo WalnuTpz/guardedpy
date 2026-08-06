@@ -36,19 +36,11 @@ class FakeRuntime:
         self.project_root: Path | None = None
         self.config: HarnessConfig | None = None
         self.created: list[TaskState] = []
-        self.setups: list[tuple[Path, HarnessConfig, str | None]] = []
         self.decisions: list[tuple[UUID, str, str]] = []
         self.cancelled: list[UUID] = []
         self._wait_for_approval = wait_for_approval
         self._interrupt = interrupt
         self._consume_reject = consume_reject
-
-    def setup(self, project_root: Path, config: HarnessConfig, api_key: str | None) -> None:
-        self.project_root = project_root
-        self.config = config
-        self.setups.append((project_root, config, api_key))
-        if api_key is not None:
-            self.configured = True
 
     def credential_status(self) -> CredentialStatus:
         return CredentialStatus(configured=self.configured)
@@ -124,45 +116,6 @@ class FakeRuntime:
         self.configured = False
 
 
-def test_repl_uses_hidden_key_input_and_never_echoes_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Catches replacing the hidden key prompt with terminal input or output."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-    monkeypatch.setattr("guardedpy.cli.getpass", lambda _: "REAL-KEY-MUST-NOT-PRINT")
-
-    code = run_repl(
-        runtime,
-        StringIO("/init\n/project\nsrc\ntests\npytest\nmodel\n30\n/exit\n"),
-        output,
-        lambda: True,
-    )
-
-    assert code == 0
-    assert "REAL-KEY-MUST-NOT-PRINT" not in output.getvalue()
-    assert runtime.configured is True
-
-
-def test_repl_refuses_init_secret_entry_from_non_tty_without_calling_getpass(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Catches a piped init falling back to a blocking or visible key read."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-    monkeypatch.setattr(
-        "guardedpy.cli.getpass", lambda _: pytest.fail("non-TTY init must not call getpass")
-    )
-
-    code = run_repl(runtime, StringIO("/init\n/exit\n"), output, lambda: False)
-
-    assert code == 0
-    assert runtime.setups == []
-    assert output.getvalue() == "非交互终端不能录入凭据。\n"
-
-
 def test_repl_refuses_credential_update_secret_entry_from_non_tty_without_getpass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -236,47 +189,6 @@ def test_one_shot_consumes_injected_approval_input_until_the_task_finishes(
     assert code == 0
     assert runtime.decisions == [(runtime.created[0].id, "bound-approval-hash", decision)]
     assert runtime.created[0].status is TaskStatus.COMPLETED
-
-
-def test_repl_refuses_a_blank_first_key_without_persisting_setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Catches allowing a first setup that has neither a hidden key nor a stored credential."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-    monkeypatch.setattr("guardedpy.cli.getpass", lambda _: "")
-
-    run_repl(
-        runtime,
-        StringIO("/init\n/project\nsrc\ntests\npytest\nmodel\n30\n/exit\n"),
-        output,
-        lambda: True,
-    )
-
-    assert runtime.setups == []
-    assert output.getvalue().endswith("尚未配置凭据。\n")
-
-
-def test_repl_reports_malformed_init_tokens_without_starting_a_task(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Catches malformed non-secret configuration input escaping the REPL."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-    monkeypatch.setattr("guardedpy.cli.getpass", lambda _: "fake-key")
-
-    code = run_repl(
-        runtime,
-        StringIO('/init\n/project\n"\ntests\npytest\nmodel\n30\n/exit\n'),
-        output,
-        lambda: True,
-    )
-
-    assert code == 0
-    assert runtime.setups == []
-    assert output.getvalue().endswith("初始化参数无效。\n")
 
 
 def test_repl_runs_ordinary_feature_text_and_renders_only_safe_progress() -> None:
@@ -397,6 +309,17 @@ def test_task_command_requires_target_for_bugfix_before_runtime_mutation() -> No
     assert code == 0
     assert runtime.created == []
     assert "缺陷修复任务必须提供 pytest node。" in output.getvalue()
+
+
+def test_repl_help_omits_retired_manual_init() -> None:
+    """Catches interactive help retaining the retired manual setup workflow."""
+    from guardedpy.cli import run_repl
+
+    output = StringIO()
+
+    assert run_repl(FakeRuntime(), StringIO("/help\n/exit\n"), output, lambda: False) == 0
+    assert "/init" not in output.getvalue()
+    assert "/task" in output.getvalue()
 
 
 def test_help_exposes_only_terminal_options_and_no_retired_surface(
