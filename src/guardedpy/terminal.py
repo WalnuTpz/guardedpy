@@ -8,10 +8,11 @@ from typing import Any, TextIO
 from uuid import UUID
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
+from guardedpy.conversations import ConversationStore
 
 
 COMMANDS = (
-    "/history", "/new", "/clear", "/exit", "/plan", "/review", "/tests", "/diff",
+    "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review", "/tests", "/diff",
     "/permissions", "/credentials", "/memory", "/model", "/effort", "/doctor", "/help",
 )
 
@@ -19,7 +20,7 @@ COMMANDS = (
 def render_help() -> tuple[str, ...]:
     """Return the grouped, secret-free command help shared by both session renderers."""
     return (
-        "会话与对话：/history /new /clear /exit",
+        "会话与对话：/history /conversations /new /clear /exit",
         "任务与检查：/plan <任务> /review <路径> /tests /diff",
         "设置与安全：/model /effort /permissions /credentials /memory /doctor",
         "帮助：/help",
@@ -99,6 +100,9 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
         if name == "/history" and not argument:
             _render_history(runtime, output)
             continue
+        if name == "/conversations" and not argument:
+            _render_conversations(runtime, output)
+            continue
         if name == "/plan":
             code = run_noninteractive_task(runtime, argument, TaskIntent.PLAN, output)
             if code:
@@ -152,6 +156,13 @@ def _render_history(runtime: Any, output: TextIO) -> None:
         return
     for task in tasks:
         render_lifecycle(runtime, task, output)
+
+
+def _render_conversations(runtime: Any, output: TextIO) -> None:
+    conversations = ConversationStore(runtime.project_root).list()
+    output.write(f"会话：{len(conversations)}\n")
+    for conversation in conversations:
+        output.write(f"{conversation.id} {conversation.updated_at.isoformat()}\n")
 
 
 def _run_tests(runtime: Any, output: TextIO) -> None:

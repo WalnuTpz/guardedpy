@@ -52,7 +52,7 @@ The interactive command set is:
 
 ## Credentials, model, and effort
 
-In an interactive session, `/credentials` opens a masked input for the DeepSeek API key. The value is written only through the operating-system keyring, is not echoed in the transcript, and can be updated or cleared through the same controlled UI. Do not put a key in project files, command arguments, environment variables, logs, or examples. An unavailable keyring fails safely; there is no plaintext fallback.
+In an interactive session, `/credentials` opens a masked input for the DeepSeek API key. The value is written only through the operating-system keyring, is not echoed in the transcript, and can be updated or cleared through the same controlled UI. Before any coding, plan, or review task starts, GuardedPy requires this interactive credential step; redirected sessions stop with an explicit message and never create the task. Do not put a key in project files, command arguments, environment variables, logs, or examples. An unavailable keyring fails safely; there is no plaintext fallback.
 
 The default is `deepseek-v4-flash` with `high` effort. In the interactive session, `/model` or `/effort` opens a keyboard- and mouse-selectable picker; the selected value applies only to later tasks. In redirected plain text, provide the supported value explicitly:
 

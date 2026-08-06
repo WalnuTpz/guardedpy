@@ -15,13 +15,14 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, ListItem, ListView, RichLog, Static, TextArea
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
+from guardedpy.conversations import ConversationStore
 from guardedpy.mechanism_demo import ScenarioName, run_scenario
 from guardedpy.terminal import COMMANDS, lifecycle_lines, render_help, run_plain_session
 
 
 _NO_ARGUMENT_COMMANDS = frozenset(
     {
-        "/new", "/clear", "/history", "/exit", "/tests", "/diff",
+        "/new", "/clear", "/history", "/conversations", "/exit", "/tests", "/diff",
         "/credentials", "/doctor", "/help", "/model", "/effort",
     }
 )
@@ -79,6 +80,41 @@ class SettingsScreen(ModalScreen[str | None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(str(event.item.query_one(Static).render()))
+
+
+class ConversationScreen(ModalScreen[UUID | None]):
+    """Select a stored conversation without rendering task bodies in the selector."""
+
+    def __init__(self, conversations: tuple[Any, ...]) -> None:
+        super().__init__()
+        self._conversations = conversations
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            ListView(
+                *(ListItem(Static(f"{item.id} {item.updated_at.isoformat()}"), id=f"conversation-{item.id}") for item in self._conversations),
+                id="conversation-picker",
+            ),
+            id="conversation-modal",
+        )
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#conversation-picker", ListView)
+        picker.index = 0
+        picker.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(UUID((event.item.id or "").removeprefix("conversation-")))
+
+
+class NewConversationScreen(ModalScreen[bool]):
+    """Require a cancellation decision before discarding an active conversation view."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(Static("活跃任务将被取消。确认新建会话？", id="new-confirm"), Button("取消任务并新建", id="new-confirm-button"), Button("继续会话", id="new-cancel"))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "new-confirm-button")
 
 
 class ApprovalScreen(ModalScreen[str | None]):
@@ -216,6 +252,8 @@ class GuardedPyApp(App[None]):
         self._palette_index = -1
         self._suppress_palette_once = False
         self._pending_credential_request: tuple[str, TaskIntent, str | None] | None = None
+        self._conversation_store: ConversationStore | None = None
+        self._conversation_id: UUID | None = None
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
@@ -257,7 +295,7 @@ class GuardedPyApp(App[None]):
     def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         """Make the custom composer message the sole interactive submit path."""
         palette = self.query_one("#command-palette", ListView)
-        if event.text.strip() == "/help":
+        if event.text.strip() in COMMANDS:
             self.submit(event.text)
             return
         if palette.display:
@@ -349,8 +387,21 @@ class GuardedPyApp(App[None]):
         if name not in COMMANDS or (name in _NO_ARGUMENT_COMMANDS and argument):
             self._write("未知命令。")
             return
-        if name in {"/new", "/clear"}:
+        if name == "/clear":
             self.query_one("#transcript", RichLog).clear()
+            return
+        if name == "/new":
+            if self._active_task is None:
+                self._new_conversation()
+            else:
+                self.push_screen(NewConversationScreen(), self._new_conversation_resolved)
+            return
+        if name == "/conversations":
+            conversations = self._conversation_store_for_session().list()
+            if conversations:
+                self.push_screen(ConversationScreen(conversations), self._conversation_selected)
+            else:
+                self._write("会话：0")
             return
         if name == "/help":
             for help_line in render_help():
@@ -492,6 +543,10 @@ class GuardedPyApp(App[None]):
         try:
             self._write(f"用户：{description}")
             task = self.runtime.create_task(description, intent, review_path=review_path)
+            store = self._conversation_store_for_session()
+            if self._conversation_id is None:
+                self._conversation_id = store.create().id
+            store.attach_task(self._conversation_id, task.id)
             self._active_task = task
             self.query_one("#status", Static).update(self._status_text(task))
             worker = Thread(target=self._run_task_in_thread, args=(task,), daemon=True)
@@ -499,6 +554,37 @@ class GuardedPyApp(App[None]):
             worker.start()
         except Exception:
             self._write("无法启动任务。")
+
+    def _new_conversation_resolved(self, confirmed: bool) -> None:
+        if confirmed:
+            self._cancel_active_task()
+            self._new_conversation()
+
+    def _new_conversation(self) -> None:
+        self._conversation_id = None
+        self.query_one("#transcript", RichLog).clear()
+        composer = self.query_one("#composer", Composer)
+        composer.focus()
+        composer.cursor_location = composer.document.end
+
+    def _conversation_store_for_session(self) -> ConversationStore:
+        if self._conversation_store is None:
+            self._conversation_store = ConversationStore(self.profile.root)
+        return self._conversation_store
+
+    def _conversation_selected(self, conversation_id: UUID | None) -> None:
+        if conversation_id is None:
+            return
+        transcript = self.query_one("#transcript", RichLog)
+        transcript.clear()
+        for task_id in self._conversation_store_for_session().tasks(conversation_id):
+            task = self.runtime.task(task_id)
+            for line in lifecycle_lines(self.runtime, task):
+                self._write(line)
+        self._conversation_id = conversation_id
+        composer = self.query_one("#composer", Composer)
+        composer.focus()
+        composer.cursor_location = composer.document.end
 
     def _run_task_in_thread(self, task: TaskState) -> None:
         """Advance one runtime task off-loop and post only a typed completion message."""

@@ -153,6 +153,23 @@ def test_plain_help_is_grouped_and_treats_status_as_unknown(tmp_path: Path) -> N
     assert rendered.endswith("未知命令。\n")
 
 
+def test_plain_conversations_prints_only_safe_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches non-TTY history reconstruction exposing task bodies."""
+    from guardedpy.conversations import ConversationStore
+    from guardedpy.terminal import run_plain_session
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    profile = _profile(tmp_path)
+    conversation = ConversationStore(profile.root).create()
+    ConversationStore(profile.root).attach_task(conversation.id, uuid4())
+    output = StringIO()
+
+    assert run_plain_session(_Runtime(profile), StringIO("/conversations\n/exit\n"), output) == 0
+    rendered = output.getvalue()
+    assert str(conversation.id) in rendered
+    assert "raw secret" not in rendered
+
+
 def test_plain_session_requires_exact_command_names_before_mutating_defaults(tmp_path: Path) -> None:
     """Catches a slash-prefix typo changing persistent model or workflow state."""
     from guardedpy.terminal import run_plain_session

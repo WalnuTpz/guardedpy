@@ -16,6 +16,12 @@ from guardedpy.events import StoredRunEvent
 from guardedpy.runtime import LocalRuntime, RuntimeServices
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep Textual sessions that create a safe conversation index out of the host state home."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
 class _Runtime:
     """The smallest real-session boundary needed to exercise Textual widgets."""
 
@@ -30,6 +36,9 @@ class _Runtime:
     def events(self, task_id: object) -> list[StoredRunEvent]:
         del task_id
         return []
+
+    def task(self, task_id: object) -> TaskState:
+        return next(task for task in self.created if task.id == task_id)
 
     def update_future_defaults(self, **changes: str) -> HarnessConfig:
         self.updated = changes
@@ -133,7 +142,7 @@ def test_tui_mounts_safe_session_widgets_and_filters_exact_command_palette(tmp_p
             await pilot.click("#command-history")
             assert app.query_one("#composer", Composer).text == "/history"
             assert tuple(COMMANDS) == (
-                "/history", "/new", "/clear", "/exit", "/plan", "/review",
+                "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
                 "/tests", "/diff", "/permissions", "/credentials", "/memory",
                 "/model", "/effort", "/doctor", "/help",
             )
@@ -593,6 +602,46 @@ def test_tui_has_grouped_help_without_footer(tmp_path: Path) -> None:
             for group in ("会话与对话", "任务与检查", "设置与安全"):
                 assert group in rendered
             assert "/status" not in rendered
+
+    asyncio.run(check())
+
+
+def test_tui_conversation_selection_restores_safe_lifecycle_and_new_confirms_active_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches historical selection leaking task descriptions or /new abandoning active work."""
+    from guardedpy.conversations import ConversationStore
+    from guardedpy.tui import Composer, GuardedPyApp
+    from textual.widgets import RichLog
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    profile = _profile(tmp_path)
+    runtime = _Runtime(profile)
+    task = TaskState(description="raw secret prompt", config=runtime.config)
+    task.status = TaskStatus.COMPLETED
+    runtime.created.append(task)
+    conversation = ConversationStore(profile.root).create()
+    ConversationStore(profile.root).attach_task(conversation.id, task.id)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("/conversations")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            transcript = app.query_one("#transcript", RichLog)
+            rendered = "\n".join(line.text for line in transcript.lines)
+            assert f"任务 {task.id}：completed" in rendered
+            assert "raw secret prompt" not in rendered
+            composer = app.query_one("#composer", Composer)
+            assert app.focused is composer
+            assert composer.cursor_location == composer.document.end
+
+            app._active_task = TaskState(description="active", config=runtime.config)
+            app.submit("/new")
+            await pilot.pause()
+            assert app.screen.query_one("#new-confirm")
 
     asyncio.run(check())
 
