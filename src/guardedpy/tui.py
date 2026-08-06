@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from io import StringIO
+from threading import Thread
 from typing import Any
+from uuid import UUID
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, ListItem, ListView, RichLog, Static, TextArea
 
@@ -99,6 +102,15 @@ class ExitScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "exit-confirm-button")
 
 
+class TaskRunFinished(Message):
+    """Deliver one background runtime result to the Textual event loop."""
+
+    def __init__(self, task_id: UUID, result: TaskState | None) -> None:
+        self.task_id = task_id
+        self.result = result
+        super().__init__()
+
+
 class GuardedPyApp(App[None]):
     """The single-project interactive terminal session."""
 
@@ -116,6 +128,7 @@ class GuardedPyApp(App[None]):
         self.initial_task = initial_task
         self._pending_approval: tuple[TaskState, str] | None = None
         self._active_task: TaskState | None = None
+        self._cancelled_task_ids: set[UUID] = set()
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
@@ -149,6 +162,7 @@ class GuardedPyApp(App[None]):
         if event.key == "ctrl+c" and self._active_task is not None:
             event.prevent_default()
             event.stop()
+            self._cancelled_task_ids.add(self._active_task.id)
             self._render_task(self.runtime.cancel(self._active_task.id))
 
     def submit(self, text: str) -> None:
@@ -259,6 +273,7 @@ class GuardedPyApp(App[None]):
         if not confirmed:
             return
         if self._active_task is not None:
+            self._cancelled_task_ids.add(self._active_task.id)
             self._render_task(self.runtime.cancel(self._active_task.id))
         self.exit()
 
@@ -267,11 +282,38 @@ class GuardedPyApp(App[None]):
             self._write("任务描述不能为空。")
             return
         try:
+            self._write(f"用户：{description}")
             task = self.runtime.create_task(description, intent, review_path=review_path)
             self._active_task = task
-            self._render_task(self.runtime.run(task.id))
+            self.query_one("#status", Static).update(self._status_text(task))
+            Thread(target=self._run_task_in_thread, args=(task,), daemon=True).start()
         except Exception:
             self._write("无法启动任务。")
+
+    def _run_task_in_thread(self, task: TaskState) -> None:
+        """Advance one runtime task off-loop and post only a typed completion message."""
+        try:
+            result = self.runtime.run(task.id)
+        except Exception:
+            self.post_message(TaskRunFinished(task.id, None))
+            return
+        self.post_message(TaskRunFinished(task.id, result))
+
+    def on_task_run_finished(self, event: TaskRunFinished) -> None:
+        if event.result is None:
+            self._task_run_failed(event.task_id)
+            return
+        self._task_run_finished(event.result)
+
+    def _task_run_failed(self, task_id: UUID) -> None:
+        if task_id not in self._cancelled_task_ids:
+            self._write("无法启动任务。")
+
+    def _task_run_finished(self, task: TaskState) -> None:
+        if task.id in self._cancelled_task_ids:
+            self._cancelled_task_ids.remove(task.id)
+            return
+        self._render_task(task)
 
     def _render_task(self, task: TaskState) -> None:
         self._active_task = task if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL} else None

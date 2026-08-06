@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from threading import Event, Timer
 
 import pytest
 from textual.css.query import NoMatches
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import TaskState, TaskStatus
+from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.events import StoredRunEvent
 
 
@@ -105,6 +106,7 @@ def test_tui_lifecycle_tracks_baseline_task_and_safe_cancel_exit(tmp_path: Path)
         async with app.run_test() as pilot:
             app.submit("repair value")
             await pilot.pause()
+            await app.workers.wait_for_complete()
             assert "基线：baseline_pending · 任务：waiting_approval" in str(
                 app.query_one("#status").render()
             )
@@ -112,9 +114,74 @@ def test_tui_lifecycle_tracks_baseline_task_and_safe_cancel_exit(tmp_path: Path)
             assert runtime.cancelled == [runtime.created[0].id]
             app.submit("repair value")
             await pilot.pause()
+            await app.workers.wait_for_complete()
             app.submit("/exit")
             await pilot.pause()
             assert app.screen.query_one("#exit-confirm")
+
+    asyncio.run(check())
+
+
+def test_tui_transcript_records_the_submitted_user_request_before_lifecycle(tmp_path: Path) -> None:
+    """Catches a task starting without an auditable, safe user-message projection."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import RichLog
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("repair value")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            transcript = app.query_one("#transcript", RichLog)
+            assert transcript.lines[0].text == "用户：repair value"
+
+    asyncio.run(check())
+
+
+def test_tui_runs_blocking_runtime_in_worker_and_cancels_before_it_releases(tmp_path: Path) -> None:
+    """Catches a synchronous run freezing the event loop until a blocking runtime returns."""
+    from guardedpy.tui import GuardedPyApp
+
+    class BlockingRuntime(_Runtime):
+        def __init__(self, profile: ProjectProfile) -> None:
+            super().__init__(profile)
+            self.started = Event()
+            self.release = Event()
+            self.cancel_before_release = False
+
+        def run(self, task_id: object) -> TaskState:
+            self.started.set()
+            self.release.wait(timeout=0.3)
+            task = next(task for task in self.created if task.id == task_id)
+            return task
+
+        def cancel(self, task_id: object) -> TaskState:
+            self.cancel_before_release = not self.release.is_set()
+            self.release.set()
+            return super().cancel(task_id)
+
+    profile = _profile(tmp_path)
+    runtime = BlockingRuntime(profile)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        timer = Timer(0.3, runtime.release.set)
+        timer.start()
+        try:
+            async with app.run_test() as pilot:
+                app.submit("long repair")
+                await pilot.pause()
+                assert runtime.started.is_set()
+                assert runtime.release.is_set() is False
+                await pilot.press("ctrl+c")
+                assert runtime.cancel_before_release is True
+                assert runtime.cancelled == [runtime.created[0].id]
+        finally:
+            timer.cancel()
+            runtime.release.set()
 
     asyncio.run(check())
 
