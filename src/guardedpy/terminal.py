@@ -60,6 +60,9 @@ def run_noninteractive_task(
         output.write("任务描述不能为空。\n")
         return 2
     try:
+        if not runtime.credential_status().configured:
+            output.write("需要先在交互终端配置凭据。\n")
+            return 1
         task = runtime.create_task(description, intent, review_path=review_path)
         result = runtime.run(task.id)
     except Exception:

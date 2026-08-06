@@ -215,6 +215,7 @@ class GuardedPyApp(App[None]):
         self._session_command_workers: dict[str, Thread] = {}
         self._palette_index = -1
         self._suppress_palette_once = False
+        self._pending_credential_request: tuple[str, TaskIntent, str | None] | None = None
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
@@ -301,7 +302,7 @@ class GuardedPyApp(App[None]):
         if request.startswith("/"):
             self._submit_command(request)
             return
-        self._start_task(request, TaskIntent.CODING)
+        self._require_credential_then_submit(request, TaskIntent.CODING)
 
     def request_approval(
         self,
@@ -370,10 +371,10 @@ class GuardedPyApp(App[None]):
             self._open_settings("reasoning_effort", ("high", "max"))
             return
         if name == "/plan":
-            self._start_task(argument, TaskIntent.PLAN)
+            self._require_credential_then_submit(argument, TaskIntent.PLAN)
             return
         if name == "/review":
-            self._start_task("Review project", TaskIntent.REVIEW, argument or None)
+            self._require_credential_then_submit("Review project", TaskIntent.REVIEW, argument or None)
             return
         if name == "/exit":
             if self._active_task is None:
@@ -428,6 +429,9 @@ class GuardedPyApp(App[None]):
 
     def _credential_resolved(self, result: tuple[str, str | None] | None) -> None:
         if result is None:
+            if self._pending_credential_request is not None:
+                self._pending_credential_request = None
+                self._write("未配置凭据，任务未开始。")
             return
         operation, value = result
         try:
@@ -437,10 +441,34 @@ class GuardedPyApp(App[None]):
                     return
                 self.runtime.update_credential(value)
                 self._write("凭据已更新。")
+                self._resume_pending_credential_request()
             elif operation == "clear_requested":
                 self.push_screen(ClearCredentialScreen(), self._clear_credential_resolved)
         except Exception:
             self._write("凭据操作失败。")
+
+    def _require_credential_then_submit(
+        self, text: str, intent: TaskIntent, review_path: str | None = None
+    ) -> None:
+        if not text.strip():
+            self._write("任务描述不能为空。")
+            return
+        try:
+            configured = self.runtime.credential_status().configured
+        except Exception:
+            self._write("凭据状态不可用。")
+            return
+        if configured:
+            self._start_task(text, intent, review_path)
+            return
+        self._pending_credential_request = (text, intent, review_path)
+        self.push_screen(CredentialScreen(False), self._credential_resolved)
+
+    def _resume_pending_credential_request(self) -> None:
+        pending = self._pending_credential_request
+        self._pending_credential_request = None
+        if pending is not None:
+            self._start_task(*pending)
 
     def _clear_credential_resolved(self, confirmed: bool) -> None:
         if not confirmed:

@@ -25,6 +25,7 @@ class _Runtime:
         self.created: list[TaskState] = []
         self.cancelled: list[object] = []
         self.history_reads = 0
+        self.configured = True
 
     def events(self, task_id: object) -> list[StoredRunEvent]:
         del task_id
@@ -40,7 +41,11 @@ class _Runtime:
         return []
 
     def credential_status(self) -> CredentialStatus:
-        return CredentialStatus(configured=False)
+        return CredentialStatus(configured=self.configured)
+
+    def update_credential(self, key: str) -> None:
+        assert key
+        self.configured = True
 
     def create_task(self, description: str, intent: object, review_path: str | None = None) -> TaskState:
         task = TaskState(description=description, config=self.config, intent=intent, review_path=review_path)
@@ -63,7 +68,7 @@ class _Credentials:
     """A credential port for tests that exercise the real LocalRuntime."""
 
     def status(self) -> CredentialStatus:
-        return CredentialStatus(configured=False)
+        return CredentialStatus(configured=True)
 
     def set_key(self, key: str) -> None:
         del key
@@ -606,6 +611,39 @@ def test_tui_credentials_command_uses_a_masked_modal_input(tmp_path: Path) -> No
             await pilot.pause()
             field = app.screen.query_one("#credential-value", Input)
             assert field.password is True
+
+    asyncio.run(check())
+
+
+def test_tui_requires_masked_credential_before_creating_llm_task(tmp_path: Path) -> None:
+    """Catches a provider task being registered before its interactive credential exists."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Input, RichLog
+
+    profile = _profile(tmp_path)
+    runtime = _Runtime(profile)
+    runtime.configured = False
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("repair failing test")
+            await pilot.pause()
+            assert runtime.created == []
+            assert app.screen.query_one("#credential-value", Input).password is True
+            field = app.screen.query_one("#credential-value", Input)
+            field.value = "test-key"
+            await pilot.click("#credential-update")
+            await pilot.pause()
+            assert [task.description for task in runtime.created] == ["repair failing test"]
+
+            runtime.configured = False
+            app.submit("/plan inspect")
+            await pilot.pause()
+            await pilot.click("#credential-cancel")
+            await pilot.pause()
+            transcript = app.query_one("#transcript", RichLog)
+            assert transcript.lines[-1].text == "未配置凭据，任务未开始。"
 
     asyncio.run(check())
 

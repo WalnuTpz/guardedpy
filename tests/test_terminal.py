@@ -31,6 +31,7 @@ class _Runtime:
         self.revoked: list[str] = []
         self.approved: list[object] = []
         self.removed: list[object] = []
+        self.configured = False
 
     def create_task(self, description: str, intent: TaskIntent = TaskIntent.CODING, review_path: str | None = None) -> TaskState:
         task = TaskState(description=description, intent=intent, config=self.config, review_path=review_path)
@@ -47,7 +48,7 @@ class _Runtime:
         return []
 
     def credential_status(self) -> CredentialStatus:
-        return CredentialStatus(configured=False)
+        return CredentialStatus(configured=self.configured)
 
     def update_credential(self, key: str) -> None:
         del key
@@ -94,6 +95,7 @@ def test_noninteractive_task_stops_on_approval_without_consuming_stdin(tmp_path:
     from guardedpy.terminal import run_noninteractive_task
 
     runtime = _Runtime(_profile(tmp_path), approval=True)
+    runtime.configured = True
     output = StringIO()
 
     code = run_noninteractive_task(runtime, "remove artifact", TaskIntent.CODING, output)
@@ -101,6 +103,20 @@ def test_noninteractive_task_stops_on_approval_without_consuming_stdin(tmp_path:
     assert code == 1
     assert "waiting_approval" in output.getvalue()
     assert "需要人工审批，非交互模式已安全停止。" in output.getvalue()
+
+
+def test_noninteractive_task_requires_configured_credential_before_creation(tmp_path: Path) -> None:
+    """Catches redirected work creating a provider task without a keyring credential."""
+    from guardedpy.terminal import run_noninteractive_task
+
+    runtime = _Runtime(_profile(tmp_path))
+    output = StringIO()
+
+    code = run_noninteractive_task(runtime, "repair test", TaskIntent.CODING, output)
+
+    assert code == 1
+    assert runtime.created == []
+    assert output.getvalue() == "需要先在交互终端配置凭据。\n"
 
 
 def test_plain_session_refuses_piped_credential_entry_and_lists_only_supported_commands(tmp_path: Path) -> None:
