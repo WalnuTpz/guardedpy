@@ -9,6 +9,7 @@ from uuid import UUID
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
+from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, ListItem, ListView, RichLog, Static, TextArea
@@ -24,6 +25,28 @@ _NO_ARGUMENT_COMMANDS = frozenset(
         "/credentials", "/status", "/doctor", "/help",
     }
 )
+
+
+class ComposerSubmitted(Message):
+    """Deliver a composer submission that TextArea would otherwise consume."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        super().__init__()
+
+
+class Composer(TextArea):
+    """TextArea with explicit submit and multiline key boundaries."""
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            self.post_message(ComposerSubmitted(self.text))
+        elif event.key in {"shift+enter", "ctrl+j"}:
+            event.prevent_default()
+            event.stop()
+            self.insert("\n")
 
 
 class ApprovalScreen(ModalScreen[str | None]):
@@ -167,7 +190,7 @@ class GuardedPyApp(App[None]):
             *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}" ) for command in COMMANDS),
             id="command-palette",
         )
-        yield TextArea(id="composer")
+        yield Composer(id="composer")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -188,14 +211,14 @@ class GuardedPyApp(App[None]):
                 item.display = command.startswith(prefix)
 
     def on_key(self, event: Any) -> None:
-        if event.key == "enter" and self.focused is self.query_one("#composer"):
-            event.prevent_default()
-            event.stop()
-            self.submit(self.query_one("#composer", TextArea).text)
         if event.key == "ctrl+c" and self._active_task is not None:
             event.prevent_default()
             event.stop()
             self._cancel_active_task()
+
+    def on_composer_submitted(self, event: ComposerSubmitted) -> None:
+        """Make the custom composer message the sole interactive submit path."""
+        self.submit(event.text)
 
     def submit(self, text: str) -> None:
         request = text.strip()

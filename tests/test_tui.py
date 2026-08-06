@@ -76,6 +76,30 @@ def _profile(tmp_path: Path) -> ProjectProfile:
     return discover_project(tmp_path)
 
 
+def test_composer_enter_submits_help_and_shift_enter_or_ctrl_j_adds_newline(tmp_path: Path) -> None:
+    """Catches TextArea consuming Enter instead of delivering the submitted command."""
+    from guardedpy.tui import Composer, GuardedPyApp
+    from textual.widgets import RichLog
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            await pilot.click("#composer")
+            await pilot.press(*"/help", "enter")
+            transcript = app.query_one("#transcript", RichLog)
+            assert any("可用命令：" in line.text for line in transcript.lines)
+            composer = app.query_one("#composer", Composer)
+            await pilot.press("shift+enter")
+            assert "\n" in composer.text
+            composer.text = ""
+            await pilot.press("ctrl+j")
+            assert composer.text == "\n"
+
+    asyncio.run(check())
+
+
 def test_tui_mounts_safe_session_widgets_and_filters_exact_command_palette(tmp_path: Path) -> None:
     """Catches the interactive session losing its composer, status, or safe command UI."""
     from guardedpy.tui import COMMANDS, GuardedPyApp
