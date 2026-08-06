@@ -6,6 +6,7 @@ from typing import Any, Callable, Protocol
 
 from openai import APIConnectionError, APITimeoutError
 
+from guardedpy.config import HarnessConfig
 from guardedpy.context import LlmContext
 
 
@@ -41,11 +42,11 @@ class DeepSeekClient:
     def __init__(
         self,
         key_provider: Callable[[], str],
-        model: str,
+        config: HarnessConfig,
         transport_factory: Callable[[str], Any],
     ) -> None:
         self._key_provider = key_provider
-        self._model = model
+        self._config = config.model_copy(deep=True)
         self._transport_factory = transport_factory
 
     def complete(self, context: LlmContext) -> str:
@@ -54,9 +55,11 @@ class DeepSeekClient:
         for attempt in range(2):
             try:
                 response = transport.chat.completions.create(
-                    model=self._model,
+                    model=self._config.model,
                     messages=context.messages(),
                     response_format={"type": "json_object"},
+                    reasoning_effort=self._config.reasoning_effort,
+                    extra_body={"thinking": {"type": "enabled"}},
                 )
                 return response.choices[0].message.content
             except (ConnectionError, TimeoutError, APIConnectionError, APITimeoutError):

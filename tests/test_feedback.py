@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 from unittest.mock import patch
 
 import pytest
 
+from conftest import safe_config
 from guardedpy.config import HarnessConfig
+from guardedpy.discovery import ProjectProfile
 from guardedpy.domain import FeedbackKind
 from guardedpy.feedback import FeedbackCollector, PytestRun
 from guardedpy.workspace import Workspace
@@ -109,11 +111,7 @@ def test_run_pytest_uses_the_selected_root_as_its_working_directory(tmp_path: Pa
         "def test_selected_root_is_cwd() -> None:\n"
         f"    assert Path.cwd() == Path({str(tmp_path)!r})\n"
     )
-    config = HarnessConfig(
-        source_dirs=("src",),
-        test_dirs=("tests",),
-        pytest_command=(sys.executable, "-m", "pytest", "-q"),
-    )
+    config = safe_config(tmp_path)
 
     result = Workspace(tmp_path, config).run_pytest(("tests/test_cwd.py",))
 
@@ -131,12 +129,7 @@ def test_run_pytest_returns_a_structured_timeout_result(tmp_path: Path) -> None:
         "def test_waits() -> None:\n"
         "    time.sleep(10)\n"
     )
-    config = HarnessConfig(
-        source_dirs=("src",),
-        test_dirs=("tests",),
-        pytest_command=(sys.executable, "-m", "pytest", "-q"),
-        timeout_seconds=5,
-    )
+    config = safe_config(tmp_path).model_copy(update={"timeout_seconds": 5})
 
     result = Workspace(tmp_path, config).run_pytest(("tests/test_wait.py",))
 
@@ -146,11 +139,7 @@ def test_run_pytest_returns_a_structured_timeout_result(tmp_path: Path) -> None:
 
 def test_run_pytest_explicitly_disables_shell_execution(tmp_path: Path) -> None:
     """Catches a runner that relies on subprocess's default shell setting."""
-    config = HarnessConfig(
-        source_dirs=("src",),
-        test_dirs=("tests",),
-        pytest_command=("pytest",),
-    )
+    config = safe_config(tmp_path)
     completed = subprocess.CompletedProcess(("pytest",), 0, "1 passed\n", "")
 
     with patch("guardedpy.workspace.subprocess.run", return_value=completed) as run:
@@ -164,11 +153,7 @@ def test_run_pytest_rejects_a_target_outside_configured_test_directories(
     tmp_path: Path,
 ) -> None:
     """Catches a runner that lets model-supplied targets select files outside test roots."""
-    config = HarnessConfig(
-        source_dirs=("src",),
-        test_dirs=("tests",),
-        pytest_command=(sys.executable, "-m", "pytest"),
-    )
+    config = safe_config(tmp_path)
 
     with pytest.raises(ValueError, match="configured test directories"):
         Workspace(tmp_path, config).run_pytest(("src/module.py",))
@@ -180,9 +165,13 @@ def test_run_pytest_rejects_empty_or_option_targets_even_with_project_test_root(
 ) -> None:
     """Catches a target value that turns pytest selection into a command option or full run."""
     config = HarnessConfig(
-        source_dirs=("src",),
-        test_dirs=(".",),
-        pytest_command=(sys.executable, "-c", "pass"),
+        profile=ProjectProfile(
+            root=tmp_path.resolve(),
+            discovery_source="root_tests",
+            source_dirs=(PurePosixPath("."),),
+            test_dirs=(PurePosixPath("."),),
+            pytest_command=(sys.executable, "-m", "pytest"),
+        )
     )
 
     with pytest.raises(ValueError, match="must name files"):

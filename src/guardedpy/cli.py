@@ -61,7 +61,7 @@ def local_services() -> RuntimeServices:
                 timeout_seconds=config.timeout_seconds,
             )
 
-        llm = DeepSeekClient(credentials.get_key, config.model, transport_factory)
+        llm = DeepSeekClient(credentials.get_key, config, transport_factory)
         return TaskOrchestrator(
             project_root,
             llm,

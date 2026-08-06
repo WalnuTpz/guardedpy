@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from conftest import safe_config
 from guardedpy.actions import (
     Action,
     ApplyPatchAction,
@@ -15,7 +16,6 @@ from guardedpy.actions import (
     RunPytestAction,
 )
 from guardedpy.command_rules import CommandRuleStore
-from guardedpy.config import HarnessConfig
 from guardedpy.domain import (
     ApprovalDecision,
     FeedbackKind,
@@ -437,7 +437,7 @@ def test_bugfix_requires_a_nonblank_target_at_creation(tmp_path: Path) -> None:
             description="Repair a test",
             mode=TaskMode.BUGFIX,
             bugfix_target="  ",
-            config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+            config=safe_config(tmp_path),
         )
 
 
@@ -445,7 +445,7 @@ def test_bugfix_red_requires_exactly_the_selected_assertion_node(
     policy: PolicyEngine, tmp_path: Path
 ) -> None:
     """Catches a selected bugfix target being bypassed by an unrelated assertion failure."""
-    config = HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",))
+    config = safe_config(tmp_path)
     selected = "tests/test_parser.py::test_bad_input"
     action = RunPytestAction(kind="run_pytest", summary="run configured suite", targets=())
     target_task = TaskState(
@@ -484,7 +484,7 @@ def test_bugfix_target_free_sole_selected_failure_records_baseline_and_red(
         description="Persisted red without baseline evidence",
         mode=TaskMode.BUGFIX,
         bugfix_target=selected,
-        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+        config=safe_config(tmp_path),
         tdd_phase=TddPhase.RED_OBSERVED,
     )
     policy.record_read(
@@ -506,7 +506,7 @@ def test_bugfix_target_free_sole_selected_failure_records_baseline_and_red(
         description="Repair parser",
         mode=TaskMode.BUGFIX,
         bugfix_target=selected,
-        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+        config=safe_config(tmp_path),
     )
 
     recorded = policy.record_pytest(
@@ -529,7 +529,7 @@ def test_bugfix_target_free_sole_selected_failure_records_baseline_and_red(
 
 
 def test_bugfix_targeted_selected_failure_does_not_establish_baseline_or_red(
-    policy: PolicyEngine
+    policy: PolicyEngine, tmp_path: Path
 ) -> None:
     """Catches a targeted run claiming that the unrelated starting suite is healthy."""
     selected = "tests/test_parser.py::test_bad_input"
@@ -537,7 +537,7 @@ def test_bugfix_targeted_selected_failure_does_not_establish_baseline_or_red(
         description="Repair parser",
         mode=TaskMode.BUGFIX,
         bugfix_target=selected,
-        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+        config=safe_config(tmp_path),
     )
 
     targeted = policy.record_pytest(
@@ -554,7 +554,7 @@ def test_bugfix_targeted_selected_failure_does_not_establish_baseline_or_red(
 
 
 def test_bugfix_target_free_unrelated_failure_does_not_establish_baseline_or_red(
-    policy: PolicyEngine
+    policy: PolicyEngine, tmp_path: Path
 ) -> None:
     """Catches an unrelated broken baseline authorizing changes outside the selected bug."""
     selected = "tests/test_parser.py::test_bad_input"
@@ -562,7 +562,7 @@ def test_bugfix_target_free_unrelated_failure_does_not_establish_baseline_or_red
         description="Repair parser",
         mode=TaskMode.BUGFIX,
         bugfix_target=selected,
-        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+        config=safe_config(tmp_path),
     )
 
     unrelated = policy.record_pytest(
@@ -592,7 +592,7 @@ def test_bugfix_target_free_unrelated_failure_does_not_establish_baseline_or_red
 
 
 def test_bugfix_policy_refuses_runtime_feedback_with_a_source_assert_line(
-    policy: PolicyEngine
+    policy: PolicyEngine, tmp_path: Path
 ) -> None:
     """Catches a source assertion in a TypeError traceback advancing the bugfix red gate."""
     target = "tests/test_parser.py::test_bad_input"
@@ -600,7 +600,7 @@ def test_bugfix_policy_refuses_runtime_feedback_with_a_source_assert_line(
         description="Repair parser",
         mode=TaskMode.BUGFIX,
         bugfix_target=target,
-        config=HarnessConfig(source_dirs=("src",), test_dirs=("tests",), pytest_command=("pytest",)),
+        config=safe_config(tmp_path),
     )
     feedback = FeedbackCollector().collect(
         PytestRun(

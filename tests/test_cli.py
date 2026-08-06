@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 
+from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TaskStatus
@@ -15,11 +16,7 @@ from guardedpy.events import StopReason, StoredRunEvent
 
 
 def _config() -> HarnessConfig:
-    return HarnessConfig(
-        source_dirs=(Path("src"),),
-        test_dirs=(Path("tests"),),
-        pytest_command=("pytest",),
-    )
+    return safe_config(Path.cwd())
 
 
 class FakeRuntime:

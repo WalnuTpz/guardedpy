@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from guardedpy.config import HarnessConfig
+from conftest import safe_config
 from guardedpy.context import ContextBuilder
 from guardedpy.domain import TaskMode, TaskState, TddPhase
 from guardedpy.memory import MemoryEntry
@@ -15,11 +15,7 @@ def _task() -> TaskState:
         description="Repair the parser",
         mode=TaskMode.BUGFIX,
         bugfix_target="tests/test_parser.py::test_bad_input",
-        config=HarnessConfig(
-            source_dirs=(Path("src"),),
-            test_dirs=(Path("tests"),),
-            pytest_command=("pytest", "-q"),
-        ),
+        config=safe_config(Path.cwd()),
         tdd_phase=TddPhase.RED_OBSERVED,
     )
 

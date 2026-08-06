@@ -10,7 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from guardedpy.actions import parse_action
-from guardedpy.config import HarnessConfig
+from conftest import safe_config
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 
@@ -228,12 +228,8 @@ def test_register_task_persists_static_metadata_and_forces_pending_state(
     store: EventStore,
 ) -> None:
     """Catches restart history losing task identity/config or inheriting a forged status."""
-    config = HarnessConfig(
-        source_dirs=(Path("src"),),
-        test_dirs=(Path("tests"),),
-        pytest_command=("pytest", "-q"),
-        model="deepseek-chat",
-        timeout_seconds=45,
+    config = safe_config(store.project_root).model_copy(
+        update={"model": "deepseek-v4-pro", "timeout_seconds": 45}
     )
     task = TaskState(
         description="Keep this task after restart",
@@ -269,11 +265,7 @@ def test_existing_event_database_adds_task_metadata_without_losing_events(
     new_task = TaskState(
         description="Registered after migration",
         mode=TaskMode.FEATURE,
-        config=HarnessConfig(
-            source_dirs=(Path("src"),),
-            test_dirs=(Path("tests"),),
-            pytest_command=("pytest",),
-        ),
+        config=safe_config(store.project_root),
     )
     migrated.register_task(new_task)
 

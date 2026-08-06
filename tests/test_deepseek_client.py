@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import sys
 from typing import Any
 
 import httpx
@@ -13,6 +14,7 @@ import pytest
 from guardedpy.config import HarnessConfig
 from guardedpy.context import LlmContext
 from guardedpy.domain import TaskMode, TaskState, TaskStatus
+from guardedpy.discovery import ProjectProfile
 from guardedpy.events import EventStore, StopReason
 from guardedpy.llm import DeepSeekClient, TemporaryProviderFailure
 from guardedpy.memory import MemoryStore
@@ -53,6 +55,23 @@ class _Transport:
         self.chat = type("Chat", (), {"completions": _Completions(responses)})()
 
 
+def _config(
+    *, model: str = "deepseek-v4-flash", reasoning_effort: str = "high", timeout: int = 120
+) -> HarnessConfig:
+    return HarnessConfig(
+        profile=ProjectProfile(
+            root=Path.cwd().resolve(),
+            discovery_source="tests_dir",
+            source_dirs=(PurePosixPath("src"),),
+            test_dirs=(PurePosixPath("tests"),),
+            pytest_command=(sys.executable, "-m", "pytest"),
+        ),
+        model=model,
+        reasoning_effort=reasoning_effort,
+        timeout_seconds=timeout,
+    )
+
+
 def _completion_outcome(client: DeepSeekClient) -> str | Exception:
     try:
         return client.complete(LlmContext.minimal())
@@ -68,20 +87,37 @@ def _sdk_timeout_error() -> APITimeoutError:
     return APITimeoutError(httpx.Request("POST", "https://api.deepseek.com/chat/completions"))
 
 
-def test_deepseek_client_gets_key_at_call_time_and_uses_json_mode() -> None:
+@pytest.mark.parametrize(
+    ("model", "reasoning_effort"),
+    [
+        ("deepseek-v4-flash", "high"),
+        ("deepseek-v4-flash", "max"),
+        ("deepseek-v4-pro", "high"),
+        ("deepseek-v4-pro", "max"),
+    ],
+)
+def test_deepseek_client_uses_immutable_model_and_thinking_snapshot(
+    model: str, reasoning_effort: str
+) -> None:
     """Catches eager key access or a completion request that permits non-JSON output."""
     keys: list[str] = []
     transport = _Transport([_Response([_Choice(_Message('{"kind":"finish","summary":"done","status":"blocked"}'))])])
-    client = DeepSeekClient(lambda: keys.append("called") or "secret", "deepseek-v4-flash", lambda key: transport)
+    client = DeepSeekClient(
+        lambda: keys.append("called") or "secret",
+        _config(model=model, reasoning_effort=reasoning_effort),
+        lambda key: transport,
+    )
 
     assert keys == []
     assert client.complete(LlmContext.minimal()) == '{"kind":"finish","summary":"done","status":"blocked"}'
     assert keys == ["called"]
     assert transport.chat.completions.calls == [
         {
-            "model": "deepseek-v4-flash",
+            "model": model,
             "messages": LlmContext.minimal().messages(),
             "response_format": {"type": "json_object"},
+            "reasoning_effort": reasoning_effort,
+            "extra_body": {"thinking": {"type": "enabled"}},
         }
     ]
 
@@ -90,7 +126,7 @@ def test_deepseek_client_returns_invalid_json_unchanged() -> None:
     """Catches adapter-side repair that would hide malformed model output from the action parser."""
     transport = _Transport([_Response([_Choice(_Message("not json"))])])
 
-    assert DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: transport).complete(LlmContext.minimal()) == "not json"
+    assert DeepSeekClient(lambda: "secret", _config(), lambda key: transport).complete(LlmContext.minimal()) == "not json"
 
 
 def test_deepseek_client_retries_only_temporary_transport_failures() -> None:
@@ -101,14 +137,14 @@ def test_deepseek_client_retries_only_temporary_transport_failures() -> None:
             _Response([_Choice(_Message('{"kind":"finish","summary":"done","status":"blocked"}'))]),
         ]
     )
-    client = DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: temporary)
+    client = DeepSeekClient(lambda: "secret", _config(), lambda key: temporary)
 
     assert '"kind":"finish"' in client.complete(LlmContext.minimal())
     assert len(temporary.chat.completions.calls) == 2
 
     permanent = _Transport([ValueError("bad request")])
     with pytest.raises(ValueError, match="bad request"):
-        DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: permanent).complete(LlmContext.minimal())
+        DeepSeekClient(lambda: "secret", _config(), lambda key: permanent).complete(LlmContext.minimal())
 
 
 @pytest.mark.parametrize("failure_factory", [_sdk_connection_error, _sdk_timeout_error])
@@ -124,7 +160,7 @@ def test_deepseek_client_retries_actual_openai_transient_failures_once(
     )
 
     result = _completion_outcome(
-        DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: transport)
+        DeepSeekClient(lambda: "secret", _config(), lambda key: transport)
     )
 
     assert result == '{"kind":"finish","summary":"done","status":"blocked"}'
@@ -139,7 +175,7 @@ def test_two_actual_openai_transient_failures_stop_after_two_total_calls(
     transport = _Transport([failure_factory(), failure_factory()])
 
     outcome = _completion_outcome(
-        DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: transport)
+        DeepSeekClient(lambda: "secret", _config(), lambda key: transport)
     )
 
     assert isinstance(outcome, TemporaryProviderFailure)
@@ -156,7 +192,7 @@ def test_deepseek_client_propagates_actual_openai_permanent_failure_unchanged() 
     transport = _Transport([permanent])
 
     with pytest.raises(BadRequestError) as caught:
-        DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: transport).complete(
+        DeepSeekClient(lambda: "secret", _config(), lambda key: transport).complete(
             LlmContext.minimal()
         )
 
@@ -222,12 +258,7 @@ def test_local_services_composes_the_task_config_timeout_into_openai_transport(
     monkeypatch.setattr(cli, "_system_keyring", lambda: Keyring())
     monkeypatch.setattr(cli, "OpenAI", openai_factory)
     services = cli.local_services()
-    config = HarnessConfig(
-        source_dirs=(Path("src"),),
-        test_dirs=(Path("tests"),),
-        pytest_command=("pytest",),
-        timeout_seconds=19,
-    )
+    config = _config(model="deepseek-v4-pro", reasoning_effort="max", timeout=19)
     orchestrator = services.orchestrator_factory(tmp_path, config, MemoryStore(tmp_path))
 
     orchestrator.run(
@@ -241,6 +272,11 @@ def test_local_services_composes_the_task_config_timeout_into_openai_transport(
 
     assert captured["timeout"] == 19
     assert captured["max_retries"] == 0
+    assert transport.chat.completions.calls[0]["model"] == "deepseek-v4-pro"
+    assert transport.chat.completions.calls[0]["reasoning_effort"] == "max"
+    assert transport.chat.completions.calls[0]["extra_body"] == {
+        "thinking": {"type": "enabled"}
+    }
 
 
 def test_two_temporary_provider_failures_stop_with_their_own_audit_reason(
@@ -249,12 +285,12 @@ def test_two_temporary_provider_failures_stop_with_their_own_audit_reason(
     """Catches retry exhaustion being misrepresented as a model-selected finish action."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     transport = _Transport([ConnectionError("offline"), ConnectionError("offline")])
-    client = DeepSeekClient(lambda: "secret", "deepseek-chat", lambda key: transport)
+    client = DeepSeekClient(lambda: "secret", _config(), lambda key: transport)
     task = TaskState(
         description="Repair the selected failure",
         mode=TaskMode.BUGFIX,
         bugfix_target="tests/test_value.py::test_value_is_fixed",
-        config=HarnessConfig(source_dirs=(Path("src"),), test_dirs=(Path("tests"),), pytest_command=("pytest",)),
+        config=_config(),
     )
 
     stopped = TaskOrchestrator(tmp_path, client).run(task)
