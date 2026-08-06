@@ -52,6 +52,14 @@ class Composer(TextArea):
             event.prevent_default()
             event.stop()
 
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if self.app._move_palette("down"):
+            event.stop()
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if self.app._move_palette("up"):
+            event.stop()
+
 
 class SettingsScreen(ModalScreen[str | None]):
     """Choose a validated future-task setting with keyboard or mouse."""

@@ -583,6 +583,111 @@ def test_tui_palette_selection_fills_then_second_enter_executes_and_model_picker
     asyncio.run(check())
 
 
+def test_tui_palette_wheel_and_click_are_fill_first_before_enter(tmp_path: Path) -> None:
+    """Catches pointer palette selection executing a command or ignoring wheel navigation."""
+    from guardedpy.tui import Composer, GuardedPyApp
+    from textual import events
+
+    profile = _profile(tmp_path)
+    runtime = _Runtime(profile)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            composer = app.query_one("#composer", Composer)
+            await pilot.click("#composer")
+            await pilot.press("/")
+            composer.post_message(events.MouseScrollDown(composer, 0, 0, 0, 1, 0, False, False, False))
+            await pilot.pause()
+            assert app.query_one("#command-palette").index == 0
+            composer.post_message(events.MouseScrollUp(composer, 0, 0, 0, -1, 0, False, False, False))
+            await pilot.pause()
+            assert app.query_one("#command-palette").index == len(app.query("#command-palette ListItem")) - 1
+
+            composer.text = "/h"
+            await pilot.pause()
+            await pilot.click("#command-history")
+            assert composer.text == "/history"
+            assert runtime.history_reads == 0
+            await pilot.press("enter")
+            assert runtime.history_reads == 1
+
+    asyncio.run(check())
+
+
+def test_tui_new_confirmation_keyboard_click_and_reject_control_cancellation(tmp_path: Path) -> None:
+    """Catches /new cancelling without consent or failing to cancel the exact active task."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import RichLog
+
+    profile = _profile(tmp_path)
+    runtime = _Runtime(profile)
+    active = TaskState(description="active", config=runtime.config)
+    runtime.created.append(active)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app._active_task = active
+            app.query_one("#transcript", RichLog).write("old")
+            app.submit("/new")
+            await pilot.pause()
+            await pilot.click("#new-cancel")
+            await pilot.pause()
+            assert runtime.cancelled == []
+
+            app.submit("/new")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert runtime.cancelled == [active.id]
+            assert app._conversation_id is None
+            assert app.query_one("#transcript", RichLog).lines == []
+
+            clicked_active = TaskState(description="clicked", config=runtime.config)
+            runtime.created.append(clicked_active)
+            app._active_task = clicked_active
+            app.submit("/new")
+            await pilot.pause()
+            await pilot.click("#new-confirm-button")
+            await pilot.pause()
+            assert runtime.cancelled == [active.id, clicked_active.id]
+            assert app._conversation_id is None
+            assert app.query_one("#transcript", RichLog).lines == []
+
+    asyncio.run(check())
+
+
+def test_tui_effort_picker_supports_keyboard_and_click(tmp_path: Path) -> None:
+    """Catches effort selection diverging from model picker behavior for keyboard or mouse."""
+    from guardedpy.tui import Composer, GuardedPyApp, SettingsScreen
+
+    profile = _profile(tmp_path)
+    keyboard_runtime = _Runtime(profile)
+    keyboard_app = GuardedPyApp(keyboard_runtime, profile)
+    click_runtime = _Runtime(profile)
+    click_app = GuardedPyApp(click_runtime, profile)
+
+    async def check() -> None:
+        async with keyboard_app.run_test() as pilot:
+            keyboard_app.submit("/effort")
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            assert keyboard_runtime.updated == {"reasoning_effort": "max"}
+            assert keyboard_app.query_one("#composer", Composer).text == ""
+            assert not isinstance(keyboard_app.screen, SettingsScreen)
+        async with click_app.run_test() as pilot:
+            click_app.submit("/effort")
+            await pilot.pause()
+            await pilot.click("#setting-max")
+            await pilot.pause()
+            assert click_runtime.updated == {"reasoning_effort": "max"}
+            assert click_app.query_one("#composer", Composer).text == ""
+            assert not isinstance(click_app.screen, SettingsScreen)
+
+    asyncio.run(check())
+
+
 def test_tui_has_grouped_help_without_footer(tmp_path: Path) -> None:
     """Catches the accepted help surface retaining framework Footer chrome."""
     from guardedpy.tui import GuardedPyApp
