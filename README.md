@@ -1,10 +1,10 @@
 # GuardedPy
 
-GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its own loop builds context, requests one structured LLM action, applies deterministic policy, runs restricted tools, returns objective feedback, and stops on a bounded result. The release-facing interfaces are a terminal client and a loopback-only local server; the existing WebUI remains a local compatibility surface. It also includes a separate, fixed-scenario demo that requires neither a project nor a credential.
+GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its self-owned loop creates context, asks one structured LLM action at a time, applies deterministic policy, runs restricted project tools, feeds back concise pytest evidence, and stops at a bounded result. It is a CLI-only Python package: start it from the project you want to inspect or change.
 
 ## Installation
 
-GuardedPy requires Python 3.11+ and a working operating-system keyring for local provider use. From a source checkout, create an environment and install the development dependencies:
+GuardedPy supports Python 3.11+ on Linux and WSL. Install from a source checkout for development:
 
 ```bash
 python3 -m venv .venv
@@ -12,139 +12,108 @@ python3 -m venv .venv
 python -m pip install -e ".[dev]"
 ```
 
-To test the distribution form after `make build`, install the wheel with `pipx install dist/guardedpy-*.whl`. This repository does not claim that GuardedPy is published to PyPI. Release asset URL is pending: no wheel or sdist has been uploaded to a GitHub Release, so use a locally built artifact until that happens.
-
-## Local operation
-
-On Linux or WSL, GuardedPy requires Python 3.11+, an OS keyring backend, and `fcntl` support for its local execution lease. Start the interactive client with either entrypoint:
+To verify the distributable form locally, build it first and install the generated wheel into a separate environment:
 
 ```bash
+make build
+python3 -m venv /tmp/guardedpy-release-env
+/tmp/guardedpy-release-env/bin/python -m pip install dist/guardedpy-*.whl
+```
+
+The release artifact is **not uploaded** to a hosting platform yet. Until a real release is published, use this source checkout or a wheel built by the commands above; this README deliberately provides no invented download link.
+
+## Run in a project
+
+Move into a supported Python + pytest repository and launch the one command:
+
+```bash
+cd /path/to/python-pytest-project
 guardedpy
-# or
-guardedpy-cli
 ```
 
-Run `/init` to choose a project root, source/test directories, pytest command, model, timeout and hidden DeepSeek key. The key is never a command-line argument, is not echoed, and is stored only in the OS keyring. Use `/help` to list `/task`, `/status`, `/tasks`, `/memory`, `/rules`, `/credentials`, `/clear` and `/exit`; `--prompt` supports one local task invocation. A real DeepSeek-compatible provider is used only after setup; there is no `.env` file or environment-variable credential fallback.
-
-Start the compatibility WebUI and versioned local JSON API only when needed:
+GuardedPy discovers the current project, its common source/test layout, and the full pytest command automatically. There is no manual root, source-directory, test-directory, or pytest-command setup flow. In an interactive terminal, enter a natural-language coding task or choose a command from the live command palette. A short initial task may also be passed directly:
 
 ```bash
-guardedpy-server
-# compatible alias
-guardedpy serve
+guardedpy "find the failing tests and explain a safe repair plan"
 ```
 
-The server is fixed to `127.0.0.1`. It shares the CLI's execution lease, so while either entrypoint owns an active task or configuration mutation, the other may read history but cannot create a task or change setup. GuardedPy does not deploy or advertise a 公网 WebUI.
+When stdin or stdout is redirected, GuardedPy uses a safe plain-text session. It cannot accept secret input there and stops rather than auto-approving a dangerous action.
 
-## Demo operation
+The interactive command set is:
 
-Run the isolated mechanism demo with:
+```text
+/new /clear /history /exit /plan /review /tests /diff
+/permissions /credentials /memory /model /effort /status /doctor /help
+```
+
+`/plan <request>` and `/review [path]` are read-only workflows. `/tests`, `/diff`, and `/doctor` are deterministic local checks, not LLM requests. A coding task first runs the discovered full test suite: a passing baseline enters feature TDD, assertion failures enter the repair path, and collection/execution errors or a timeout block further automated changes.
+
+## Credentials, model, and effort
+
+In an interactive session, `/credentials` opens a masked input for the DeepSeek API key. The value is written only through the operating-system keyring, is not echoed in the transcript, and can be updated or cleared through the same controlled UI. Do not put a key in project files, command arguments, environment variables, logs, or examples. An unavailable keyring fails safely; there is no plaintext fallback.
+
+The default is `deepseek-v4-flash` with `high` effort. Choose only a supported setting for later tasks:
+
+```text
+/model deepseek-v4-flash
+/model deepseek-v4-pro
+/effort high
+/effort max
+```
+
+An active task retains its creation snapshot. `max` effort can increase latency and provider cost.
+
+## Mechanism demo
+
+The fixed demo is offline and does not inspect the caller project, touch the keyring, or call a provider:
 
 ```bash
 guardedpy demo
+make demo
 ```
 
-Demo mode is a distinct FastAPI factory with a Chinese, independent `只读演示` header and exactly three fixed scenario links: `dangerous_action_denied`, `failure_feedback_corrects`, and `tdd_source_patch_denied`. They are offline mock-LLM mechanism evidence only. The demo exposes neither target-project setup, keyring access, a real provider, arbitrary tasks, approvals, API documentation, nor persistent state.
+Interactive `guardedpy demo` lets you select one fixed request and press Enter. `make demo` runs all three deterministic mock-LLM scenarios without interaction:
 
-## Keyring lifecycle
+1. a privileged command request is denied before command dispatch;
+2. assertion feedback is required before the mock returns a repair patch, then the full suite passes;
+3. a production patch before an observed red test is denied.
 
-The local setup form writes its submitted key directly to the operating-system keyring; the credentials page reports only configured/not-configured status and never displays the key. That page provides hidden update and explicit clear controls. A missing or unavailable keyring is reported as the same generic local error for status, update, and clear operations—there is no plaintext fallback.
+This is mechanism evidence, not a substitute for using a real provider on a target project.
 
-## Safety boundaries
+## Test, build, and local release artifact
 
-The harness treats LLM output and repository text as untrusted. Deterministic policy code enforces repository boundaries, read-before-patch, TDD state transitions, restricted pytest execution, dangerous-action denial, exact one-time approvals, and narrow project-scoped command rules. It is not an OS sandbox: a user-selected repository and its tests remain trusted inputs, and malicious pytest code is out of scope.
-
-## Tests and build
-
-All verification commands are local and use no real LLM or key:
+All repository checks are local and use mock/stub LLMs rather than a real key or network call:
 
 ```bash
-make test
-make demo
-make demo-assets
-make build
-make cli-check
+make test PYTHON=python
+make demo PYTHON=python
+make build PYTHON=python
 ```
 
-`make test` runs the offline pytest suite. `make demo` executes the three literal demo scenarios and exits nonzero if their statuses differ from the expected deterministic result. `make demo-assets` verifies the rendered public demo surface, its fixed route boundary, and its shared responsive CSS contracts. `make build` runs `python -m build --no-isolation` to create a wheel and sdist in `dist/`. `make cli-check` runs all three console entrypoint help paths without composing a provider, keyring, or Uvicorn server.
+`make test` runs the offline test suite. `make demo` asserts the stable safe summaries for the three mechanism scenarios. `make build` creates a wheel and source distribution in `dist/`. The CI definitions use these same three commands; the GitLab job is named `unit-test`. Remote CI, a release upload, GitLab mirroring, collaborator access, and the student's own reflection remain external handoff steps and are not claimed complete here.
 
 ## Directory structure
 
 ```text
 .
-├── src/guardedpy/          # self-owned loop, governance, tools, provider adapter, and WebUI
-│   ├── templates/          # server-rendered local and demo pages
-│   └── static/             # handwritten CSS and polling JavaScript
-├── tests/                  # offline unit, integration, UI, demo, and packaging contracts
-├── docs/                   # course requirements plus Superpowers plans, specs, and reviews
-├── Makefile                # one-command tests, mechanism demo, and package build
-├── pyproject.toml          # package metadata, runtime dependencies, and CLI/server entry points
-├── render.yaml             # public fixed-scenario demo blueprint only
+├── src/guardedpy/          # self-owned loop, policy, tools, feedback, and terminal client
+├── tests/                  # offline unit, integration, terminal, and artifact contracts
+├── scripts/                # non-interactive mechanism demonstration runner
+├── docs/                   # course requirements, design records, and implementation plans
+├── Makefile                # test, demo, and build entry points
+├── pyproject.toml          # package metadata and sole `guardedpy` console entry point
 ├── .github/workflows/ci.yml
 └── .gitlab-ci.yml
 ```
 
-## Repository and PR evidence
+## Safety boundaries and limitations
 
-The configured GitHub origin, verified locally with `git remote get-url origin`, is `git@github.com:WalnuTpz/guardedpy.git`. The user-authorized reconstruction created and merged these real pull requests:
+GuardedPy treats LLM output and repository text as untrusted. Deterministic code enforces project-root boundaries, read-before-patch, baseline/TDD transitions, restricted pytest invocation, explicit approvals, and bounded task execution. The harness is not an operating-system sandbox: a selected repository and its pytest code are trusted inputs, so malicious tests are out of scope.
 
-| Milestone | Pull request |
-| --- | --- |
-| Task 1 | [#1](https://github.com/WalnuTpz/guardedpy/pull/1) |
-| Task 3 | [#2](https://github.com/WalnuTpz/guardedpy/pull/2) |
-| Task 4 | [#3](https://github.com/WalnuTpz/guardedpy/pull/3) |
-| Task 2 | [#4](https://github.com/WalnuTpz/guardedpy/pull/4) |
-| Task 5 | [#5](https://github.com/WalnuTpz/guardedpy/pull/5) |
-| Task 6 | [#6](https://github.com/WalnuTpz/guardedpy/pull/6) |
-| Task 7 | [#7](https://github.com/WalnuTpz/guardedpy/pull/7) |
-| Task 8 | [#8](https://github.com/WalnuTpz/guardedpy/pull/8) |
-| Task 9 | [#9](https://github.com/WalnuTpz/guardedpy/pull/9) |
-| Task 10 | [#10](https://github.com/WalnuTpz/guardedpy/pull/10) |
-| Task 11 | [#11](https://github.com/WalnuTpz/guardedpy/pull/11) |
-| Task 12 | [#12](https://github.com/WalnuTpz/guardedpy/pull/12) |
-| Final remediation | [#13](https://github.com/WalnuTpz/guardedpy/pull/13) |
+The first release supports one active task at a time and Python 3.11+ pytest projects on Linux or WSL. It does not support Windows-native execution leases, multi-project operation, remote workspaces, arbitrary shell access, deployment, browser delivery, or an HTTP interface. Textual needs an interactive TTY; redirected I/O has the deliberately narrower safe text mode.
 
-Each listed PR was created as a draft, validated by its GitHub Actions run, marked ready, and merged with a merge commit. These are present-time reconstruction records; they do not imply that the missing remote PRs existed during the original implementation, especially for the post-rollback Tasks 9–12.
-
-## Render demo wake-up
-
-`render.yaml` is a demo-only deployment blueprint: its start command serves `guardedpy.demo:create_demo_app`, never the keyring-backed local application. The blueprint is not deployed and this README intentionally contains no Render URL. If it is deployed on a free Render instance, the first request after an idle period may wait while the instance wakes; verify the generated service URL in Render before publishing it here.
-
-## CI evidence
-
-The [GitHub Actions workflow](.github/workflows/ci.yml) and [.gitlab-ci.yml](.gitlab-ci.yml) install the same development dependencies and run `make test`, `make demo`, and `make build`; the GitLab job is named exactly `unit-test`. GitHub Actions has recorded successful validation runs during the reconstructed PR sequence; the repository Actions and PR pages are the authoritative current evidence. The GitLab workflow has not yet been executed, so no GitLab pass is claimed.
-
-## Open Design attribution
-
-Task 13 used the Neutral Modern `default` system in the real Open Design project `guardedpy-frontend-rebuild`; it supersedes the earlier Agentic-direction exploration recorded in `AGENT_LOG.md`. The recorded `frontend-design` run is `73bf9eed-b6f4-4edc-bf6d-caf5a54c54ea`; the final `web-design-guidelines` correction run is `db7ff169-63b4-4cbe-8c44-983908284248`. The generated reference bundle and run metadata are preserved in [docs/open-design/frontend-rebuild](docs/open-design/frontend-rebuild/README.md). Runtime templates, CSS, and JavaScript remain handwritten Jinja2/plain-web assets that preserve GuardedPy’s existing backend contracts; Open Design assets are not bundled in the package.
+The project owner reports a teacher clarification permitting a CLI-only release artifact. The general course materials still describe a browser-interface default, so that clarification must be retained as real submission evidence; this repository does not represent the CLI-only form as satisfying that default without it.
 
 ## Third-party software and licenses
 
-GuardedPy imports installed third-party distributions; it does not copy their source into this repository. The table lists every direct Python dependency declared in `pyproject.toml`. License identifiers were checked from the installed distributions' `License-Expression`, license field, or license classifier on 2026-08-05. Versions remain resolver-controlled except where `pyproject.toml` states a constraint, so redistributors should re-check the metadata of the versions they actually ship.
-
-| Role | Direct dependency | License |
-| --- | --- | --- |
-| Runtime | FastAPI | MIT |
-| Runtime | Jinja2 | BSD-3-Clause |
-| Runtime | python-multipart | Apache-2.0 |
-| Runtime | Pydantic | MIT |
-| Runtime | keyring | MIT |
-| Runtime | OpenAI Python SDK | Apache-2.0 |
-| Runtime | pytest | MIT |
-| Runtime | Uvicorn | BSD-3-Clause |
-| Runtime | PyYAML | MIT |
-| Development | HTTPX | BSD-3-Clause |
-| Development/build frontend | build | MIT |
-| Build backend | setuptools | MIT |
-
-Transitive dependencies are installed through these distributions and retain their own package metadata and license files. Open Design is a design reference only; no Open Design code or asset is included in the package.
-
-## Known limitations
-
-- Local mode supports one active task and Python 3.11+ projects that use pytest; it is not a multi-user, remote, or multi-project runner.
-- The CLI/server lease relies on Linux/WSL `fcntl`; this release does not support a Windows-native lease implementation.
-- The public demo is evidence of fixed mechanisms, not a hosted version of the local coding harness.
-- Local mode needs a functioning OS keyring; an unavailable backend does not fall back to plaintext credentials.
-- The Render blueprint is deployment preparation only: it has not been deployed, no public URL is available, and it is not a public WebUI delivery path.
-- A GitHub Release asset has not been uploaded; the only available installation route is a source checkout or locally built wheel.
-- GitHub Actions has been exercised; GitLab CI and the Render deployment have not.
+GuardedPy declares these direct dependencies and imports their installed distributions rather than copying their source: Pydantic (MIT), keyring (MIT), OpenAI Python SDK (Apache-2.0), pytest (MIT), PyYAML (MIT), Textual (MIT), build (MIT), and setuptools (MIT). Distributors should check the resolved package metadata for the versions they actually ship.
