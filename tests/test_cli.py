@@ -399,18 +399,14 @@ def test_task_command_requires_target_for_bugfix_before_runtime_mutation() -> No
     assert "缺陷修复任务必须提供 pytest node。" in output.getvalue()
 
 
-def test_server_main_binds_uvicorn_to_loopback_and_rejects_a_host_option(
-    monkeypatch: pytest.MonkeyPatch,
+def test_help_exposes_only_terminal_options_and_no_retired_surface(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Catches the local-server entrypoint accepting a public listen address."""
-    from guardedpy import web
+    """Catches the sole CLI advertising a server, Web/API surface, or setup command."""
+    from guardedpy.cli import main
 
-    called: dict[str, object] = {}
-    monkeypatch.setattr(web, "create_app", lambda mode, services: "app")
-    monkeypatch.setattr(web, "local_services", lambda: "services")
-    monkeypatch.setattr(web.uvicorn, "run", lambda app, **kwargs: called.update(app=app, **kwargs))
+    assert main(["--help"], runtime_factory=lambda: pytest.fail("help composed runtime")) == 0
 
-    assert web.server_main(()) == 0
-    assert called == {"app": "app", "host": "127.0.0.1"}
-    with pytest.raises(SystemExit, match="2"):
-        web.server_main(("--host", "0.0.0.0"))
+    help_text = capsys.readouterr().out.lower()
+    for retired in ("serve", "server", "webui", "api", "/init"):
+        assert retired not in help_text

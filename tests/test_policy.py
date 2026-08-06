@@ -1210,7 +1210,7 @@ def test_patch_rejects_rename_hidden_beside_a_valid_test_change(
         ),
         (
             RunCommandAction(kind="run_command", summary="elevate", args=("sudo", "id")),
-            "command.privilege",
+            "command.privileged",
         ),
         (
             RunCommandAction(

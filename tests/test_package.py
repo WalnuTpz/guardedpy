@@ -11,7 +11,6 @@ import tomllib
 import venv
 import zipfile
 
-import pytest
 import yaml
 
 
@@ -22,24 +21,24 @@ def _text(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-def test_package_metadata_declares_cli_and_loopback_server_entrypoints() -> None:
-    """Catches a wheel that routes either public command away from its local adapter."""
+def test_package_metadata_declares_exact_cli_only_boundary() -> None:
+    """Catches a wheel exposing a retired surface or depending on a Web stack."""
     project = tomllib.loads(_text("pyproject.toml"))
 
-    assert project["project"]["scripts"] == {
-        "guardedpy": "guardedpy.cli:main",
-        "guardedpy-cli": "guardedpy.cli:main",
-        "guardedpy-server": "guardedpy.cli:server_main",
-    }
-    assert project["tool"]["setuptools"]["package-data"]["guardedpy"] == [
-        "templates/*.html",
-        "static/*.css",
-        "static/*.js",
+    assert project["project"]["scripts"] == {"guardedpy": "guardedpy.cli:main"}
+    assert project["project"]["dependencies"] == [
+        "pydantic>=2,<3",
+        "keyring",
+        "openai",
+        "pytest",
+        "pyyaml",
+        "textual",
     ]
+    assert "package-data" not in project["tool"]["setuptools"]
 
 
-def test_distribution_wheel_includes_pytest_required_by_the_public_demo(tmp_path: Path) -> None:
-    """Catches a standard wheel install whose fixed demo cannot run its pytest fixture."""
+def test_distribution_wheel_includes_pytest_required_by_the_headless_demo(tmp_path: Path) -> None:
+    """Catches a standard wheel install missing the demo fixture's test runner."""
     project_copy = tmp_path / "project"
     shutil.copytree(
         ROOT,
@@ -80,8 +79,8 @@ def test_distribution_wheel_includes_pytest_required_by_the_public_demo(tmp_path
     assert "Requires-Dist: pytest\n" in metadata
 
 
-def test_cli_check_runs_each_installed_console_entrypoint_without_composition(tmp_path: Path) -> None:
-    """Catches cli-check bypassing the three installed local console scripts."""
+def test_cli_check_runs_the_installed_guardedpy_entrypoint(tmp_path: Path) -> None:
+    """Catches cli-check bypassing the sole installed console script."""
     project_copy = tmp_path / "project"
     shutil.copytree(
         ROOT,
@@ -126,29 +125,18 @@ def test_cli_check_runs_each_installed_console_entrypoint_without_composition(tm
     )
     assert install.returncode == 0, install.stderr
 
-    sitecustomize = tmp_path / "instrumentation" / "sitecustomize.py"
-    sitecustomize.parent.mkdir()
-    sitecustomize.write_text(
-        "from guardedpy import web\n"
-        "def fail(*args, **kwargs):\n"
-        "    raise AssertionError('help must not compose local services')\n"
-        "web.local_services = fail\n"
-        "web.uvicorn.run = fail\n",
-        encoding="utf-8",
-    )
     entrypoint_bin = tmp_path / "entrypoints"
     entrypoint_bin.mkdir()
     entrypoint_log = tmp_path / "entrypoints.log"
     entrypoint_log.touch()
-    for name in ("guardedpy", "guardedpy-cli", "guardedpy-server"):
-        wrapper = entrypoint_bin / name
-        wrapper.write_text(
-            "#!/bin/sh\n"
-            f"printf '%s\\n' {name} >> \"$GUARDEDPY_ENTRYPOINT_LOG\"\n"
-            f"exec \"$GUARDEDPY_ENTRYPOINT_BIN/{name}\" \"$@\"\n",
-            encoding="utf-8",
-        )
-        wrapper.chmod(0o755)
+    wrapper = entrypoint_bin / "guardedpy"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' guardedpy >> \"$GUARDEDPY_ENTRYPOINT_LOG\"\n"
+        "exec \"$GUARDEDPY_ENTRYPOINT_BIN/guardedpy\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
 
     dependency_paths = [path for path in sys.path if "site-packages" in path]
     environment_variables = {
@@ -157,7 +145,7 @@ def test_cli_check_runs_each_installed_console_entrypoint_without_composition(tm
         "GUARDEDPY_ENTRYPOINT_LOG": str(entrypoint_log),
         "PATH": f"{entrypoint_bin}{os.pathsep}{os.environ['PATH']}",
         "PYTHON": str(python),
-        "PYTHONPATH": os.pathsep.join([str(sitecustomize.parent), *dependency_paths]),
+        "PYTHONPATH": os.pathsep.join(dependency_paths),
     }
     result = subprocess.run(
         ["make", "cli-check"],
@@ -169,11 +157,7 @@ def test_cli_check_runs_each_installed_console_entrypoint_without_composition(tm
     )
 
     assert result.returncode == 0, result.stderr
-    assert entrypoint_log.read_text(encoding="utf-8").splitlines() == [
-        "guardedpy",
-        "guardedpy-cli",
-        "guardedpy-server",
-    ]
+    assert entrypoint_log.read_text(encoding="utf-8").splitlines() == ["guardedpy"]
 
 
 def test_delivery_automation_runs_the_same_offline_test_demo_and_build_contract() -> None:
@@ -184,16 +168,11 @@ def test_delivery_automation_runs_the_same_offline_test_demo_and_build_contract(
     assert "build:" in makefile
     assert "cli-check:" in makefile
     assert "\tguardedpy --help" in makefile
-    assert "\tguardedpy-cli --help" in makefile
-    assert "\tguardedpy-server --help" in makefile
+    assert "guardedpy-cli" not in makefile
+    assert "guardedpy-server" not in makefile
+    assert "demo-assets" not in makefile
     assert "pytest tests -q" in makefile
-    for scenario in (
-        "dangerous_action_denied",
-        "failure_feedback_corrects",
-        "tdd_source_patch_denied",
-    ):
-        assert scenario in makefile
-    assert "assert actual == expected" in makefile
+    assert "PYTHONPATH=src $(PYTHON) scripts/run_mechanism_demo.py" in makefile
     assert "$(PYTHON) -m build" in makefile
 
     github = yaml.safe_load(_text(".github/workflows/ci.yml"))
@@ -204,18 +183,6 @@ def test_delivery_automation_runs_the_same_offline_test_demo_and_build_contract(
     gitlab = yaml.safe_load(_text(".gitlab-ci.yml"))
     assert gitlab["unit-test"]["script"][0] == 'pip install -e ".[dev]"'
     assert gitlab["unit-test"]["script"][-3:] == ["make test", "make demo", "make build"]
-
-
-def test_render_blueprint_starts_the_isolated_demo_not_local_controls() -> None:
-    """Catches a public deployment missing demo runtime or composing local controls."""
-    render = yaml.safe_load(_text("render.yaml"))
-    service = render["services"][0]
-
-    assert service["name"] == "guardedpy-demo"
-    assert service["buildCommand"] == 'pip install ".[dev]"'
-    assert "guardedpy.demo:create_demo_app" in service["startCommand"]
-    assert "guardedpy.web:serve" not in service["startCommand"]
-    assert "guardedpy serve" not in service["startCommand"]
 
 
 def test_readme_documents_real_local_demo_security_delivery_and_course_context() -> None:
@@ -250,33 +217,3 @@ def test_readme_documents_real_local_demo_security_delivery_and_course_context()
     assert "present-time reconstruction records" in readme
     assert "src/guardedpy/" in readme
     assert "tests/" in readme
-
-
-def test_readme_documents_local_cli_server_and_pending_release_assets() -> None:
-    """Catches an operator guide that promotes a public UI or invents a release asset."""
-    readme = _text("README.md")
-
-    assert "guardedpy-cli" in readme
-    assert "guardedpy-server" in readme
-    assert "公网 WebUI" in readme
-    assert "Release asset URL is pending" in readme
-    assert "releases/download" not in readme
-
-
-@pytest.mark.parametrize("mode", ["serve", "demo"])
-def test_console_help_exits_before_composing_or_starting_a_server(
-    mode: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Catches a console help request accidentally starting local or demo Uvicorn."""
-    from guardedpy import web
-
-    monkeypatch.setattr(web, "local_services", lambda: pytest.fail("help must not compose local services"))
-    monkeypatch.setattr(web, "create_demo_app", lambda: pytest.fail("help must not compose demo services"))
-    monkeypatch.setattr(web.uvicorn, "run", lambda *args, **kwargs: pytest.fail("help must not start Uvicorn"))
-    monkeypatch.setattr(sys, "argv", ["guardedpy", mode, "--help"])
-
-    with pytest.raises(SystemExit) as exit_code:
-        web.serve()
-
-    assert exit_code.value.code == 0
-    assert "{serve,demo}" in capsys.readouterr().out

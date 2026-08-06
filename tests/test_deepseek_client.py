@@ -15,6 +15,7 @@ from guardedpy.context import LlmContext
 from guardedpy.domain import TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore, StopReason
 from guardedpy.llm import DeepSeekClient, TemporaryProviderFailure
+from guardedpy.memory import MemoryStore
 from guardedpy.orchestrator import TaskOrchestrator
 
 
@@ -165,7 +166,7 @@ def test_deepseek_client_propagates_actual_openai_permanent_failure_unchanged() 
 
 def test_openai_transport_disables_sdk_retries_and_uses_config_timeout() -> None:
     """Catches the OpenAI SDK silently owning retries or ignoring the project timeout."""
-    from guardedpy import web
+    from guardedpy import cli
 
     captured: dict[str, object] = {}
     sentinel = object()
@@ -175,7 +176,7 @@ def test_openai_transport_disables_sdk_retries_and_uses_config_timeout() -> None
         return sentinel
 
     try:
-        created = web._deepseek_transport(
+        created = cli._deepseek_transport(
             "secret", timeout_seconds=17, openai_factory=openai_factory
         )
     except TypeError as error:
@@ -194,7 +195,7 @@ def test_local_services_composes_the_task_config_timeout_into_openai_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Catches local composition using a default timeout instead of the task snapshot."""
-    from guardedpy import web
+    from guardedpy import cli
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     captured: dict[str, object] = {}
@@ -218,16 +219,16 @@ def test_local_services_composes_the_task_config_timeout_into_openai_transport(
         captured.update(kwargs)
         return transport
 
-    monkeypatch.setattr(web, "_system_keyring", lambda: Keyring())
-    monkeypatch.setattr(web, "OpenAI", openai_factory)
-    services = web.local_services()
+    monkeypatch.setattr(cli, "_system_keyring", lambda: Keyring())
+    monkeypatch.setattr(cli, "OpenAI", openai_factory)
+    services = cli.local_services()
     config = HarnessConfig(
         source_dirs=(Path("src"),),
         test_dirs=(Path("tests"),),
         pytest_command=("pytest",),
         timeout_seconds=19,
     )
-    orchestrator = services.orchestrator_factory(tmp_path, config, web.MemoryStore(tmp_path))
+    orchestrator = services.orchestrator_factory(tmp_path, config, MemoryStore(tmp_path))
 
     orchestrator.run(
         TaskState(

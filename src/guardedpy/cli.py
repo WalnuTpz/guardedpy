@@ -7,14 +7,20 @@ from collections.abc import Callable, Sequence
 from getpass import getpass
 from pathlib import Path
 import shlex
+import subprocess
 import sys
-from typing import TextIO
+from typing import Any, TextIO
 from uuid import UUID
 
+import keyring
+from openai import OpenAI
+
 from guardedpy.config import HarnessConfig
+from guardedpy.credentials import CredentialService
 from guardedpy.domain import TaskMode, TaskState, TaskStatus, is_approval_decision
-from guardedpy.runtime import LocalRuntime
-from guardedpy.web import local_services, server_main as _server_main
+from guardedpy.llm import DeepSeekClient
+from guardedpy.orchestrator import TaskOrchestrator
+from guardedpy.runtime import LocalRuntime, RuntimeServices
 
 
 _TERMINAL_STATUSES = {
@@ -39,8 +45,51 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 def local_runtime() -> LocalRuntime:
-    """Compose the same local runtime services used by the loopback server."""
+    """Compose the provider-backed services used only after CLI parsing."""
     return LocalRuntime(local_services())
+
+
+def local_services() -> RuntimeServices:
+    """Compose injectable CLI runtime services without reading a credential."""
+    credentials = CredentialService(_system_keyring())
+
+    def orchestrator_factory(
+        project_root: Path, config: HarnessConfig, memory_store: Any
+    ) -> TaskOrchestrator:
+        def transport_factory(api_key: str) -> Any:
+            return _deepseek_transport(
+                api_key,
+                timeout_seconds=config.timeout_seconds,
+            )
+
+        llm = DeepSeekClient(credentials.get_key, config.model, transport_factory)
+        return TaskOrchestrator(
+            project_root,
+            llm,
+            memory_store=memory_store,
+            current_branch_provider=lambda: _current_git_branch(project_root),
+        )
+
+    return RuntimeServices(credentials=credentials, orchestrator_factory=orchestrator_factory)
+
+
+def _system_keyring() -> Any:
+    return keyring.get_keyring()
+
+
+def _deepseek_transport(
+    api_key: str,
+    *,
+    timeout_seconds: int,
+    openai_factory: Callable[..., Any] | None = None,
+) -> Any:
+    factory = OpenAI if openai_factory is None else openai_factory
+    return factory(
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        timeout=timeout_seconds,
+        max_retries=0,
+    )
 
 
 def main(
@@ -50,7 +99,7 @@ def main(
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
 ) -> int:
-    """Dispatch one local REPL, one prompt, or compatible server/demo commands."""
+    """Dispatch one local REPL or one prompt."""
     parser = _parser()
     try:
         arguments = parser.parse_args(argv)
@@ -59,12 +108,6 @@ def main(
     except SystemExit as error:
         return int(error.code)
 
-    if arguments.command == "serve":
-        return _server_main(())
-    if arguments.command == "demo":
-        from guardedpy.web import demo_main
-
-        return demo_main(())
     if arguments.mode == TaskMode.BUGFIX.value and not (
         arguments.target and arguments.target.strip()
     ):
@@ -83,11 +126,6 @@ def main(
             source.readline,
         )
     return run_repl(runtime, source, output, source.isatty)
-
-
-def server_main(argv: Sequence[str] | None = None) -> int:
-    """Expose the loopback-only server entrypoint for package metadata."""
-    return _server_main(argv)
 
 
 def run_repl(
@@ -143,8 +181,23 @@ def _parser() -> _ArgumentParser:
     parser.add_argument("--prompt")
     parser.add_argument("--mode", choices=tuple(mode.value for mode in TaskMode), default="feature")
     parser.add_argument("--target")
-    parser.add_argument("command", nargs="?", choices=("serve", "demo"))
     return parser
+
+
+def _current_git_branch(project_root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project_root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    branch = completed.stdout.strip()
+    return branch if completed.returncode == 0 and branch else None
 
 
 def _initialize(

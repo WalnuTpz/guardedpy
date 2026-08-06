@@ -546,7 +546,7 @@ class PolicyEngine:
     ) -> PolicyDecision:
         command = action.args[0] if action.args else ""
         if command in {"sudo", "doas", "su"}:
-            return self._deny(task, action, "command.privilege", "privilege escalation is forbidden")
+            return self._deny(task, action, "command.privileged", "privilege escalation is forbidden")
         if command == "keyring" or any(".env" in argument for argument in action.args):
             return self._deny(task, action, "command.credentials", "credential access is forbidden")
         if any(self._argument_escapes_root(argument) for argument in action.args):

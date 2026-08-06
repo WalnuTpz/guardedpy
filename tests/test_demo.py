@@ -1,140 +1,111 @@
-"""Public demo coverage for fixed, offline governed-agent scenarios."""
+"""Headless mechanism evidence from the self-owned Harness loop."""
 
 from __future__ import annotations
 
-import asyncio
+from dataclasses import fields
 import os
 from pathlib import Path
-from typing import Any
 
-import httpx
 import pytest
-from fastapi.routing import APIRoute
 
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskStatus
-
-
-async def _request(app: Any, method: str, path: str) -> httpx.Response:
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        return await client.request(method, path)
+from guardedpy.context import LlmContext
 
 
-def test_demo_lists_exactly_the_three_literal_fixed_scenarios() -> None:
-    """Catches a public demo accepting arbitrary or reordered scenario definitions."""
-    from guardedpy.demo import SCENARIOS
+def test_scenario_result_has_the_exact_frozen_evidence_contract() -> None:
+    """Catches a result that hides raw events or omits canonical mechanism facts."""
+    from guardedpy.mechanism_demo import ScenarioResult
 
-    assert SCENARIOS == (
-        "dangerous_action_denied",
-        "failure_feedback_corrects",
-        "tdd_source_patch_denied",
+    assert ScenarioResult.__dataclass_params__.frozen is True
+    assert tuple(field.name for field in fields(ScenarioResult)) == (
+        "name",
+        "status",
+        "rule_id",
+        "feedback_kind",
+        "dispatched_command",
+        "event_kinds",
+        "workspace_value",
     )
 
 
-def test_demo_routes_are_read_only_and_exclude_local_control_capabilities() -> None:
-    """Catches public demo composition exposing setup, credentials, tasks, or approvals."""
-    from guardedpy.demo import create_demo_app
-
-    app = create_demo_app()
-
-    assert asyncio.run(_request(app, "GET", "/")).status_code == 200
-    scenarios = asyncio.run(_request(app, "GET", "/demo/scenarios"))
-    assert scenarios.status_code == 200
-    assert scenarios.json() == [
-        "dangerous_action_denied",
-        "failure_feedback_corrects",
-        "tdd_source_patch_denied",
-    ]
-    assert asyncio.run(
-        _request(app, "GET", "/demo/scenarios/dangerous_action_denied")
-    ).status_code == 200
-    for path in (
-        "/setup",
-        "/settings/credentials",
-        "/tasks/new",
-        "/tasks/any/approval",
-        "/memories",
-        "/openapi.json",
-        "/docs",
-        "/docs/oauth2-redirect",
-        "/redoc",
-        "/demo/scenarios/not-a-scenario",
-    ):
-        assert asyncio.run(_request(app, "GET", path)).status_code == 404
-    assert asyncio.run(_request(app, "POST", "/demo/scenarios/dangerous_action_denied")).status_code == 405
-
-    missing = asyncio.run(_request(app, "GET", "/demo/scenarios/not-a-scenario"))
-    assert missing.json() == {"detail": "未找到演示场景。"}
-
-
-def test_demo_route_inventory_allows_only_the_fixed_get_surface() -> None:
-    """Catches any newly registered demo control route or non-GET method."""
-    from guardedpy.demo import create_demo_app
-
-    app = create_demo_app()
-
-    assert {
-        route.path: route.methods
-        for route in app.routes
-        if isinstance(route, APIRoute)
-    } == {
-        "/": {"GET"},
-        "/demo/scenarios": {"GET"},
-        "/demo/scenarios/{name}": {"GET"},
-    }
-
-
-def test_demo_runs_real_governance_feedback_and_workspace_fixtures_without_command_dispatch(
+def test_headless_demo_runs_real_policy_feedback_workspace_and_event_mechanisms(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catches scripted demos that skip policy, feedback, workspace, or command safety checks."""
-    from guardedpy.demo import run_scenario
+    """Catches fixed results that skip policy, feedback, event, or workspace execution."""
+    from guardedpy.mechanism_demo import run_all_scenarios
 
     original_state_home = tmp_path / "preexisting-state"
     monkeypatch.setenv("XDG_STATE_HOME", str(original_state_home))
 
-    dangerous = run_scenario("dangerous_action_denied")
-    corrected = run_scenario("failure_feedback_corrects")
-    tdd_denied = run_scenario("tdd_source_patch_denied")
+    dangerous, corrected, tdd_denied = run_all_scenarios()
 
-    assert dangerous.status is TaskStatus.BLOCKED
-    assert dangerous.command_dispatches == ()
-    assert any(
-        event.policy_verdict is PolicyVerdict.DENY and event.action_summary == "run approved command"
-        for event in dangerous.events
+    assert (
+        dangerous.name,
+        dangerous.status,
+        dangerous.rule_id,
+        dangerous.dispatched_command,
+    ) == ("dangerous_action_denied", "blocked", "command.privileged", False)
+    assert "policy_denial" in dangerous.event_kinds
+
+    assert (
+        corrected.name,
+        corrected.status,
+        corrected.feedback_kind,
+        corrected.workspace_value,
+        corrected.dispatched_command,
+    ) == (
+        "failure_feedback_corrects",
+        "completed",
+        "assertion_failure",
+        "fixed",
+        False,
     )
-    assert corrected.status is TaskStatus.COMPLETED
-    assert corrected.source_value == "VALUE = 'fixed'\n"
-    assert any(event.feedback_kind is FeedbackKind.ASSERTION_FAILURE for event in corrected.events)
-    assert tdd_denied.status is TaskStatus.BLOCKED
-    assert tdd_denied.source_value == "VALUE = 'broken'\n"
-    assert any(
-        event.policy_verdict is PolicyVerdict.DENY and event.action_summary == "apply source patch"
-        for event in tdd_denied.events
+    assert corrected.event_kinds.index("assertion_feedback") < corrected.event_kinds.index(
+        "source_patch"
     )
+    assert corrected.event_kinds.index("source_patch") < corrected.event_kinds.index(
+        "full_suite_pass"
+    )
+
+    assert (
+        tdd_denied.name,
+        tdd_denied.status,
+        tdd_denied.rule_id,
+        tdd_denied.dispatched_command,
+        tdd_denied.workspace_value,
+    ) == ("tdd_source_patch_denied", "blocked", "tdd.red_required", False, "broken")
+    assert "policy_denial" in tdd_denied.event_kinds
     assert original_state_home.exists() is False
     assert Path(os.environ["XDG_STATE_HOME"]) == original_state_home
 
 
-def test_demo_cli_composes_no_local_services(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Catches the public demo CLI starting keyring or provider-backed local services."""
-    from guardedpy import web
+def test_feedback_aware_demo_llm_refuses_to_patch_without_trusted_assertion_feedback() -> None:
+    """Catches the corrective mock returning its patch on scripted timing alone."""
+    from guardedpy.mechanism_demo import FeedbackAwareDemoLLM
 
-    application = object()
-    received: dict[str, object] = {}
-    monkeypatch.setattr(web, "create_demo_app", lambda: application, raising=False)
-    monkeypatch.setattr(
-        web,
-        "local_services",
-        lambda: pytest.fail("demo CLI must not compose local services"),
-    )
-    monkeypatch.setattr(
-        web.uvicorn,
-        "run",
-        lambda app, *, host: received.update({"app": app, "host": host}),
-    )
-    monkeypatch.setattr("sys.argv", ["guardedpy", "demo"])
+    llm = FeedbackAwareDemoLLM()
+    context = LlmContext.minimal()
+    llm.complete(context)
+    llm.complete(context)
 
-    web.serve()
+    with pytest.raises(AssertionError, match="trusted assertion feedback"):
+        llm.complete(context)
 
-    assert received == {"app": application, "host": "127.0.0.1"}
+
+def test_demo_isolates_pytest_controls_and_restores_the_caller_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches caller pytest options or plugins changing the fixed mechanism evidence."""
+    from guardedpy.mechanism_demo import _isolated_demo_root
+
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--collect-only")
+    monkeypatch.setenv("PYTEST_PLUGINS", "untrusted_demo_plugin")
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "caller-value")
+
+    with _isolated_demo_root():
+        assert "PYTEST_ADDOPTS" not in os.environ
+        assert "PYTEST_PLUGINS" not in os.environ
+        assert os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+
+    assert os.environ["PYTEST_ADDOPTS"] == "--collect-only"
+    assert os.environ["PYTEST_PLUGINS"] == "untrusted_demo_plugin"
+    assert os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "caller-value"
