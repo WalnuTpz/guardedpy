@@ -11,6 +11,7 @@ import pytest
 from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
+from guardedpy.discovery import ProjectProfile
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TaskStatus
 from guardedpy.events import StopReason, StoredRunEvent
 
@@ -35,9 +36,16 @@ class FakeRuntime:
         self.created: list[TaskState] = []
         self.decisions: list[tuple[UUID, str, str]] = []
         self.cancelled: list[UUID] = []
+        self.setups: list[ProjectProfile] = []
         self._wait_for_approval = wait_for_approval
         self._interrupt = interrupt
         self._consume_reject = consume_reject
+
+    def setup(self, profile: ProjectProfile, api_key: str | None) -> None:
+        assert api_key is None
+        self.project_root = profile.root
+        self.config = HarnessConfig(profile=profile)
+        self.setups.append(profile)
 
     def credential_status(self) -> CredentialStatus:
         return CredentialStatus(configured=self.configured)
@@ -137,6 +145,47 @@ def test_one_shot_bugfix_requires_an_explicit_pytest_node() -> None:
     from guardedpy.cli import main
 
     assert main(["--prompt", "repair", "--mode", "bugfix"], runtime_factory=FakeRuntime) == 2
+
+
+def test_main_discovers_and_binds_the_current_project_before_creating_a_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the real CLI task path using absent or stale persisted project state."""
+    from guardedpy.cli import main
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests").mkdir()
+    runtime = FakeRuntime()
+    monkeypatch.chdir(tmp_path)
+
+    code = main(["--prompt", "inspect"], runtime_factory=lambda: runtime)
+
+    assert code == 0
+    assert [profile.root for profile in runtime.setups] == [tmp_path.resolve()]
+    assert runtime.created[0].config.profile == runtime.setups[0]
+
+
+def test_main_fails_safely_without_composing_a_runtime_for_unsupported_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches discovery failure falling through to a stale project or creating state."""
+    from guardedpy.cli import main
+
+    output = StringIO()
+    composed: list[FakeRuntime] = []
+    monkeypatch.chdir(tmp_path)
+
+    code = main(
+        ["--prompt", "inspect"],
+        runtime_factory=lambda: composed.append(FakeRuntime()) or composed[-1],
+        stdout=output,
+    )
+
+    assert code == 1
+    assert composed == []
+    assert output.getvalue() == "无法识别 Python pytest 项目。\n"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_one_shot_bugfix_rejects_a_whitespace_only_pytest_node_before_composition() -> None:

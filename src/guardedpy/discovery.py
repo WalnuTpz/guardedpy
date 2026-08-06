@@ -87,9 +87,15 @@ def discover_project(root: Path) -> ProjectProfile:
 def _configured_testpaths(root: Path) -> tuple[str, ...] | None:
     for filename in ("pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg"):
         path = root / filename
+        if path.is_symlink() and not path.exists():
+            raise ProjectDiscoveryError("invalid_pytest_config")
         if not path.exists():
             continue
-        if not path.is_file() or not _contained_path(root, path):
+        try:
+            valid_file = path.is_file() and _contained_path(root, path)
+        except (OSError, RuntimeError):
+            raise ProjectDiscoveryError("invalid_pytest_config") from None
+        if not valid_file:
             raise ProjectDiscoveryError("invalid_pytest_config")
         if filename == "pyproject.toml":
             return _toml_testpaths(path)
@@ -150,8 +156,13 @@ def _validated_testpaths(root: Path, values: tuple[str, ...]) -> tuple[PurePosix
         if relative.is_absolute() or ".." in relative.parts:
             raise ProjectDiscoveryError("invalid_pytest_config")
         candidate = root / relative
-        resolved = candidate.resolve(strict=False)
+        try:
+            resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError):
+            raise ProjectDiscoveryError("invalid_pytest_config") from None
         if not resolved.is_relative_to(root):
+            raise ProjectDiscoveryError("invalid_pytest_config")
+        if candidate.is_symlink() and not candidate.exists():
             raise ProjectDiscoveryError("invalid_pytest_config")
         if not candidate.exists():
             raise ProjectDiscoveryError("configured_testpath_missing")

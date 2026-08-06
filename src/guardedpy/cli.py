@@ -16,6 +16,7 @@ from openai import OpenAI
 
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialService
+from guardedpy.discovery import ProjectDiscoveryError, discover_project
 from guardedpy.domain import TaskMode, TaskState, TaskStatus, is_approval_decision
 from guardedpy.llm import DeepSeekClient
 from guardedpy.orchestrator import TaskOrchestrator
@@ -112,9 +113,15 @@ def main(
     ):
         return 2
 
-    runtime = runtime_factory()
     output = stdout or sys.stdout
     source = stdin or sys.stdin
+    try:
+        profile = discover_project(Path.cwd())
+    except ProjectDiscoveryError:
+        output.write("无法识别 Python pytest 项目。\n")
+        return 1
+    runtime = runtime_factory()
+    runtime.setup(profile, api_key=None)
     if arguments.prompt is not None:
         return _run_task(
             runtime,

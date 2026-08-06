@@ -185,11 +185,50 @@ def test_discover_project_rejects_configured_symlink_escaping_root(tmp_path: Pat
     assert caught.value.code == "invalid_pytest_config"
 
 
+def test_discover_project_maps_cyclic_configured_testpath_to_bounded_error(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "first").symlink_to(tmp_path / "second", target_is_directory=True)
+    (tmp_path / "second").symlink_to(tmp_path / "first", target_is_directory=True)
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = ['first']\n"
+    )
+    _write_source(tmp_path)
+
+    with pytest.raises(ProjectDiscoveryError) as caught:
+        discover_project(tmp_path)
+
+    assert caught.value.code == "invalid_pytest_config"
+
+
 def test_discover_project_does_not_read_a_config_symlink_outside_root(tmp_path: Path) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}-outside.toml"
     outside.write_text("[tool.pytest.ini_options]\ntestpaths = ['checks']\n")
     (tmp_path / "pyproject.toml").symlink_to(outside)
     (tmp_path / "checks").mkdir()
+    _write_source(tmp_path)
+
+    with pytest.raises(ProjectDiscoveryError) as caught:
+        discover_project(tmp_path)
+
+    assert caught.value.code == "invalid_pytest_config"
+
+
+def test_discover_project_rejects_a_broken_config_file_symlink(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").symlink_to(tmp_path / "missing.toml")
+    (tmp_path / "tests").mkdir()
+    _write_source(tmp_path)
+
+    with pytest.raises(ProjectDiscoveryError) as caught:
+        discover_project(tmp_path)
+
+    assert caught.value.code == "invalid_pytest_config"
+
+
+def test_discover_project_rejects_a_cyclic_config_file_symlink(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").symlink_to(tmp_path / "cycle.toml")
+    (tmp_path / "cycle.toml").symlink_to(tmp_path / "pyproject.toml")
+    (tmp_path / "tests").mkdir()
     _write_source(tmp_path)
 
     with pytest.raises(ProjectDiscoveryError) as caught:
