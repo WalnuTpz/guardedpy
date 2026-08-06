@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -32,6 +33,7 @@ def test_headless_mechanism_demo_has_no_web_or_provider_dependency() -> None:
         capture_output=True,
         text=True,
         check=False,
+        env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
     )
 
     assert completed.returncode == 0, completed.stderr
