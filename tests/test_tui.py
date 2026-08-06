@@ -13,6 +13,7 @@ from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.events import StoredRunEvent
+from guardedpy.runtime import LocalRuntime, RuntimeServices
 
 
 class _Runtime:
@@ -51,6 +52,19 @@ class _Runtime:
         task.status = TaskStatus.CANCELLED
         self.cancelled.append(task_id)
         return task
+
+
+class _Credentials:
+    """A credential port for tests that exercise the real LocalRuntime."""
+
+    def status(self) -> CredentialStatus:
+        return CredentialStatus(configured=False)
+
+    def set_key(self, key: str) -> None:
+        del key
+
+    def clear_key(self) -> None:
+        return None
 
 
 def _profile(tmp_path: Path) -> ProjectProfile:
@@ -141,47 +155,112 @@ def test_tui_transcript_records_the_submitted_user_request_before_lifecycle(tmp_
     asyncio.run(check())
 
 
-def test_tui_runs_blocking_runtime_in_worker_and_cancels_before_it_releases(tmp_path: Path) -> None:
-    """Catches a synchronous run freezing the event loop until a blocking runtime returns."""
+def test_tui_cancels_a_real_blocking_local_runtime_without_freezing_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches Ctrl+C waiting on LocalRuntime's lifecycle lock while a run is blocked."""
     from guardedpy.tui import GuardedPyApp
 
-    class BlockingRuntime(_Runtime):
-        def __init__(self, profile: ProjectProfile) -> None:
-            super().__init__(profile)
+    class BlockingOrchestrator:
+        def __init__(self) -> None:
+            self.task: TaskState | None = None
             self.started = Event()
             self.release = Event()
             self.cancel_before_release = False
 
-        def run(self, task_id: object) -> TaskState:
+        def submit(self, task: TaskState) -> TaskState:
+            self.task = task
+            return task
+
+        def run(self, task: TaskState) -> TaskState:
+            task.status = TaskStatus.RUNNING
             self.started.set()
-            self.release.wait(timeout=0.3)
-            task = next(task for task in self.created if task.id == task_id)
+            self.release.wait()
             return task
 
         def cancel(self, task_id: object) -> TaskState:
+            assert self.task is not None
+            assert task_id == self.task.id
             self.cancel_before_release = not self.release.is_set()
+            self.task.status = TaskStatus.CANCELLED
             self.release.set()
-            return super().cancel(task_id)
+            return self.task
+
+        def resolve_approval(self, task_id: object, action_hash: str, *, decision: object) -> bool:
+            del task_id, action_hash, decision
+            return False
 
     profile = _profile(tmp_path)
-    runtime = BlockingRuntime(profile)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    orchestrator = BlockingOrchestrator()
+    runtime = LocalRuntime(
+        RuntimeServices(
+            credentials=_Credentials(),
+            orchestrator_factory=lambda root, config, memory: orchestrator,
+        )
+    )
+    runtime.setup(profile, api_key=None)
     app = GuardedPyApp(runtime, profile)
 
     async def check() -> None:
-        timer = Timer(0.3, runtime.release.set)
+        timer = Timer(0.3, orchestrator.release.set)
         timer.start()
         try:
             async with app.run_test() as pilot:
                 app.submit("long repair")
                 await pilot.pause()
-                assert runtime.started.is_set()
-                assert runtime.release.is_set() is False
+                assert orchestrator.started.is_set()
+                assert orchestrator.release.is_set() is False
                 await pilot.press("ctrl+c")
-                assert runtime.cancel_before_release is True
-                assert runtime.cancelled == [runtime.created[0].id]
+                assert orchestrator.cancel_before_release is True
+                app.submit("/status")
+                await pilot.pause()
+                assert "项目：" in str(app.query_one("#status").render())
         finally:
             timer.cancel()
-            runtime.release.set()
+            orchestrator.release.set()
+
+    asyncio.run(check())
+
+
+def test_tui_unmount_cancels_its_active_worker_and_discards_late_completion(
+    tmp_path: Path,
+) -> None:
+    """Catches session teardown leaving a daemon worker or repainting from its late result."""
+    from guardedpy.tui import GuardedPyApp
+
+    class LateCompletionRuntime(_Runtime):
+        def __init__(self, profile: ProjectProfile) -> None:
+            super().__init__(profile)
+            self.started = Event()
+            self.release = Event()
+
+        def run(self, task_id: object) -> TaskState:
+            task = next(task for task in self.created if task.id == task_id)
+            self.started.set()
+            self.release.wait(timeout=1)
+            return task.model_copy(update={"status": TaskStatus.WAITING_APPROVAL})
+
+        def cancel(self, task_id: object) -> TaskState:
+            self.release.set()
+            return super().cancel(task_id)
+
+    profile = _profile(tmp_path)
+    runtime = LateCompletionRuntime(profile)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("long repair")
+            await pilot.pause()
+            assert runtime.started.is_set()
+
+            app.on_unmount()
+            await pilot.pause()
+
+            assert runtime.cancelled == [runtime.created[0].id]
+            assert app._active_task is None
+            assert app._run_threads == {}
 
     asyncio.run(check())
 

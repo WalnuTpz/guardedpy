@@ -129,6 +129,7 @@ class GuardedPyApp(App[None]):
         self._pending_approval: tuple[TaskState, str] | None = None
         self._active_task: TaskState | None = None
         self._cancelled_task_ids: set[UUID] = set()
+        self._run_threads: dict[UUID, Thread] = {}
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
@@ -144,6 +145,10 @@ class GuardedPyApp(App[None]):
     def on_mount(self) -> None:
         if self.initial_task:
             self.call_after_refresh(self.submit, self.initial_task)
+
+    def on_unmount(self) -> None:
+        """Request cancellation before the app relinquishes a daemon worker's runtime lease."""
+        self._cancel_active_task(render=False)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id == "composer":
@@ -162,8 +167,7 @@ class GuardedPyApp(App[None]):
         if event.key == "ctrl+c" and self._active_task is not None:
             event.prevent_default()
             event.stop()
-            self._cancelled_task_ids.add(self._active_task.id)
-            self._render_task(self.runtime.cancel(self._active_task.id))
+            self._cancel_active_task()
 
     def submit(self, text: str) -> None:
         request = text.strip()
@@ -272,9 +276,7 @@ class GuardedPyApp(App[None]):
     def _exit_resolved(self, confirmed: bool) -> None:
         if not confirmed:
             return
-        if self._active_task is not None:
-            self._cancelled_task_ids.add(self._active_task.id)
-            self._render_task(self.runtime.cancel(self._active_task.id))
+        self._cancel_active_task()
         self.exit()
 
     def _start_task(self, description: str, intent: TaskIntent, review_path: str | None = None) -> None:
@@ -286,7 +288,9 @@ class GuardedPyApp(App[None]):
             task = self.runtime.create_task(description, intent, review_path=review_path)
             self._active_task = task
             self.query_one("#status", Static).update(self._status_text(task))
-            Thread(target=self._run_task_in_thread, args=(task,), daemon=True).start()
+            worker = Thread(target=self._run_task_in_thread, args=(task,), daemon=True)
+            self._run_threads[task.id] = worker
+            worker.start()
         except Exception:
             self._write("无法启动任务。")
 
@@ -300,20 +304,38 @@ class GuardedPyApp(App[None]):
         self.post_message(TaskRunFinished(task.id, result))
 
     def on_task_run_finished(self, event: TaskRunFinished) -> None:
+        self._run_threads.pop(event.task_id, None)
         if event.result is None:
             self._task_run_failed(event.task_id)
             return
         self._task_run_finished(event.result)
 
     def _task_run_failed(self, task_id: UUID) -> None:
-        if task_id not in self._cancelled_task_ids:
-            self._write("无法启动任务。")
+        if task_id in self._cancelled_task_ids:
+            self._cancelled_task_ids.remove(task_id)
+            return
+        self._write("无法启动任务。")
 
     def _task_run_finished(self, task: TaskState) -> None:
         if task.id in self._cancelled_task_ids:
             self._cancelled_task_ids.remove(task.id)
             return
         self._render_task(task)
+
+    def _cancel_active_task(self, *, render: bool = True) -> None:
+        task = self._active_task
+        if task is None:
+            return
+        self._cancelled_task_ids.add(task.id)
+        try:
+            cancelled = self.runtime.cancel(task.id)
+        except Exception:
+            if render:
+                self._write("取消任务失败。")
+            return
+        self._active_task = None
+        if render:
+            self._render_task(cancelled)
 
     def _render_task(self, task: TaskState) -> None:
         self._active_task = task if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL} else None

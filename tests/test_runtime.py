@@ -88,6 +88,76 @@ def test_execution_lease_releases_the_nonblocking_file_lock(tmp_path: Path) -> N
     second.release()
 
 
+def test_cancel_reaches_a_blocking_local_runtime_run_before_the_run_is_released(
+    tmp_path: Path,
+) -> None:
+    """Catches LocalRuntime holding its lifecycle lock across a blocking orchestrator run."""
+
+    class BlockingOrchestrator:
+        def __init__(self) -> None:
+            self.task: TaskState | None = None
+            self.started = Event()
+            self.release = Event()
+            self.cancel_before_release = False
+
+        def submit(self, task: TaskState) -> TaskState:
+            self.task = task
+            return task
+
+        def run(self, task: TaskState) -> TaskState:
+            task.status = TaskStatus.RUNNING
+            self.started.set()
+            self.release.wait()
+            return task
+
+        def cancel(self, task_id: object) -> TaskState:
+            assert self.task is not None
+            assert task_id == self.task.id
+            self.cancel_before_release = not self.release.is_set()
+            self.task.status = TaskStatus.CANCELLED
+            self.release.set()
+            return self.task
+
+        def resolve_approval(self, task_id: object, action_hash: str, *, decision: object) -> bool:
+            del task_id, action_hash, decision
+            return False
+
+    orchestrator = BlockingOrchestrator()
+    runtime = LocalRuntime(
+        RuntimeServices(
+            credentials=FakeCredentials(),
+            orchestrator_factory=lambda root, config, memory: orchestrator,
+        )
+    )
+    runtime.setup(_profile(tmp_path), api_key=None)
+    task = runtime.create_task("long-running repair", TaskIntent.CODING)
+    run_thread = Thread(target=runtime.run, args=(task.id,))
+    cancel_returned = Event()
+    cancelled: dict[str, TaskState] = {}
+
+    def cancel_task() -> None:
+        cancelled["task"] = runtime.cancel(task.id)
+        cancel_returned.set()
+
+    cancel_thread = Thread(target=cancel_task)
+    try:
+        run_thread.start()
+        assert orchestrator.started.wait(timeout=1)
+        cancel_thread.start()
+
+        assert cancel_returned.wait(timeout=0.2)
+        assert orchestrator.cancel_before_release is True
+        assert cancelled["task"].status is TaskStatus.CANCELLED
+    finally:
+        orchestrator.release.set()
+        run_thread.join(timeout=1)
+        cancel_thread.join(timeout=1)
+
+    assert run_thread.is_alive() is False
+    assert cancel_thread.is_alive() is False
+    assert runtime.task(task.id).status is TaskStatus.CANCELLED
+
+
 def test_task_snapshot_retains_model_and_effort_after_default_changes(tmp_path: Path) -> None:
     runtime = _replacing_runtime(FakeCredentials())
     runtime.setup(_profile(tmp_path), api_key=None)
