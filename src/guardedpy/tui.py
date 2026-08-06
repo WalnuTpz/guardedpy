@@ -66,9 +66,37 @@ class CredentialScreen(ModalScreen[tuple[str, str | None] | None]):
         if button_id == "credential-update":
             self.dismiss(("update", self.query_one("#credential-value", Input).value))
         elif button_id == "credential-clear":
-            self.dismiss(("clear", None))
+            self.dismiss(("clear_requested", None))
         else:
             self.dismiss(None)
+
+
+class ClearCredentialScreen(ModalScreen[bool]):
+    """Require a second, focused decision before clearing a keyring entry."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("确认清除已保存的凭据？", id="credential-clear-confirm"),
+            Button("确认清除", id="credential-clear-confirm-button"),
+            Button("取消", id="credential-clear-cancel"),
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "credential-clear-confirm-button")
+
+
+class ExitScreen(ModalScreen[bool]):
+    """Avoid abandoning an active governed task on an accidental exit command."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("活跃任务将被取消。确认退出？", id="exit-confirm"),
+            Button("取消任务并退出", id="exit-confirm-button"),
+            Button("继续会话", id="exit-cancel"),
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "exit-confirm-button")
 
 
 class GuardedPyApp(App[None]):
@@ -87,15 +115,16 @@ class GuardedPyApp(App[None]):
         self.profile = profile
         self.initial_task = initial_task
         self._pending_approval: tuple[TaskState, str] | None = None
+        self._active_task: TaskState | None = None
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
-        yield Static(
-            f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort} · 测试：完整套件",
-            id="status",
-        )
+        yield Static(self._status_text(), id="status")
         yield RichLog(id="transcript", wrap=True, highlight=False, markup=False)
-        yield ListView(*(ListItem(Static(command)) for command in COMMANDS), id="command-palette")
+        yield ListView(
+            *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}" ) for command in COMMANDS),
+            id="command-palette",
+        )
         yield TextArea(id="composer")
         yield Footer()
 
@@ -117,6 +146,10 @@ class GuardedPyApp(App[None]):
             event.prevent_default()
             event.stop()
             self.submit(self.query_one("#composer", TextArea).text)
+        if event.key == "ctrl+c" and self._active_task is not None:
+            event.prevent_default()
+            event.stop()
+            self._render_task(self.runtime.cancel(self._active_task.id))
 
     def submit(self, text: str) -> None:
         request = text.strip()
@@ -186,7 +219,10 @@ class GuardedPyApp(App[None]):
             self._start_task("Review project", TaskIntent.REVIEW, argument or None)
             return
         if name == "/exit":
-            self.exit()
+            if self._active_task is None:
+                self.exit()
+            else:
+                self.push_screen(ExitScreen(), self._exit_resolved)
             return
         if name in {"/tests", "/diff", "/permissions", "/memory", "/model", "/effort", "/history", "/doctor"}:
             output = StringIO()
@@ -205,11 +241,26 @@ class GuardedPyApp(App[None]):
                     return
                 self.runtime.update_credential(value)
                 self._write("凭据已更新。")
-            else:
-                self.runtime.clear_credential()
-                self._write("凭据已清除。")
+            elif operation == "clear_requested":
+                self.push_screen(ClearCredentialScreen(), self._clear_credential_resolved)
         except Exception:
             self._write("凭据操作失败。")
+
+    def _clear_credential_resolved(self, confirmed: bool) -> None:
+        if not confirmed:
+            return
+        try:
+            self.runtime.clear_credential()
+            self._write("凭据已清除。")
+        except Exception:
+            self._write("凭据操作失败。")
+
+    def _exit_resolved(self, confirmed: bool) -> None:
+        if not confirmed:
+            return
+        if self._active_task is not None:
+            self._render_task(self.runtime.cancel(self._active_task.id))
+        self.exit()
 
     def _start_task(self, description: str, intent: TaskIntent, review_path: str | None = None) -> None:
         if not description.strip():
@@ -217,11 +268,14 @@ class GuardedPyApp(App[None]):
             return
         try:
             task = self.runtime.create_task(description, intent, review_path=review_path)
+            self._active_task = task
             self._render_task(self.runtime.run(task.id))
         except Exception:
             self._write("无法启动任务。")
 
     def _render_task(self, task: TaskState) -> None:
+        self._active_task = task if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL} else None
+        self.query_one("#status", Static).update(self._status_text(task))
         for line in lifecycle_lines(self.runtime, task):
             self._write(line)
         if task.status is TaskStatus.WAITING_APPROVAL:
@@ -239,6 +293,23 @@ class GuardedPyApp(App[None]):
     def _write(self, value: object) -> None:
         self.query_one("#transcript", RichLog).write(str(value))
 
+    def _status_text(self, task: TaskState | None = None) -> str:
+        config = self.runtime.config
+        active = task or self._active_task
+        baseline = active.path.value if active is not None else "未开始"
+        status = active.status.value if active is not None else "idle"
+        return (
+            f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort}\n"
+            f"基线：{baseline} · 任务：{status} · 测试：完整套件"
+        )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "command-palette":
+            return
+        self.query_one("#composer", TextArea).text = str(event.item.query_one(Static).render())
+        self.query_one("#command-palette").display = False
+        self.query_one("#composer", TextArea).focus()
+
 
 class DemoApp(App[None]):
     """Offline, fixed-scenario Textual mechanism demonstration."""
@@ -248,6 +319,11 @@ class DemoApp(App[None]):
         "failure_feedback_corrects",
         "tdd_source_patch_denied",
     )
+    _requests = {
+        "dangerous_action_denied": "Attempt a prohibited privileged action.",
+        "failure_feedback_corrects": "Correct the selected assertion failure.",
+        "tdd_source_patch_denied": "Attempt a source patch before observing red.",
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -255,13 +331,13 @@ class DemoApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Static("选择机制演示，按 Enter 运行。", id="demo-title")
-        yield Static(self._scenarios[self._index], id="demo-request")
+        yield Static(self._requests[self._scenarios[self._index]], id="demo-request")
         yield RichLog(id="demo-transcript", wrap=True, highlight=False, markup=False)
 
     def on_key(self, event: Any) -> None:
         if event.key in {"down", "j"}:
             self._index = (self._index + 1) % len(self._scenarios)
-            self.query_one("#demo-request", Static).update(self._scenarios[self._index])
+            self.query_one("#demo-request", Static).update(self._requests[self._scenarios[self._index]])
         elif event.key == "enter":
             result = run_scenario(self._scenarios[self._index])
             self.query_one("#demo-transcript", RichLog).write(f"{result.name} status={result.status}")

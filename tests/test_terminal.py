@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+from uuid import uuid4
 
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import TaskIntent, TaskState, TaskStatus
+from guardedpy.domain import CommandApprovalRule, CommandRuleKind, TaskIntent, TaskState, TaskStatus
 from guardedpy.events import StoredRunEvent
+from guardedpy.memory import MemoryEntry
 
 
 class _Runtime:
@@ -21,6 +23,11 @@ class _Runtime:
         self.approval = approval
         self.updated = False
         self.created: list[TaskState] = []
+        self.rule_id = "rule-to-revoke"
+        self.memory_id = uuid4()
+        self.revoked: list[str] = []
+        self.approved: list[object] = []
+        self.removed: list[object] = []
 
     def create_task(self, description: str, intent: TaskIntent = TaskIntent.CODING, review_path: str | None = None) -> TaskState:
         task = TaskState(description=description, intent=intent, config=self.config, review_path=review_path)
@@ -42,6 +49,32 @@ class _Runtime:
     def update_credential(self, key: str) -> None:
         del key
         self.updated = True
+
+    def command_rules(self) -> list[CommandApprovalRule]:
+        return [
+            CommandApprovalRule(
+                id=self.rule_id,
+                kind=CommandRuleKind.GIT_DIFF_CHECK,
+                project_hash="safe",
+            )
+        ]
+
+    def delete_command_rule(self, rule_id: str) -> bool:
+        self.revoked.append(rule_id)
+        return True
+
+    def memory_proposals(self) -> list[MemoryEntry]:
+        return [MemoryEntry(id=self.memory_id, task_id=uuid4(), text="remember tests")]
+
+    def memories(self) -> list[MemoryEntry]:
+        return []
+
+    def approve_memory(self, memory_id: object) -> MemoryEntry:
+        self.approved.append(memory_id)
+        return self.memory_proposals()[0]
+
+    def delete_memory(self, memory_id: object) -> None:
+        self.removed.append(memory_id)
 
 
 def _profile(tmp_path: Path) -> ProjectProfile:
@@ -84,3 +117,44 @@ def test_plain_session_refuses_piped_credential_entry_and_lists_only_supported_c
         assert command in rendered
     for retired in ("/init", "/task", "/serve", "!shell"):
         assert retired not in rendered
+
+
+def test_plain_session_requires_exact_command_names_before_mutating_defaults(tmp_path: Path) -> None:
+    """Catches a slash-prefix typo changing persistent model or workflow state."""
+    from guardedpy.terminal import run_plain_session
+
+    runtime = _Runtime(_profile(tmp_path))
+    output = StringIO()
+
+    code = run_plain_session(
+        runtime,
+        StringIO("/modeloops deepseek-v4-pro\n/planish inspect\n/exit\n"),
+        output,
+    )
+
+    assert code == 0
+    assert not hasattr(runtime, "defaults")
+    assert output.getvalue() == "未知命令。\n未知命令。\n"
+
+
+def test_plain_session_manages_only_explicit_permission_and_memory_identifiers(tmp_path: Path) -> None:
+    """Catches rule or memory management being a display-only command surface."""
+    from guardedpy.terminal import run_plain_session
+
+    runtime = _Runtime(_profile(tmp_path))
+    output = StringIO()
+
+    code = run_plain_session(
+        runtime,
+        StringIO(
+            f"/permissions revoke {runtime.rule_id}\n"
+            f"/memory approve {runtime.memory_id}\n"
+            f"/memory remove {runtime.memory_id}\n/exit\n"
+        ),
+        output,
+    )
+
+    assert code == 0
+    assert runtime.revoked == [runtime.rule_id]
+    assert runtime.approved == [runtime.memory_id]
+    assert runtime.removed == [runtime.memory_id]

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from io import TextIOBase
-from pathlib import Path
 import subprocess
 import sys
 from typing import Any, TextIO
+from uuid import UUID
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 
@@ -77,54 +75,55 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
         line = raw_line.strip()
         if not line:
             continue
-        if line == "/exit":
+        name, _, argument = line.partition(" ")
+        if name == "/exit" and not argument:
             return 0
-        if line == "/help":
+        if name == "/help" and not argument:
             output.write(_HELP)
             continue
-        if line in {"/new", "/clear"}:
+        if name in {"/new", "/clear"} and not argument:
             output.write("已清除当前视觉会话。\n")
             continue
-        if line == "/history":
+        if name == "/history" and not argument:
             _render_history(runtime, output)
             continue
-        if line.startswith("/plan"):
-            request = line.removeprefix("/plan").strip()
-            code = run_noninteractive_task(runtime, request, TaskIntent.PLAN, output)
+        if name == "/plan":
+            code = run_noninteractive_task(runtime, argument, TaskIntent.PLAN, output)
             if code:
                 return code
             continue
-        if line.startswith("/review"):
-            review_path = line.removeprefix("/review").strip() or None
-            code = run_noninteractive_task(runtime, "Review project", TaskIntent.REVIEW, output, review_path)
+        if name == "/review":
+            code = run_noninteractive_task(
+                runtime, "Review project", TaskIntent.REVIEW, output, argument or None
+            )
             if code:
                 return code
             continue
-        if line == "/tests":
+        if name == "/tests" and not argument:
             _run_tests(runtime, output)
             continue
-        if line == "/diff":
+        if name == "/diff" and not argument:
             _run_diff(runtime, output)
             continue
-        if line == "/permissions":
-            _render_permissions(runtime, output)
+        if name == "/permissions":
+            _permissions(runtime, argument, output)
             continue
-        if line == "/credentials" or line.startswith("/credentials "):
-            _credentials(runtime, line.removeprefix("/credentials").strip(), output)
+        if name == "/credentials":
+            _credentials(runtime, argument, output)
             continue
-        if line == "/memory":
-            _render_memory(runtime, output)
+        if name == "/memory":
+            _memory(runtime, argument, output)
             continue
-        if line.startswith("/model"):
-            _update_default(runtime, "model", line.removeprefix("/model").strip(), output)
+        if name == "/model":
+            _update_default(runtime, "model", argument, output)
             continue
-        if line.startswith("/effort"):
-            _update_default(runtime, "reasoning_effort", line.removeprefix("/effort").strip(), output)
+        if name == "/effort":
+            _update_default(runtime, "reasoning_effort", argument, output)
             continue
-        if line == "/status":
+        if name == "/status" and not argument:
             _render_status(runtime, output)
             continue
-        if line == "/doctor":
+        if name == "/doctor" and not argument:
             _doctor(runtime, output)
             continue
         if line.startswith("/"):
@@ -161,8 +160,16 @@ def _run_diff(runtime: Any, output: TextIO) -> None:
     output.write(result.stdout or "没有未提交改动。\n")
 
 
-def _render_permissions(runtime: Any, output: TextIO) -> None:
+def _permissions(runtime: Any, argument: str, output: TextIO) -> None:
+    operation, _, rule_id = argument.partition(" ")
+    if operation not in {"", "list", "revoke"} or (operation == "revoke" and not rule_id):
+        output.write("权限操作无效。\n")
+        return
     try:
+        if operation == "revoke":
+            runtime.delete_command_rule(rule_id)
+            output.write("权限规则已撤销。\n")
+            return
         rules = runtime.command_rules()
     except Exception:
         output.write("无法读取权限规则。\n")
@@ -182,8 +189,20 @@ def _credentials(runtime: Any, operation: str, output: TextIO) -> None:
     output.write("非交互终端不能录入凭据。\n")
 
 
-def _render_memory(runtime: Any, output: TextIO) -> None:
+def _memory(runtime: Any, argument: str, output: TextIO) -> None:
+    operation, _, raw_id = argument.partition(" ")
+    if operation not in {"", "list", "approve", "remove"} or (operation in {"approve", "remove"} and not raw_id):
+        output.write("记忆操作无效。\n")
+        return
     try:
+        if operation == "approve":
+            runtime.approve_memory(UUID(raw_id))
+            output.write("记忆已批准。\n")
+            return
+        if operation == "remove":
+            runtime.delete_memory(UUID(raw_id))
+            output.write("记忆已移除。\n")
+            return
         entries = [*runtime.memory_proposals(), *runtime.memories()]
     except Exception:
         output.write("无法读取记忆。\n")
