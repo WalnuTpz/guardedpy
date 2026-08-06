@@ -11,11 +11,19 @@ from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 
 
 COMMANDS = (
-    "/new", "/clear", "/history", "/exit", "/plan", "/review", "/tests", "/diff",
-    "/permissions", "/credentials", "/memory", "/model", "/effort", "/status", "/doctor",
-    "/help",
+    "/history", "/new", "/clear", "/exit", "/plan", "/review", "/tests", "/diff",
+    "/permissions", "/credentials", "/memory", "/model", "/effort", "/doctor", "/help",
 )
-_HELP = "可用命令：" + " ".join(COMMANDS) + "\n"
+
+
+def render_help() -> tuple[str, ...]:
+    """Return the grouped, secret-free command help shared by both session renderers."""
+    return (
+        "会话与对话：/history /new /clear /exit",
+        "任务与检查：/plan <任务> /review <路径> /tests /diff",
+        "设置与安全：/model /effort /permissions /credentials /memory /doctor",
+        "帮助：/help",
+    )
 
 
 def lifecycle_lines(runtime: Any, task: TaskState) -> tuple[str, ...]:
@@ -79,7 +87,8 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
         if name == "/exit" and not argument:
             return 0
         if name == "/help" and not argument:
-            output.write(_HELP)
+            for help_line in render_help():
+                output.write(f"{help_line}\n")
             continue
         if name in {"/new", "/clear"} and not argument:
             output.write("已清除当前视觉会话。\n")
@@ -119,9 +128,6 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
             continue
         if name == "/effort":
             _update_default(runtime, "reasoning_effort", argument, output)
-            continue
-        if name == "/status" and not argument:
-            _render_status(runtime, output)
             continue
         if name == "/doctor" and not argument:
             _doctor(runtime, output)

@@ -42,8 +42,10 @@ When stdin or stdout is redirected, GuardedPy uses a safe plain-text session. It
 The interactive command set is:
 
 ```text
-/new /clear /history /exit /plan /review /tests /diff
-/permissions /credentials /memory /model /effort /status /doctor /help
+会话与对话：/history /new /clear /exit
+任务与检查：/plan /review /tests /diff
+设置与安全：/model /effort /permissions /credentials /memory /doctor
+帮助：/help
 ```
 
 `/plan <request>` and `/review [path]` are read-only workflows. `/tests`, `/diff`, and `/doctor` are deterministic local checks, not LLM requests. A coding task first runs the discovered full test suite: a passing baseline enters feature TDD, assertion failures enter the repair path, and collection/execution errors or a timeout block further automated changes.
@@ -52,7 +54,7 @@ The interactive command set is:
 
 In an interactive session, `/credentials` opens a masked input for the DeepSeek API key. The value is written only through the operating-system keyring, is not echoed in the transcript, and can be updated or cleared through the same controlled UI. Do not put a key in project files, command arguments, environment variables, logs, or examples. An unavailable keyring fails safely; there is no plaintext fallback.
 
-The default is `deepseek-v4-flash` with `high` effort. Choose only a supported setting for later tasks:
+The default is `deepseek-v4-flash` with `high` effort. In the interactive session, `/model` or `/effort` opens a keyboard- and mouse-selectable picker; the selected value applies only to later tasks. In redirected plain text, provide the supported value explicitly:
 
 ```text
 /model deepseek-v4-flash

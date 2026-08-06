@@ -122,6 +122,21 @@ def test_plain_session_refuses_piped_credential_entry_and_lists_only_supported_c
         assert retired not in rendered
 
 
+def test_plain_help_is_grouped_and_treats_status_as_unknown(tmp_path: Path) -> None:
+    """Catches the retired status command returning through the safe renderer."""
+    from guardedpy.terminal import run_plain_session
+
+    output = StringIO()
+    code = run_plain_session(_Runtime(_profile(tmp_path)), StringIO("/help\n/status\n/exit\n"), output)
+
+    assert code == 0
+    rendered = output.getvalue()
+    for group in ("会话与对话", "任务与检查", "设置与安全"):
+        assert group in rendered
+    assert "/status" not in rendered
+    assert rendered.endswith("未知命令。\n")
+
+
 def test_plain_session_requires_exact_command_names_before_mutating_defaults(tmp_path: Path) -> None:
     """Catches a slash-prefix typo changing persistent model or workflow state."""
     from guardedpy.terminal import run_plain_session

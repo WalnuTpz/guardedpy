@@ -24,6 +24,7 @@ class _Runtime:
         self.config = HarnessConfig(profile=profile)
         self.created: list[TaskState] = []
         self.cancelled: list[object] = []
+        self.history_reads = 0
 
     def events(self, task_id: object) -> list[StoredRunEvent]:
         del task_id
@@ -33,6 +34,10 @@ class _Runtime:
         self.updated = changes
         self.config = self.config.model_copy(update=changes)
         return self.config
+
+    def tasks(self) -> list[TaskState]:
+        self.history_reads += 1
+        return []
 
     def credential_status(self) -> CredentialStatus:
         return CredentialStatus(configured=False)
@@ -89,7 +94,7 @@ def test_composer_enter_submits_help_and_shift_enter_or_ctrl_j_adds_newline(tmp_
             await pilot.click("#composer")
             await pilot.press(*"/help", "enter")
             transcript = app.query_one("#transcript", RichLog)
-            assert any("可用命令：" in line.text for line in transcript.lines)
+            assert any("会话与对话" in line.text for line in transcript.lines)
             composer = app.query_one("#composer", Composer)
             await pilot.press("shift+enter")
             assert "\n" in composer.text
@@ -102,8 +107,7 @@ def test_composer_enter_submits_help_and_shift_enter_or_ctrl_j_adds_newline(tmp_
 
 def test_tui_mounts_safe_session_widgets_and_filters_exact_command_palette(tmp_path: Path) -> None:
     """Catches the interactive session losing its composer, status, or safe command UI."""
-    from guardedpy.tui import COMMANDS, GuardedPyApp
-    from textual.widgets import TextArea
+    from guardedpy.tui import COMMANDS, Composer, GuardedPyApp
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
@@ -111,7 +115,7 @@ def test_tui_mounts_safe_session_widgets_and_filters_exact_command_palette(tmp_p
     async def check() -> None:
         async with app.run_test() as pilot:
             assert "项目：" in str(app.query_one("#status").render())
-            assert isinstance(app.query_one("#composer"), TextArea)
+            assert isinstance(app.query_one("#composer"), Composer)
             await pilot.click("#composer")
             await pilot.press("/")
             assert app.query_one("#command-palette").display is True
@@ -122,11 +126,11 @@ def test_tui_mounts_safe_session_widgets_and_filters_exact_command_palette(tmp_p
                 if item.display
             ] == ["/history", "/help"]
             await pilot.click("#command-history")
-            assert app.query_one("#composer", TextArea).text == "/history"
+            assert app.query_one("#composer", Composer).text == "/history"
             assert tuple(COMMANDS) == (
-                "/new", "/clear", "/history", "/exit", "/plan", "/review",
+                "/history", "/new", "/clear", "/exit", "/plan", "/review",
                 "/tests", "/diff", "/permissions", "/credentials", "/memory",
-                "/model", "/effort", "/status", "/doctor", "/help",
+                "/model", "/effort", "/doctor", "/help",
             )
 
     asyncio.run(check())
@@ -237,7 +241,7 @@ def test_tui_cancels_a_real_blocking_local_runtime_without_freezing_the_session(
                 assert orchestrator.release.is_set() is False
                 await pilot.press("ctrl+c")
                 assert orchestrator.cancel_before_release is True
-                app.submit("/status")
+                app.submit("/help")
                 await pilot.pause()
                 assert "项目：" in str(app.query_one("#status").render())
         finally:
@@ -282,7 +286,7 @@ def test_tui_runs_blocking_tests_command_off_loop_without_an_active_task(
                 assert release.is_set() is False
 
                 await pilot.press("ctrl+c")
-                app.submit("/status")
+                app.submit("/help")
                 await pilot.pause()
                 assert "项目：" in str(app.query_one("#status").render())
 
@@ -339,9 +343,10 @@ def test_tui_unmount_cancels_its_active_worker_and_discards_late_completion(
     asyncio.run(check())
 
 
-def test_tui_status_command_renders_without_using_a_removed_widget_property(tmp_path: Path) -> None:
-    """Catches `/status` crashing after Textual removes an internal Static attribute."""
+def test_tui_status_is_unknown_and_idle_status_explains_first_task_test_scope(tmp_path: Path) -> None:
+    """Catches the retired status command or an opaque idle status returning."""
     from guardedpy.tui import GuardedPyApp
+    from textual.widgets import RichLog
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
@@ -350,13 +355,17 @@ def test_tui_status_command_renders_without_using_a_removed_widget_property(tmp_
         async with app.run_test() as pilot:
             app.submit("/status")
             await pilot.pause()
+            assert "已就绪 · 尚未提交任务 · 首个任务将运行完整测试" in str(
+                app.query_one("#status").render()
+            )
+            assert app.query_one("#transcript", RichLog).lines[-1].text == "未知命令。"
 
     asyncio.run(check())
 
 
 @pytest.mark.parametrize(
     "command",
-    ("/new unexpected", "/credentials unexpected", "/status unexpected", "/help unexpected"),
+    ("/new unexpected", "/credentials unexpected", "/help unexpected"),
 )
 def test_tui_rejects_trailing_arguments_for_no_argument_commands(
     tmp_path: Path, command: str
@@ -519,7 +528,7 @@ def test_tui_runs_blocking_approval_continuation_off_loop_and_keeps_cancel_reach
 
                 await pilot.press("ctrl+c")
                 assert orchestrator.cancel_before_release is True
-                app.submit("/status")
+                app.submit("/help")
                 await pilot.pause()
                 assert "项目：" in str(app.query_one("#status").render())
         finally:
@@ -529,9 +538,11 @@ def test_tui_runs_blocking_approval_continuation_off_loop_and_keeps_cancel_reach
     asyncio.run(check())
 
 
-def test_tui_model_command_updates_only_future_defaults(tmp_path: Path) -> None:
-    """Catches the visible model picker becoming a nonfunctional status message."""
-    from guardedpy.tui import GuardedPyApp
+def test_tui_palette_selection_fills_then_second_enter_executes_and_model_picker_updates_defaults(
+    tmp_path: Path,
+) -> None:
+    """Catches palette selection executing early or settings ignoring keyboard selection."""
+    from guardedpy.tui import Composer, GuardedPyApp, SettingsScreen
 
     profile = _profile(tmp_path)
     runtime = _Runtime(profile)
@@ -539,9 +550,44 @@ def test_tui_model_command_updates_only_future_defaults(tmp_path: Path) -> None:
 
     async def check() -> None:
         async with app.run_test() as pilot:
-            app.submit("/model deepseek-v4-pro")
+            await pilot.click("#composer")
+            await pilot.press("/", "down", "enter")
+            composer = app.query_one("#composer", Composer)
+            assert composer.text == "/history"
+            assert runtime.history_reads == 0
+            await pilot.press("enter")
+            assert runtime.history_reads == 1
+
+            app.submit("/model")
+            await pilot.pause()
+            await pilot.press("down", "enter")
             await pilot.pause()
             assert runtime.updated == {"model": "deepseek-v4-pro"}
+            assert composer.text == ""
+            assert not isinstance(app.screen, SettingsScreen)
+
+    asyncio.run(check())
+
+
+def test_tui_has_grouped_help_without_footer(tmp_path: Path) -> None:
+    """Catches the accepted help surface retaining framework Footer chrome."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.css.query import NoMatches
+    from textual.widgets import Footer, RichLog
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            with pytest.raises(NoMatches):
+                app.query_one(Footer)
+            app.submit("/help")
+            await pilot.pause()
+            rendered = "\n".join(line.text for line in app.query_one("#transcript", RichLog).lines)
+            for group in ("会话与对话", "任务与检查", "设置与安全"):
+                assert group in rendered
+            assert "/status" not in rendered
 
     asyncio.run(check())
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from io import StringIO
 from threading import Thread
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from textual.app import App, ComposeResult
@@ -12,17 +12,17 @@ from textual.containers import Vertical
 from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, ListItem, ListView, RichLog, Static, TextArea
+from textual.widgets import Button, Input, ListItem, ListView, RichLog, Static, TextArea
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.mechanism_demo import ScenarioName, run_scenario
-from guardedpy.terminal import COMMANDS, lifecycle_lines, run_plain_session
+from guardedpy.terminal import COMMANDS, lifecycle_lines, render_help, run_plain_session
 
 
 _NO_ARGUMENT_COMMANDS = frozenset(
     {
         "/new", "/clear", "/history", "/exit", "/tests", "/diff",
-        "/credentials", "/status", "/doctor", "/help",
+        "/credentials", "/doctor", "/help", "/model", "/effort",
     }
 )
 
@@ -47,6 +47,38 @@ class Composer(TextArea):
             event.prevent_default()
             event.stop()
             self.insert("\n")
+        elif event.key in {"up", "down"} and self.app._move_palette(event.key):
+            event.prevent_default()
+            event.stop()
+
+
+class SettingsScreen(ModalScreen[str | None]):
+    """Choose a validated future-task setting with keyboard or mouse."""
+
+    def __init__(
+        self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
+    ) -> None:
+        super().__init__()
+        self._field = field
+        self._values = values
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("选择模型" if self._field == "model" else "选择推理强度"),
+            ListView(
+                *(ListItem(Static(value), id=f"setting-{value}") for value in self._values),
+                id="settings-picker",
+            ),
+            id="settings-modal",
+        )
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#settings-picker", ListView)
+        picker.index = 0
+        picker.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(str(event.item.query_one(Static).render()))
 
 
 class ApprovalScreen(ModalScreen[str | None]):
@@ -181,6 +213,8 @@ class GuardedPyApp(App[None]):
         self._cancelled_task_ids: set[UUID] = set()
         self._run_threads: dict[UUID, Thread] = {}
         self._session_command_workers: dict[str, Thread] = {}
+        self._palette_index = -1
+        self._suppress_palette_once = False
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
@@ -191,7 +225,6 @@ class GuardedPyApp(App[None]):
             id="command-palette",
         )
         yield Composer(id="composer")
-        yield Footer()
 
     def on_mount(self) -> None:
         if self.initial_task:
@@ -203,12 +236,16 @@ class GuardedPyApp(App[None]):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id == "composer":
+            if self._suppress_palette_once:
+                self._suppress_palette_once = False
+                return
             prefix = event.text_area.text.strip()
             palette = self.query_one("#command-palette")
             palette.display = prefix.startswith("/")
             for item in palette.query(ListItem):
                 command = str(item.query_one(Static).render())
                 item.display = command.startswith(prefix)
+            self._palette_index = -1
 
     def on_key(self, event: Any) -> None:
         if event.key == "ctrl+c" and self._active_task is not None:
@@ -218,7 +255,41 @@ class GuardedPyApp(App[None]):
 
     def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         """Make the custom composer message the sole interactive submit path."""
+        palette = self.query_one("#command-palette", ListView)
+        if event.text.strip() == "/help":
+            self.submit(event.text)
+            return
+        if palette.display:
+            items = self._visible_palette_items()
+            if items:
+                index = self._palette_index if self._palette_index >= 0 else 0
+                self._accept_palette_item(items[index])
+                return
         self.submit(event.text)
+
+    def _visible_palette_items(self) -> list[ListItem]:
+        palette = self.query_one("#command-palette", ListView)
+        return [item for item in palette.query(ListItem) if item.display]
+
+    def _move_palette(self, direction: str) -> bool:
+        palette = self.query_one("#command-palette", ListView)
+        if not palette.display:
+            return False
+        items = self._visible_palette_items()
+        if not items:
+            return True
+        change = 1 if direction == "down" else -1
+        self._palette_index = (self._palette_index + change) % len(items)
+        palette.index = list(palette.query(ListItem)).index(items[self._palette_index])
+        return True
+
+    def _accept_palette_item(self, item: ListItem) -> None:
+        composer = self.query_one("#composer", Composer)
+        self._suppress_palette_once = True
+        composer.text = str(item.query_one(Static).render())
+        self.query_one("#command-palette", ListView).display = False
+        composer.focus()
+        composer.cursor_location = composer.document.end
 
     def submit(self, text: str) -> None:
         request = text.strip()
@@ -281,10 +352,8 @@ class GuardedPyApp(App[None]):
             self.query_one("#transcript", RichLog).clear()
             return
         if name == "/help":
-            self._write("可用命令：" + " ".join(COMMANDS))
-            return
-        if name == "/status":
-            self._write(self.query_one("#status", Static).render())
+            for help_line in render_help():
+                self._write(help_line)
             return
         if name == "/credentials":
             try:
@@ -293,6 +362,12 @@ class GuardedPyApp(App[None]):
                 self._write("凭据状态不可用。")
                 return
             self.push_screen(CredentialScreen(configured), self._credential_resolved)
+            return
+        if name == "/model":
+            self._open_settings("model", ("deepseek-v4-flash", "deepseek-v4-pro"))
+            return
+        if name == "/effort":
+            self._open_settings("reasoning_effort", ("high", "max"))
             return
         if name == "/plan":
             self._start_task(argument, TaskIntent.PLAN)
@@ -309,11 +384,31 @@ class GuardedPyApp(App[None]):
         if name in {"/tests", "/diff"}:
             self._start_session_command(name)
             return
-        if name in {"/permissions", "/memory", "/model", "/effort", "/history", "/doctor"}:
+        if name in {"/permissions", "/memory", "/history", "/doctor"}:
             output = StringIO()
             run_plain_session(self.runtime, StringIO(f"{command}\n"), output)
             for line in output.getvalue().splitlines():
                 self._write(line)
+
+    def _open_settings(
+        self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
+    ) -> None:
+        self.push_screen(SettingsScreen(field, values), lambda value: self._setting_resolved(field, value))
+
+    def _setting_resolved(
+        self, field: Literal["model", "reasoning_effort"], value: str | None
+    ) -> None:
+        if value is None:
+            return
+        try:
+            self.runtime.update_future_defaults(**{field: value})
+        except Exception:
+            self._write("设置未更新。")
+            return
+        composer = self.query_one("#composer", Composer)
+        composer.text = ""
+        composer.focus()
+        self.query_one("#status", Static).update(self._status_text())
 
     def _start_session_command(self, command: str) -> None:
         if command in self._session_command_workers:
@@ -462,8 +557,13 @@ class GuardedPyApp(App[None]):
     def _status_text(self, task: TaskState | None = None) -> str:
         config = self.runtime.config
         active = task or self._active_task
-        baseline = active.path.value if active is not None else "未开始"
-        status = active.status.value if active is not None else "idle"
+        if active is None:
+            return (
+                f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort}\n"
+                "已就绪 · 尚未提交任务 · 首个任务将运行完整测试"
+            )
+        baseline = active.path.value
+        status = active.status.value
         return (
             f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort}\n"
             f"基线：{baseline} · 任务：{status} · 测试：完整套件"
@@ -472,9 +572,7 @@ class GuardedPyApp(App[None]):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id != "command-palette":
             return
-        self.query_one("#composer", TextArea).text = str(event.item.query_one(Static).render())
-        self.query_one("#command-palette").display = False
-        self.query_one("#composer", TextArea).focus()
+        self._accept_palette_item(event.item)
 
 
 class DemoApp(App[None]):
