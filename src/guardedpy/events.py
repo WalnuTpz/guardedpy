@@ -275,13 +275,16 @@ class EventStore:
                 """
             ).fetchall()
         return [
-            TaskState(
-                id=UUID(row[0]),
-                description=row[1],
-                intent=TaskIntent(row[2]),
-                config=HarnessConfig.model_validate_json(row[3]),
-                status=TaskStatus(row[4]),
-                review_path=row[5],
+            TaskState.model_validate(
+                {
+                    "id": UUID(row[0]),
+                    "description": row[1],
+                    "intent": TaskIntent(row[2]),
+                    "config": HarnessConfig.model_validate_json(row[3]),
+                    "status": TaskStatus(row[4]),
+                    "review_path": row[5],
+                },
+                context={"source": "event_store_history"},
             )
             for row in rows
         ]

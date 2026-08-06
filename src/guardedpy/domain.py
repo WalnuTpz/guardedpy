@@ -133,6 +133,15 @@ class TaskState(BaseModel):
             raise ValueError("review path must be a nonblank existing project path")
         root = self.config.profile.root.resolve()
         candidate = (root / self.review_path).resolve()
-        if not candidate.is_relative_to(root) or not candidate.exists():
+        if not candidate.is_relative_to(root):
             raise ValueError("review path must be an existing path inside the project root")
-        object.__setattr__(self, "review_path", candidate.relative_to(root).as_posix())
+        normalized = candidate.relative_to(root).as_posix()
+        restoring_history = (
+            isinstance(__context, dict)
+            and __context.get("source") == "event_store_history"
+        )
+        if restoring_history and self.review_path != normalized:
+            raise ValueError("persisted review path must be a normalized project-relative path")
+        if not restoring_history and not candidate.exists():
+            raise ValueError("review path must be an existing path inside the project root")
+        object.__setattr__(self, "review_path", normalized)

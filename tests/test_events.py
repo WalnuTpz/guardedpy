@@ -267,6 +267,31 @@ def test_register_task_persists_validated_review_scope(store: EventStore) -> Non
     assert restored.review_path == "src/value.py"
 
 
+def test_completed_review_history_survives_later_reviewed_path_deletion(
+    store: EventStore,
+) -> None:
+    """Catches history restoration reapplying mutable existence checks to saved review scope."""
+    (store.project_root / "src").mkdir(exist_ok=True)
+    reviewed = store.project_root / "src" / "value.py"
+    reviewed.write_text("VALUE = 1\n")
+    task = TaskState(
+        description="Review value",
+        intent=TaskIntent.REVIEW,
+        review_path="src/value.py",
+        config=safe_config(store.project_root),
+    )
+    store.register_task(task)
+    store.append(RunEvent(task_id=task.id, task_status=TaskStatus.COMPLETED))
+    reviewed.unlink()
+
+    restored = EventStore(store.project_root).tasks()
+
+    assert len(restored) == 1
+    assert restored[0].status is TaskStatus.COMPLETED
+    assert restored[0].intent is TaskIntent.REVIEW
+    assert restored[0].review_path == "src/value.py"
+
+
 def test_existing_event_database_adds_task_metadata_without_losing_events(
     store: EventStore,
 ) -> None:
