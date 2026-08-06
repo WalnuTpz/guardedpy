@@ -119,6 +119,22 @@ def test_noninteractive_task_requires_configured_credential_before_creation(tmp_
     assert output.getvalue() == "需要先在交互终端配置凭据。\n"
 
 
+def test_noninteractive_task_explains_unavailable_secure_keyring(tmp_path: Path) -> None:
+    """Catches a failed backend being confused with a merely missing key."""
+    from guardedpy.credentials import CredentialBackendUnavailableError
+    from guardedpy.terminal import run_noninteractive_task
+
+    class UnavailableRuntime(_Runtime):
+        def credential_status(self) -> CredentialStatus:
+            raise CredentialBackendUnavailableError("keyring backend is unavailable")
+
+    runtime = UnavailableRuntime(_profile(tmp_path))
+    output = StringIO()
+    assert run_noninteractive_task(runtime, "repair", TaskIntent.CODING, output) == 1
+    assert runtime.created == []
+    assert "安全系统密钥环" in output.getvalue()
+
+
 def test_plain_session_refuses_piped_credential_entry_and_lists_only_supported_commands(tmp_path: Path) -> None:
     """Catches the fallback accepting secrets or advertising a retired command surface."""
     from guardedpy.terminal import run_plain_session
@@ -151,6 +167,17 @@ def test_plain_help_is_grouped_and_treats_status_as_unknown(tmp_path: Path) -> N
         assert group in rendered
     assert "/status" not in rendered
     assert rendered.endswith("未知命令。\n")
+
+
+def test_plain_help_explains_arguments_and_noninteractive_limits(tmp_path: Path) -> None:
+    """Catches plain help omitting the safe operating constraints needed by redirected users."""
+    from guardedpy.terminal import run_plain_session
+
+    output = StringIO()
+    run_plain_session(_Runtime(_profile(tmp_path)), StringIO("/help\n/exit\n"), output)
+    rendered = output.getvalue()
+    for phrase in ("/plan <任务>", "/review <路径>", "键盘", "鼠标", "凭据", "非交互", "安全"):
+        assert phrase in rendered
 
 
 def test_plain_conversations_prints_only_safe_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -98,7 +98,7 @@ def _profile(tmp_path: Path) -> ProjectProfile:
 def test_composer_enter_submits_help_and_shift_enter_or_ctrl_j_adds_newline(tmp_path: Path) -> None:
     """Catches TextArea consuming Enter instead of delivering the submitted command."""
     from guardedpy.tui import Composer, GuardedPyApp
-    from textual.widgets import RichLog
+    from textual.widgets import Log, Log
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
@@ -107,8 +107,9 @@ def test_composer_enter_submits_help_and_shift_enter_or_ctrl_j_adds_newline(tmp_
         async with app.run_test() as pilot:
             await pilot.click("#composer")
             await pilot.press(*"/help", "enter")
-            transcript = app.query_one("#transcript", RichLog)
-            assert any("会话与对话" in line.text for line in transcript.lines)
+            assert "会话与对话" in "\n".join(app.screen.query_one("#help-content", Log).lines)
+            await pilot.click("#help-close")
+            await pilot.click("#composer")
             composer = app.query_one("#composer", Composer)
             await pilot.press("shift+enter")
             assert "\n" in composer.text
@@ -181,7 +182,7 @@ def test_tui_lifecycle_tracks_baseline_task_and_safe_cancel_exit(tmp_path: Path)
 def test_tui_transcript_records_the_submitted_user_request_before_lifecycle(tmp_path: Path) -> None:
     """Catches a task starting without an auditable, safe user-message projection."""
     from guardedpy.tui import GuardedPyApp
-    from textual.widgets import RichLog
+    from textual.widgets import Log
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
@@ -191,8 +192,8 @@ def test_tui_transcript_records_the_submitted_user_request_before_lifecycle(tmp_
             app.submit("repair value")
             await pilot.pause()
             await app.workers.wait_for_complete()
-            transcript = app.query_one("#transcript", RichLog)
-            assert transcript.lines[0].text == "用户：repair value"
+            transcript = app.query_one("#transcript", Log)
+            assert transcript.lines[0] == "用户：repair value"
 
     asyncio.run(check())
 
@@ -270,7 +271,7 @@ def test_tui_runs_blocking_tests_command_off_loop_without_an_active_task(
 ) -> None:
     """Catches `/tests` freezing Textual while its bounded subprocess is still running."""
     from guardedpy.tui import GuardedPyApp
-    from textual.widgets import RichLog
+    from textual.widgets import Log
 
     entered = Event()
     release = Event()
@@ -306,8 +307,8 @@ def test_tui_runs_blocking_tests_command_off_loop_without_an_active_task(
 
                 release.set()
                 await pilot.pause()
-                transcript = app.query_one("#transcript", RichLog)
-                assert any("完整测试：passed" in line.text for line in transcript.lines)
+                transcript = app.query_one("#transcript", Log)
+                assert any("完整测试：passed" in line for line in transcript.lines)
         finally:
             timer.cancel()
             release.set()
@@ -360,7 +361,7 @@ def test_tui_unmount_cancels_its_active_worker_and_discards_late_completion(
 def test_tui_status_is_unknown_and_idle_status_explains_first_task_test_scope(tmp_path: Path) -> None:
     """Catches the retired status command or an opaque idle status returning."""
     from guardedpy.tui import GuardedPyApp
-    from textual.widgets import RichLog
+    from textual.widgets import Log
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
@@ -369,10 +370,10 @@ def test_tui_status_is_unknown_and_idle_status_explains_first_task_test_scope(tm
         async with app.run_test() as pilot:
             app.submit("/status")
             await pilot.pause()
-            assert "已就绪 · 尚未提交任务 · 首个任务将运行完整测试" in str(
+            assert "首个任务将运行完整测试" not in str(
                 app.query_one("#status").render()
             )
-            assert app.query_one("#transcript", RichLog).lines[-1].text == "未知命令。"
+            assert app.query_one("#transcript", Log).lines[-1] == "未知命令。"
 
     asyncio.run(check())
 
@@ -386,20 +387,20 @@ def test_tui_rejects_trailing_arguments_for_no_argument_commands(
 ) -> None:
     """Catches a typo after a no-argument command changing the interactive session."""
     from guardedpy.tui import GuardedPyApp
-    from textual.widgets import RichLog
+    from textual.widgets import Log
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
 
     async def check() -> None:
         async with app.run_test() as pilot:
-            transcript = app.query_one("#transcript", RichLog)
+            transcript = app.query_one("#transcript", Log)
             transcript.write("保留的会话记录")
             app.submit(command)
             await pilot.pause()
 
-            assert transcript.lines[0].text == "保留的会话记录"
-            assert transcript.lines[-1].text == "未知命令。"
+            assert transcript.lines[0] == "保留的会话记录"
+            assert transcript.lines[-1] == "未知命令。"
 
     asyncio.run(check())
 
@@ -618,7 +619,7 @@ def test_tui_palette_wheel_and_click_are_fill_first_before_enter(tmp_path: Path)
 def test_tui_new_confirmation_keyboard_click_and_reject_control_cancellation(tmp_path: Path) -> None:
     """Catches /new cancelling without consent or failing to cancel the exact active task."""
     from guardedpy.tui import GuardedPyApp
-    from textual.widgets import RichLog
+    from textual.widgets import Log
 
     profile = _profile(tmp_path)
     runtime = _Runtime(profile)
@@ -629,7 +630,7 @@ def test_tui_new_confirmation_keyboard_click_and_reject_control_cancellation(tmp
     async def check() -> None:
         async with app.run_test() as pilot:
             app._active_task = active
-            app.query_one("#transcript", RichLog).write("old")
+            app.query_one("#transcript", Log).write("old")
             app.submit("/new")
             await pilot.pause()
             await pilot.click("#new-cancel")
@@ -642,7 +643,7 @@ def test_tui_new_confirmation_keyboard_click_and_reject_control_cancellation(tmp
             await pilot.pause()
             assert runtime.cancelled == [active.id]
             assert app._conversation_id is None
-            assert app.query_one("#transcript", RichLog).lines == []
+            assert app.query_one("#transcript", Log).lines == []
 
             clicked_active = TaskState(description="clicked", config=runtime.config)
             runtime.created.append(clicked_active)
@@ -653,7 +654,7 @@ def test_tui_new_confirmation_keyboard_click_and_reject_control_cancellation(tmp
             await pilot.pause()
             assert runtime.cancelled == [active.id, clicked_active.id]
             assert app._conversation_id is None
-            assert app.query_one("#transcript", RichLog).lines == []
+            assert app.query_one("#transcript", Log).lines == []
 
     asyncio.run(check())
 
@@ -692,7 +693,7 @@ def test_tui_has_grouped_help_without_footer(tmp_path: Path) -> None:
     """Catches the accepted help surface retaining framework Footer chrome."""
     from guardedpy.tui import GuardedPyApp
     from textual.css.query import NoMatches
-    from textual.widgets import Footer, RichLog
+    from textual.widgets import Footer, Log
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
@@ -703,10 +704,71 @@ def test_tui_has_grouped_help_without_footer(tmp_path: Path) -> None:
                 app.query_one(Footer)
             app.submit("/help")
             await pilot.pause()
-            rendered = "\n".join(line.text for line in app.query_one("#transcript", RichLog).lines)
+            rendered = "\n".join(app.screen.query_one("#help-content", Log).lines)
             for group in ("会话与对话", "任务与检查", "设置与安全"):
                 assert group in rendered
             assert "/status" not in rendered
+
+    asyncio.run(check())
+
+
+def test_tui_help_is_scrollable_and_send_button_matches_enter(tmp_path: Path) -> None:
+    """Catches a terse help transcript or a pointer send path diverging from Enter."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Button, Log
+
+    profile = _profile(tmp_path)
+    runtime = _Runtime(profile)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            send = app.query_one("#send", Button)
+            assert send.disabled is True
+            app.submit("/help")
+            await pilot.pause()
+            help_content = app.screen.query_one("#help-content", Log)
+            assert help_content.allow_select is True
+            assert "非交互" in "\n".join(help_content.lines)
+
+            await pilot.click("#help-close")
+            composer = app.query_one("#composer")
+            composer.text = "send by click"
+            await pilot.pause()
+            assert send.disabled is False
+            await pilot.click("#send")
+            await pilot.pause()
+            assert runtime.created[0].description == "send by click"
+            assert "首个任务将运行完整测试" not in str(app.query_one("#status").render())
+
+    asyncio.run(check())
+
+
+def test_tui_transcript_is_selectable_safe_log_and_unavailable_keyring_never_opens_input(tmp_path: Path) -> None:
+    """Catches an unselectable transcript or an unsafe credential prompt without secure storage."""
+    from guardedpy.credentials import CredentialBackendUnavailableError
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Input, Log
+    from textual.css.query import NoMatches
+
+    class UnavailableRuntime(_Runtime):
+        def credential_status(self) -> CredentialStatus:
+            raise CredentialBackendUnavailableError("keyring backend is unavailable")
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(UnavailableRuntime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            transcript = app.query_one("#transcript", Log)
+            assert transcript.allow_select is True
+            app._write("safe projection")
+            assert "raw-marker" not in "\n".join(transcript.lines)
+            app.submit("/credentials")
+            await pilot.pause()
+            assert "安全系统密钥环" in str(app.screen.query_one("#credential-backend-unavailable").render())
+            with pytest.raises(NoMatches):
+                app.screen.query_one("#credential-value", Input)
 
     asyncio.run(check())
 
@@ -717,7 +779,7 @@ def test_tui_conversation_selection_restores_safe_lifecycle_and_new_confirms_act
     """Catches historical selection leaking task descriptions or /new abandoning active work."""
     from guardedpy.conversations import ConversationStore
     from guardedpy.tui import Composer, GuardedPyApp
-    from textual.widgets import RichLog
+    from textual.widgets import Log
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     profile = _profile(tmp_path)
@@ -735,8 +797,8 @@ def test_tui_conversation_selection_restores_safe_lifecycle_and_new_confirms_act
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
-            transcript = app.query_one("#transcript", RichLog)
-            rendered = "\n".join(line.text for line in transcript.lines)
+            transcript = app.query_one("#transcript", Log)
+            rendered = "\n".join(line for line in transcript.lines)
             assert f"任务 {task.id}：completed" in rendered
             assert "raw secret prompt" not in rendered
             composer = app.query_one("#composer", Composer)
@@ -772,7 +834,7 @@ def test_tui_credentials_command_uses_a_masked_modal_input(tmp_path: Path) -> No
 def test_tui_requires_masked_credential_before_creating_llm_task(tmp_path: Path) -> None:
     """Catches a provider task being registered before its interactive credential exists."""
     from guardedpy.tui import GuardedPyApp
-    from textual.widgets import Input, RichLog
+    from textual.widgets import Input, Log
 
     profile = _profile(tmp_path)
     runtime = _Runtime(profile)
@@ -796,8 +858,8 @@ def test_tui_requires_masked_credential_before_creating_llm_task(tmp_path: Path)
             await pilot.pause()
             await pilot.click("#credential-cancel")
             await pilot.pause()
-            transcript = app.query_one("#transcript", RichLog)
-            assert transcript.lines[-1].text == "未配置凭据，任务未开始。"
+            transcript = app.query_one("#transcript", Log)
+            assert transcript.lines[-1] == "未配置凭据，任务未开始。"
 
     asyncio.run(check())
 

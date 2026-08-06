@@ -12,10 +12,11 @@ from textual.containers import Vertical
 from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, ListItem, ListView, RichLog, Static, TextArea
+from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.conversations import ConversationStore
+from guardedpy.credentials import CredentialBackendUnavailableError
 from guardedpy.mechanism_demo import ScenarioName, run_scenario
 from guardedpy.terminal import COMMANDS, lifecycle_lines, render_help, run_plain_session
 
@@ -34,6 +35,14 @@ class ComposerSubmitted(Message):
     def __init__(self, text: str) -> None:
         self.text = text
         super().__init__()
+
+
+class TranscriptLog(Log):
+    """Selectable log that preserves one fixed safe UI projection per line."""
+
+    def write(self, data: str, scroll_end: bool | None = None) -> "TranscriptLog":
+        super().write_lines([data], scroll_end=scroll_end)
+        return self
 
 
 class Composer(TextArea):
@@ -88,6 +97,34 @@ class SettingsScreen(ModalScreen[str | None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(str(event.item.query_one(Static).render()))
+
+
+class HelpScreen(ModalScreen[None]):
+    """Scrollable safe help, kept outside the task transcript."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(Log(id="help-content", highlight=False), Button("关闭", id="help-close"), id="help-modal")
+
+    def on_mount(self) -> None:
+        content = self.query_one("#help-content", Log)
+        for line in render_help():
+            content.write(line)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
+
+
+class CredentialBackendUnavailableScreen(ModalScreen[None]):
+    """Explain why a key cannot safely be accepted without a system keyring."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("安全系统密钥环不可用。请先安装或启动兼容的安全系统密钥环；GuardedPy 不会接受明文 Key。", id="credential-backend-unavailable"),
+            Button("关闭", id="credential-backend-close"),
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
 
 
 class ConversationScreen(ModalScreen[UUID | None]):
@@ -243,7 +280,9 @@ class GuardedPyApp(App[None]):
     CSS = """
     #status { height: 3; padding: 0 1; background: $panel; }
     #transcript { height: 1fr; border: round $primary; }
-    #composer { height: 5; border: round $accent; }
+    #composer-shell { height: 5; }
+    #composer { height: 5; border: round $accent; padding: 0 10 2 0; }
+    #send { dock: right; width: 8; height: 1; margin-top: 3; }
     #command-palette { display: none; height: auto; max-height: 12; border: round $secondary; }
     """
 
@@ -266,12 +305,12 @@ class GuardedPyApp(App[None]):
     def compose(self) -> ComposeResult:
         config = self.runtime.config
         yield Static(self._status_text(), id="status")
-        yield RichLog(id="transcript", wrap=True, highlight=False, markup=False)
+        yield TranscriptLog(id="transcript", highlight=False)
         yield ListView(
             *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}" ) for command in COMMANDS),
             id="command-palette",
         )
-        yield Composer(id="composer")
+        yield Vertical(Composer(id="composer"), Button("发送", id="send", disabled=True), id="composer-shell")
 
     def on_mount(self) -> None:
         if self.initial_task:
@@ -293,6 +332,7 @@ class GuardedPyApp(App[None]):
                 command = str(item.query_one(Static).render())
                 item.display = command.startswith(prefix)
             self._palette_index = -1
+            self.query_one("#send", Button).disabled = not bool(event.text_area.text.strip())
 
     def on_key(self, event: Any) -> None:
         if event.key == "ctrl+c" and self._active_task is not None:
@@ -396,7 +436,7 @@ class GuardedPyApp(App[None]):
             self._write("未知命令。")
             return
         if name == "/clear":
-            self.query_one("#transcript", RichLog).clear()
+            self.query_one("#transcript", Log).clear()
             return
         if name == "/new":
             if self._active_task is None:
@@ -412,12 +452,14 @@ class GuardedPyApp(App[None]):
                 self._write("会话：0")
             return
         if name == "/help":
-            for help_line in render_help():
-                self._write(help_line)
+            self.push_screen(HelpScreen())
             return
         if name == "/credentials":
             try:
                 configured = self.runtime.credential_status().configured
+            except CredentialBackendUnavailableError:
+                self.push_screen(CredentialBackendUnavailableScreen())
+                return
             except Exception:
                 self._write("凭据状态不可用。")
                 return
@@ -462,6 +504,8 @@ class GuardedPyApp(App[None]):
             return
         try:
             self.runtime.update_future_defaults(**{field: value})
+        except CredentialBackendUnavailableError:
+            self.push_screen(CredentialBackendUnavailableScreen())
         except Exception:
             self._write("设置未更新。")
             return
@@ -514,6 +558,9 @@ class GuardedPyApp(App[None]):
             return
         try:
             configured = self.runtime.credential_status().configured
+        except CredentialBackendUnavailableError:
+            self.push_screen(CredentialBackendUnavailableScreen())
+            return
         except Exception:
             self._write("凭据状态不可用。")
             return
@@ -570,7 +617,7 @@ class GuardedPyApp(App[None]):
 
     def _new_conversation(self) -> None:
         self._conversation_id = None
-        self.query_one("#transcript", RichLog).clear()
+        self.query_one("#transcript", Log).clear()
         composer = self.query_one("#composer", Composer)
         composer.focus()
         composer.cursor_location = composer.document.end
@@ -583,7 +630,7 @@ class GuardedPyApp(App[None]):
     def _conversation_selected(self, conversation_id: UUID | None) -> None:
         if conversation_id is None:
             return
-        transcript = self.query_one("#transcript", RichLog)
+        transcript = self.query_one("#transcript", Log)
         transcript.clear()
         for task_id in self._conversation_store_for_session().tasks(conversation_id):
             task = self.runtime.task(task_id)
@@ -674,7 +721,11 @@ class GuardedPyApp(App[None]):
                     return
 
     def _write(self, value: object) -> None:
-        self.query_one("#transcript", RichLog).write(str(value))
+        self.query_one("#transcript", Log).write(str(value))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "send":
+            self.submit(self.query_one("#composer", Composer).text)
 
     def _status_text(self, task: TaskState | None = None) -> str:
         config = self.runtime.config
@@ -682,7 +733,7 @@ class GuardedPyApp(App[None]):
         if active is None:
             return (
                 f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort}\n"
-                "已就绪 · 尚未提交任务 · 首个任务将运行完整测试"
+                "已就绪 · 尚未提交任务"
             )
         baseline = active.path.value
         status = active.status.value
