@@ -1197,6 +1197,53 @@ def test_transcript_presenter_coalesces_assistant_deltas_by_item_id() -> None:
     assert (second.item_id, second.text, second.replace) == (item_id, "助手：第一段第二段", True)
 
 
+def test_tui_renders_continuous_session_events_without_task_audit_polling(tmp_path: Path) -> None:
+    """Catches the Task 22 surface keeping new sessions on the retired task renderer."""
+    import asyncio
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Log
+
+    session_id = uuid4()
+    turn_id = uuid4()
+
+    class _Conversation:
+        def create_session(self, project_title: str) -> object:
+            assert project_title == str(profile.root)
+            return session_id
+
+        def begin_turn(self, received_session: object, text: str, mode: str) -> tuple[object, SessionEvent]:
+            assert received_session == session_id
+            assert (text, mode) == ("hello", "normal")
+            return turn_id, SessionEvent(session_id, turn_id, 1, "user_message", uuid4(), "hello")
+
+        def run_turn(self, received_session: object, received_turn: object) -> tuple[SessionEvent, ...]:
+            assert (received_session, received_turn) == (session_id, turn_id)
+            item_id = uuid4()
+            return (
+                SessionEvent(session_id, turn_id, 2, "assistant_item_started", item_id),
+                SessionEvent(session_id, turn_id, 3, "assistant_text_delta", item_id, "hello "),
+                SessionEvent(session_id, turn_id, 4, "assistant_text_delta", item_id, "there"),
+                SessionEvent(session_id, turn_id, 5, "assistant_item_completed", item_id),
+                SessionEvent(session_id, turn_id, 6, "turn_completed"),
+            )
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile, conversation=_Conversation())
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("hello")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            transcript = app.query_one("#transcript", Log)
+            assert transcript.lines[:-1] == ["› hello", "助手：hello there", "本轮回复已完成。"]
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize(
     ("kind", "expected"),
     [
