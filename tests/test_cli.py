@@ -63,19 +63,38 @@ def test_help_exposes_only_the_cli_only_surface(capsys: object) -> None:
 
 def test_direct_task_discovers_cwd_and_uses_safe_non_tty_lifecycle(tmp_path: Path, monkeypatch: object) -> None:
     """Catches direct CLI work using stale project setup or a separate task runner."""
+    from uuid import uuid4
+
     from guardedpy.cli import main
+    from guardedpy.conversation import SessionEvent
 
     _project(tmp_path)
     monkeypatch.chdir(tmp_path)  # type: ignore[attr-defined]
     runtime = _Runtime()
+    session_id, turn_id = uuid4(), uuid4()
+
+    class Conversation:
+        def create_session(self, project_title: str) -> object:
+            assert project_title == str(tmp_path.resolve())
+            return session_id
+
+        def begin_turn(self, session: object, text: str, mode: str) -> tuple[object, SessionEvent]:
+            assert (session, text, mode) == (session_id, "inspect project", "normal")
+            return turn_id, SessionEvent(session_id, turn_id, 1, "user_message", uuid4(), text)
+
+        def run_turn(self, session: object, turn: object) -> tuple[SessionEvent, ...]:
+            assert (session, turn) == (session_id, turn_id)
+            return (SessionEvent(session_id, turn_id, 2, "turn_completed"),)
+
+    monkeypatch.setattr("guardedpy.cli.continuous_runtime", lambda local, profile: Conversation())  # type: ignore[attr-defined]
     output = StringIO()
 
     code = main(["inspect project"], runtime_factory=lambda: runtime, stdin=StringIO(), stdout=output)
 
     assert code == 0
     assert runtime.setup_profiles[0].root == tmp_path.resolve()
-    assert runtime.created[0].description == "inspect project"
-    assert "completed" in output.getvalue()
+    assert runtime.created == []
+    assert output.getvalue().splitlines() == ["› inspect project", "本轮回复已完成。"]
 
 
 def test_direct_task_stops_before_creation_without_a_credential(tmp_path: Path, monkeypatch: object) -> None:

@@ -23,7 +23,7 @@ from guardedpy.llm import DeepSeekClient, DeepSeekConversationModel
 from guardedpy.mechanism_demo import run_all_scenarios
 from guardedpy.orchestrator import TaskOrchestrator
 from guardedpy.runtime import ConversationRuntime, LocalRuntime, RuntimeServices
-from guardedpy.terminal import run_noninteractive_task, run_plain_session
+from guardedpy.terminal import run_plain_conversation
 
 
 def local_runtime() -> LocalRuntime:
@@ -140,11 +140,13 @@ def main(
     runtime = runtime_factory()
     runtime.setup(profile, api_key=None)
     if not source.isatty() or not output.isatty():
-        if arguments.target:
-            from guardedpy.domain import TaskIntent
-
-            return run_noninteractive_task(runtime, arguments.target, TaskIntent.CODING, output)
-        return run_plain_session(runtime, source, output)
+        if not runtime.credential_status().configured:
+            output.write("需要先在交互终端配置凭据。\n")
+            return 1
+        return run_plain_conversation(
+            continuous_runtime(runtime, profile), str(profile.root), source, output,
+            arguments.target,
+        )
 
     from guardedpy.tui import GuardedPyApp
 

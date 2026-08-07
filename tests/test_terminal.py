@@ -286,3 +286,38 @@ def test_plain_read_only_subprocess_commands_use_the_configured_time_budget(
 
     assert code == 0
     assert captured["timeout"] == 5
+
+
+def test_plain_continuous_session_renders_events_and_stops_nonzero_for_approval() -> None:
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.terminal import run_plain_conversation
+
+    session_id, turn_id, item_id, approval_id = uuid4(), uuid4(), uuid4(), uuid4()
+
+    class Runtime:
+        def create_session(self, project_title: str) -> object:
+            assert project_title == "project"
+            return session_id
+
+        def begin_turn(self, received: object, text: str, mode: str) -> tuple[object, SessionEvent]:
+            assert (received, text, mode) == (session_id, "repair", "normal")
+            return turn_id, SessionEvent(session_id, turn_id, 1, "user_message", item_id, text)
+
+        def run_turn(self, received_session: object, received_turn: object) -> tuple[SessionEvent, ...]:
+            assert (received_session, received_turn) == (session_id, turn_id)
+            return (
+                SessionEvent(session_id, turn_id, 2, "assistant_text_delta", item_id, "Checking."),
+                SessionEvent(
+                    session_id, turn_id, 3, "approval_requested", item_id,
+                    data={"approval_id": str(approval_id)},
+                ),
+            )
+
+    output = StringIO()
+
+    code = run_plain_conversation(Runtime(), "project", StringIO("repair\n"), output)
+
+    assert code == 1
+    assert output.getvalue().splitlines() == ["› repair", "助手：Checking.", "需要精确审批，非交互模式已安全停止。"]

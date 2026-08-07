@@ -9,6 +9,7 @@ from typing import Any, TextIO
 from uuid import UUID
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
+from guardedpy.conversation import SessionEvent
 from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialBackendUnavailableError
 from guardedpy.events import StoredRunEvent
@@ -251,6 +252,45 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
         if code:
             return code
     return 0
+
+
+def run_plain_conversation(
+    runtime: Any,
+    project_title: str,
+    input_stream: TextIO,
+    output: TextIO,
+    initial_text: str | None = None,
+) -> int:
+    """Consume the continuous SessionEvent stream without approving side effects."""
+    session_id = runtime.create_session(project_title)
+    requests = ([initial_text] if initial_text else []) + list(input_stream)
+    for raw in requests:
+        text = raw.strip()
+        if not text:
+            continue
+        if text == "/exit":
+            return 0
+        turn_id, user_event = runtime.begin_turn(session_id, text, "normal")
+        _render_conversation_event(user_event, output)
+        for event in runtime.run_turn(session_id, turn_id):
+            if event.kind == "approval_requested":
+                output.write("需要精确审批，非交互模式已安全停止。\n")
+                return 1
+            _render_conversation_event(event, output)
+    return 0
+
+
+def _render_conversation_event(event: SessionEvent, output: TextIO) -> None:
+    if event.kind == "user_message":
+        output.write(f"› {event.text}\n")
+    elif event.kind == "assistant_text_delta":
+        output.write(f"助手：{event.text}\n")
+    elif event.kind == "turn_interrupted":
+        output.write("本轮回复已中断。\n")
+    elif event.kind == "turn_completed":
+        output.write("本轮回复已完成。\n")
+    elif event.kind == "turn_failed":
+        output.write("本轮回复未完成。\n")
 
 
 def _render_history(runtime: Any, output: TextIO) -> None:
