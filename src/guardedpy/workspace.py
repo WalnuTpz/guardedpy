@@ -13,6 +13,8 @@ from guardedpy.feedback import PytestRun
 
 
 _MAX_READ_LINES = 200
+_MAX_LISTED_FILES = 200
+_MAX_OUTPUT_CHARS = 32 * 1024
 _HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
 )
@@ -60,9 +62,11 @@ class Workspace:
             sorted(
                 entry.relative_to(self.root).as_posix()
                 for entry in target.rglob("*")
-                if entry.is_file() and entry.resolve().is_relative_to(self.root)
+                if entry.is_file()
+                and ".git" not in entry.relative_to(self.root).parts
+                and entry.resolve().is_relative_to(self.root)
             )
-        )
+        )[:_MAX_LISTED_FILES]
         return ToolResult(True, "Listed project files", {"files": files})
 
     def read_file(self, path: PurePosixPath, offset: int, limit: int) -> ToolResult:
@@ -154,6 +158,22 @@ class Workspace:
                 True,
             )
         return PytestRun(completed.returncode, completed.stdout, completed.stderr, False)
+
+    def git_diff(self) -> ToolResult:
+        return self._git("diff", "--")
+
+    def git_status(self) -> ToolResult:
+        return self._git("status", "--short")
+
+    def _git(self, *arguments: str) -> ToolResult:
+        completed = subprocess.run(
+            ("git", "-C", str(self.root), *arguments),
+            capture_output=True, text=True, timeout=self.config.timeout_seconds,
+            check=False, shell=False,
+        )
+        if completed.returncode:
+            return ToolResult(False, "Project is not a Git work tree", {"reason": "not_a_git_repository"})
+        return ToolResult(True, "Read Git state", {"output": completed.stdout[:_MAX_OUTPUT_CHARS]})
 
     def _inside_root(self, path: PurePosixPath) -> Path | None:
         candidate = (self.root / Path(path)).resolve()
