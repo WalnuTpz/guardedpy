@@ -260,8 +260,8 @@ def test_local_wheel_runs_the_cli_and_sdist_is_scanned_without_the_source_checko
     assert "server" not in help_result.stdout.lower()
 
     task_result = _run([str(guardedpy), "inspect this project"], cwd=target, env=command_env)
-    assert task_result.returncode == 0, task_result.stderr
-    assert "blocked" in task_result.stdout.lower()
+    assert task_result.returncode == 1, task_result.stderr
+    assert task_result.stdout == "需要先在交互终端配置凭据。\n"
 
     demo_result = _run([str(guardedpy), "demo"], cwd=target, env=command_env)
     assert demo_result.returncode == 0, demo_result.stderr
