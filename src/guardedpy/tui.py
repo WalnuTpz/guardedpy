@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from io import StringIO
 from threading import Thread
 from typing import Any, Literal
@@ -15,6 +16,7 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
 
+from guardedpy.conversation import SessionEvent
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialBackendUnavailableError
@@ -36,6 +38,46 @@ class ComposerSubmitted(Message):
     def __init__(self, text: str) -> None:
         self.text = text
         super().__init__()
+
+
+@dataclass(frozen=True)
+class TranscriptUpdate:
+    """One safe, renderer-agnostic transcript change."""
+
+    item_id: UUID | None
+    text: str
+    replace: bool = False
+
+
+@dataclass
+class TranscriptPresenter:
+    """Project continuous-session events to text safe for a transcript."""
+
+    _assistant_text: dict[UUID, str] = field(default_factory=dict)
+
+    def present(self, event: SessionEvent) -> TranscriptUpdate | None:
+        """Return the visible update for one event without exposing tool payloads."""
+        if event.kind == "user_message":
+            return TranscriptUpdate(event.item_id, f"› {event.text}")
+        if event.kind == "assistant_text_delta":
+            if event.item_id is None:
+                return None
+            text = self._assistant_text.get(event.item_id, "") + event.text
+            self._assistant_text[event.item_id] = text
+            return TranscriptUpdate(event.item_id, f"助手：{text}", replace=True)
+        status = {
+            "tool_item_started": "正在使用受控工具。",
+            "tool_output": "工具已返回受限结果。",
+            "tool_item_completed": "工具执行完成。",
+            "approval_requested": "需要精确审批。",
+            "approval_resolved": "审批已处理。",
+            "turn_completed": "本轮回复已完成。",
+            "turn_interrupted": "本轮回复已中断。",
+            "turn_failed": "本轮回复未完成。",
+        }.get(event.kind)
+        if status is None:
+            return None
+        return TranscriptUpdate(event.item_id, status)
 
 
 class TranscriptLog(Log):

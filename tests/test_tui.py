@@ -1158,3 +1158,75 @@ def test_demo_selector_presents_fixed_request_then_runs_selected_scenario(
             assert calls == ["failure_feedback_corrects"]
 
     asyncio.run(check())
+
+
+def test_transcript_presenter_coalesces_assistant_deltas_by_item_id() -> None:
+    """Catches streaming text being rendered as separate transcript lines."""
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import TranscriptPresenter
+
+    session_id = uuid4()
+    turn_id = uuid4()
+    item_id = uuid4()
+    presenter = TranscriptPresenter()
+
+    first = presenter.present(
+        SessionEvent(
+            session_id=session_id,
+            turn_id=turn_id,
+            sequence=1,
+            kind="assistant_text_delta",
+            item_id=item_id,
+            text="第一段",
+        )
+    )
+    second = presenter.present(
+        SessionEvent(
+            session_id=session_id,
+            turn_id=turn_id,
+            sequence=2,
+            kind="assistant_text_delta",
+            item_id=item_id,
+            text="第二段",
+        )
+    )
+
+    assert (first.item_id, first.text, first.replace) == (item_id, "助手：第一段", True)
+    assert (second.item_id, second.text, second.replace) == (item_id, "助手：第一段第二段", True)
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("tool_item_started", "正在使用受控工具。"),
+        ("tool_output", "工具已返回受限结果。"),
+        ("tool_item_completed", "工具执行完成。"),
+        ("approval_requested", "需要精确审批。"),
+        ("approval_resolved", "审批已处理。"),
+    ],
+)
+def test_transcript_presenter_uses_safe_tool_and_approval_status_wording(
+    kind: str, expected: str
+) -> None:
+    """Catches raw tool details or retired audit prefixes entering the transcript."""
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import TranscriptPresenter
+
+    update = TranscriptPresenter().present(
+        SessionEvent(
+            session_id=uuid4(),
+            turn_id=uuid4(),
+            sequence=1,
+            kind=kind,  # type: ignore[arg-type]
+            item_id=uuid4(),
+            text="untrusted tool payload",
+            data={"detail": "untrusted tool payload"},
+        )
+    )
+
+    assert update.text == expected
+    assert all(prefix not in update.text for prefix in ("GuardedPy：动作", "GuardedPy：策略", "GuardedPy：反馈", "GuardedPy：停止"))
