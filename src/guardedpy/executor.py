@@ -49,22 +49,36 @@ class ToolExecutor:
         if call.name == "apply_patch":
             return self._patch(turn, call, arguments)
         if call.name == "run_pytest":
-            nodes = arguments.get("nodes", ())
+            nodes = arguments.get("nodes", [])
             if not isinstance(nodes, list) or not all(isinstance(node, str) for node in nodes) or not len(nodes) <= 20:
                 return self._failure(call, "invalid_tool_call")
             run = self._workspace.run_pytest(tuple(nodes))
             feedback = self._feedback.collect(run)
             if not nodes and feedback.kind.value == "passed":
                 turn.needs_full_verification = False
-            return ToolExecution(call.id, "allow", "ok", "pytest completed", {
-                "kind": feedback.kind.value, "nodes": feedback.node_ids, "excerpt": feedback.excerpt
+            kind = feedback.kind.value
+            return ToolExecution(call.id, "allow", kind, "pytest completed", {
+                "ok": kind == "passed", "code": kind, "summary": "pytest completed",
+                "feedback": {
+                    "kind": kind, "node_ids": list(feedback.node_ids),
+                    "excerpt": feedback.excerpt,
+                },
             }, feedback=feedback)
         if call.name == "git_diff":
             return self._result(call, self._workspace.git_diff())
         if call.name == "git_status":
             return self._result(call, self._workspace.git_status())
         if call.name == "delete_path":
-            return self._result(call, self._workspace.delete_path(self._path(arguments, "path")))
+            result = self._workspace.delete_path(self._path(arguments, "path"))
+            execution = self._result(call, result)
+            if result.ok:
+                path = self._path(arguments, "path").as_posix()
+                turn.needs_full_verification = True
+                return ToolExecution(
+                    call.id, "allow", execution.code, execution.summary,
+                    execution.provider_result, (path,),
+                )
+            return execution
         return self._failure(call, "invalid_tool_call")
 
     def _read(self, turn: Turn, call: ToolCall, arguments: dict[str, object]) -> ToolExecution:
@@ -114,7 +128,11 @@ class ToolExecutor:
     @staticmethod
     def _result(call: ToolCall, result) -> ToolExecution:
         code = "ok" if result.ok else str(result.data.get("reason", "tool_failed"))
-        return ToolExecution(call.id, "allow", code, result.summary, result.data)
+        code = {"invalid_patch": "patch_invalid", "hunk_mismatch": "patch_not_applied"}.get(code, code)
+        return ToolExecution(
+            call.id, "allow", code, result.summary,
+            {"ok": result.ok, "code": code, "summary": result.summary, **result.data},
+        )
 
 
 def _existing_patch_paths(diff: str) -> tuple[str, ...]:
