@@ -73,7 +73,7 @@ class RuntimeServices:
     """Injectable non-secret services used by the local runtime."""
 
     credentials: CredentialPort
-    orchestrator_factory: OrchestratorFactory
+    orchestrator_factory: OrchestratorFactory | None = None
 
 
 class RuntimeBusyError(RuntimeError):
@@ -354,6 +354,8 @@ class LocalRuntime:
             snapshot = current.model_copy(deep=True)
             task = task.model_copy(update={"config": snapshot}, deep=True)
             event_store = EventStore(root)
+            if self._services.orchestrator_factory is None:
+                raise RuntimeError("retired task runtime is unavailable")
             orchestrator = self._services.orchestrator_factory(root, snapshot, memory_store)
             index_path = local_state_path()
             previous_index = _snapshot_file(index_path)
