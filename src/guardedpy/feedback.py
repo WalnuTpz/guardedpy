@@ -54,6 +54,8 @@ class FeedbackCollector:
             return PytestFeedback(FeedbackKind.PASSED, (), "")
 
         collection_nodes = self._node_ids(_COLLECTION_NODE, output)
+        if run.exit_code == 2:
+            return PytestFeedback(FeedbackKind.COLLECTION_ERROR, collection_nodes, self._excerpt(output))
         if collection_nodes:
             return PytestFeedback(
                 FeedbackKind.COLLECTION_ERROR, collection_nodes, self._excerpt(output)

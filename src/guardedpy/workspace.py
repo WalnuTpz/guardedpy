@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import tempfile
 from typing import Any
 
 from guardedpy.config import HarnessConfig
@@ -78,9 +81,23 @@ class Workspace:
         if offset < 0 or limit < 1 or limit > _MAX_READ_LINES:
             return ToolResult(False, "Page is outside supported bounds", {"reason": "invalid_page"})
 
-        lines = target.read_text().splitlines(keepends=True)
-        content = "".join(lines[offset : offset + limit])
-        next_offset = offset + len(lines[offset : offset + limit])
+        content_bytes = target.read_bytes()
+        try:
+            text = content_bytes.decode()
+        except UnicodeDecodeError:
+            return ToolResult(False, "Path is not a text file", {"reason": "not_a_text_file"})
+        lines = text.splitlines(keepends=True)
+        selected = lines[offset : offset + limit]
+        page: list[str] = []
+        size = 0
+        for line in selected:
+            encoded = line.encode()
+            if size + len(encoded) > _MAX_OUTPUT_CHARS:
+                break
+            page.append(line)
+            size += len(encoded)
+        content = "".join(page)
+        next_offset = offset + len(page)
         return ToolResult(
             True,
             "Read project file",
@@ -88,6 +105,8 @@ class Workspace:
                 "path": target.relative_to(self.root).as_posix(),
                 "content": content,
                 "next_offset": next_offset,
+                "sha256": sha256(content_bytes).hexdigest(),
+                "complete": offset == 0 and next_offset == len(lines),
             },
         )
 
@@ -101,6 +120,8 @@ class Workspace:
             target = self._inside_root(file_patch.path)
             if target is None:
                 return self._outside_root()
+            if not self._patch_target_allowed(file_patch.path, target, file_patch.create):
+                return ToolResult(False, "Patch target is not permitted", {"reason": "patch_invalid"})
             if file_patch.create:
                 if target.exists() or not target.parent.is_dir():
                     return ToolResult(False, "Patch target cannot be created", {"reason": "invalid_patch"})
@@ -115,8 +136,8 @@ class Workspace:
                 return ToolResult(False, "Patch hunk does not match the current file", {"reason": "hunk_mismatch"})
             prepared[target] = updated
 
-        for target, content in prepared.items():
-            target.write_text(content)
+        if not self._atomic_replace(prepared):
+            return ToolResult(False, "Patch could not be applied", {"reason": "patch_not_applied"})
         return ToolResult(
             True,
             "Applied unified patch",
@@ -127,10 +148,14 @@ class Workspace:
         target = self._inside_root(path)
         if target is None:
             return self._outside_root()
-        if not target.is_file():
-            return ToolResult(False, "Path is not a file", {"reason": "not_a_file"})
-
-        target.unlink()
+        if any(part.startswith(".") for part in path.parts) or self._contains_symlink(path) or target.is_symlink():
+            return ToolResult(False, "Path is protected", {"reason": "protected_path"})
+        if target.is_file():
+            target.unlink()
+        elif target.is_dir() and not any(target.iterdir()):
+            target.rmdir()
+        else:
+            return ToolResult(False, "Path cannot be deleted", {"reason": "not_deletable"})
         return ToolResult(
             True,
             "Deleted project file",
@@ -172,14 +197,73 @@ class Workspace:
             check=False, shell=False,
         )
         if completed.returncode:
-            return ToolResult(False, "Project is not a Git work tree", {"reason": "not_a_git_repository"})
-        return ToolResult(True, "Read Git state", {"output": completed.stdout[:_MAX_OUTPUT_CHARS]})
+            output = completed.stderr.lower()
+            reason = "not_a_git_repository" if "not a git repository" in output else "git_failed"
+            return ToolResult(False, "Git command failed", {"reason": reason})
+        return ToolResult(True, "Read Git state", {"output": self._bounded_output(completed.stdout)})
 
     def _inside_root(self, path: PurePosixPath) -> Path | None:
-        candidate = (self.root / Path(path)).resolve()
-        if candidate.is_relative_to(self.root):
+        if path.is_absolute() or ".." in path.parts or "\\" in path.as_posix():
+            return None
+        candidate = self.root / Path(path)
+        if candidate.resolve().is_relative_to(self.root):
             return candidate
         return None
+
+    def _patch_target_allowed(self, path: PurePosixPath, target: Path, create: bool) -> bool:
+        if self._contains_symlink(path) or target.is_symlink():
+            return False
+        if not any(path.is_relative_to(directory) for directory in self.config.source_dirs + self.config.test_dirs):
+            return False
+        if create:
+            return target.parent.is_dir()
+        return target.is_file()
+
+    def _contains_symlink(self, path: PurePosixPath) -> bool:
+        current = self.root
+        for part in path.parts:
+            current /= part
+            if current.is_symlink():
+                return True
+        return False
+
+    @staticmethod
+    def _bounded_output(output: str) -> str:
+        limited_lines = output.splitlines(keepends=True)[:200]
+        result = "".join(limited_lines)
+        return result.encode()[:_MAX_OUTPUT_CHARS].decode(errors="ignore")
+
+    @staticmethod
+    def _atomic_replace(prepared: dict[Path, str]) -> bool:
+        staged: dict[Path, Path] = {}
+        backups: dict[Path, Path | None] = {}
+        replaced: list[Path] = []
+        try:
+            for target, content in prepared.items():
+                with tempfile.NamedTemporaryFile(dir=target.parent, delete=False, mode="w") as handle:
+                    handle.write(content)
+                    staged[target] = Path(handle.name)
+                if target.exists():
+                    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                        handle.write(target.read_bytes())
+                        backups[target] = Path(handle.name)
+                else:
+                    backups[target] = None
+            for target, temporary in staged.items():
+                os.replace(temporary, target)
+                replaced.append(target)
+            return True
+        except OSError:
+            for target in reversed(replaced):
+                backup = backups[target]
+                if backup is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, target)
+            return False
+        finally:
+            for temporary in (*staged.values(), *(item for item in backups.values() if item is not None)):
+                temporary.unlink(missing_ok=True)
 
     def _validate_pytest_targets(self, targets: tuple[str, ...]) -> None:
         test_roots = tuple((self.root / path).resolve() for path in self.config.test_dirs)

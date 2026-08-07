@@ -75,10 +75,9 @@ class ToolExecutor:
         result = self._workspace.read_file(path, offset, limit)
         execution = self._result(call, result)
         if result.ok:
-            target = self._workspace.root / path
-            digest = sha256(target.read_bytes()).hexdigest()
-            complete = result.data["next_offset"] >= len(target.read_text().splitlines())
-            turn.reads[path.as_posix()] = ReadRecord(path.as_posix(), digest, complete)
+            turn.reads[path.as_posix()] = ReadRecord(
+                path.as_posix(), str(result.data["sha256"]), bool(result.data["complete"])
+            )
         return execution
 
     def _patch(self, turn: Turn, call: ToolCall, arguments: dict[str, object]) -> ToolExecution:
