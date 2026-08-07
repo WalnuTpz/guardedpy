@@ -1,4 +1,6 @@
 from pathlib import Path, PurePosixPath
+import stat
+from dataclasses import replace
 
 from guardedpy.workspace import Workspace
 
@@ -50,6 +52,47 @@ def test_list_files_returns_only_root_relative_files(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert result.data["files"] == ("README.md", "src/module.py")
+
+
+def test_list_files_excludes_hidden_paths(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "visible.py").write_text("pass\n")
+    (tmp_path / "src" / ".env").write_text("secret\n")
+
+    result = Workspace(tmp_path, safe_config(tmp_path)).list_files()
+
+    assert result.data["files"] == ("src/visible.py",)
+
+
+def test_patch_rejects_docs_and_hidden_paths_even_when_source_root_is_dot(tmp_path: Path) -> None:
+    config = safe_config(tmp_path)
+    config = config.model_copy(update={"profile": replace(config.profile, source_dirs=(PurePosixPath("."),))})
+    readme = tmp_path / "README.md"
+    hidden = tmp_path / "src" / ".env"
+    readme.write_text("old\n")
+    hidden.write_text("old\n")
+    workspace = Workspace(tmp_path, config)
+
+    docs = workspace.apply_patch("--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n")
+    protected = workspace.apply_patch("--- a/src/.env\n+++ b/src/.env\n@@ -1 +1 @@\n-old\n+new\n")
+
+    assert docs.data["reason"] == "patch_invalid"
+    assert protected.data["reason"] == "patch_invalid"
+    assert readme.read_text() == hidden.read_text() == "old\n"
+
+
+def test_patch_preserves_original_file_mode(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "script.py"
+    target.write_text("old\n")
+    target.chmod(0o755)
+
+    result = Workspace(tmp_path, safe_config(tmp_path)).apply_patch(
+        "--- a/src/script.py\n+++ b/src/script.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+
+    assert result.ok is True
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
 
 
 def test_read_file_returns_a_bounded_line_page(tmp_path: Path) -> None:

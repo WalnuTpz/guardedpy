@@ -22,6 +22,7 @@ _USEFUL_OUTPUT = re.compile(
 )
 _ASSERTION_EVIDENCE = re.compile(r"^E\s+(?:AssertionError\b|assert\b)", re.MULTILINE)
 _ASSERTION_SUMMARY = re.compile(r"(?:AssertionError\b|\bassert(?:ion failed)?\b)", re.IGNORECASE)
+_ZERO_COLLECTED = re.compile(r"(?:collected 0 items|no tests ran)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,10 @@ class FeedbackCollector:
         output = "\n".join(part for part in (run.stdout, run.stderr) if part)
         if run.timed_out:
             return PytestFeedback(FeedbackKind.TIMEOUT, (), self._excerpt(output))
-        if run.exit_code == 0:
+        if run.exit_code == 0 and not _ZERO_COLLECTED.search(output):
             return PytestFeedback(FeedbackKind.PASSED, (), "")
+        if run.exit_code == 0:
+            return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), self._excerpt(output))
 
         collection_nodes = self._node_ids(_COLLECTION_NODE, output)
         if run.exit_code == 2:

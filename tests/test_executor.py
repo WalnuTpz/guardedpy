@@ -6,6 +6,7 @@ from uuid import uuid4
 from conftest import safe_config
 from guardedpy.conversation import ToolCall, Turn
 from guardedpy.executor import ToolExecutor
+from guardedpy.feedback import PytestRun
 
 
 def test_executor_reads_then_applies_a_source_patch_and_marks_verification(tmp_path: Path) -> None:
@@ -64,3 +65,50 @@ def test_tail_read_does_not_authorize_patch_of_an_unread_prefix(tmp_path: Path) 
 
     assert result.code == "read_required"
     assert target.read_text() == "first\nsecond\n"
+
+
+def test_executor_keeps_verification_for_zero_collection(tmp_path: Path, monkeypatch: object) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_real.py").write_text("def test_real(): assert False\n")
+    turn = Turn(id=uuid4(), session_id=uuid4(), initial_text="repair", mode="normal", needs_full_verification=True)
+    executor = ToolExecutor(tmp_path, safe_config(tmp_path))
+    monkeypatch.setattr(executor._workspace, "run_pytest", lambda nodes: PytestRun(0, "collected 0 items\n", "", False))  # type: ignore[attr-defined]
+
+    result = executor.execute(turn, uuid4(), ToolCall("test", "run_pytest", "{}"))
+
+    assert result.provider_result["kind"] == "execution_error"
+    assert turn.needs_full_verification is True
+
+
+def test_executor_normalizes_pytest_nodes_before_provider_output(tmp_path: Path, monkeypatch: object) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_real.py").write_text("def test_real(): assert False\n")
+    executor = ToolExecutor(tmp_path, safe_config(tmp_path))
+    turn = Turn(id=uuid4(), session_id=uuid4(), initial_text="repair", mode="normal")
+    monkeypatch.setattr(
+        executor._workspace, "run_pytest",
+        lambda nodes: PytestRun(1, "FAILED tests/test_real.py::test_real - AssertionError\nFAILED ../outside.py::test_x - AssertionError\n", "", False),
+    )  # type: ignore[attr-defined]
+
+    result = executor.execute(turn, uuid4(), ToolCall("test", "run_pytest", "{}"))
+
+    assert result.provider_result["nodes"] == ("tests/test_real.py::test_real",)
+
+
+def test_existing_patch_with_header_like_removed_content_uses_only_real_headers(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    target = tmp_path / "src" / "value.py"
+    target.write_text("-- marker\n")
+    turn = Turn(id=uuid4(), session_id=uuid4(), initial_text="repair", mode="normal")
+    executor = ToolExecutor(tmp_path, safe_config(tmp_path))
+    executor.execute(turn, uuid4(), ToolCall("read", "read_file", '{"path":"src/value.py"}'))
+
+    result = executor.execute(turn, uuid4(), ToolCall(
+        "patch", "apply_patch", '{"unified_diff":"--- a/src/value.py\\n+++ b/src/value.py\\n@@ -1 +1 @@\\n--- marker\\n++ marker\\n"}'
+    ))
+
+    assert result.code == "ok"
+    assert target.read_text() == "+ marker\n"

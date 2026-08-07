@@ -66,7 +66,7 @@ class Workspace:
                 entry.relative_to(self.root).as_posix()
                 for entry in target.rglob("*")
                 if entry.is_file()
-                and ".git" not in entry.relative_to(self.root).parts
+                and not any(part.startswith(".") for part in entry.relative_to(self.root).parts)
                 and entry.resolve().is_relative_to(self.root)
             )
         )[:_MAX_LISTED_FILES]
@@ -211,7 +211,13 @@ class Workspace:
         return None
 
     def _patch_target_allowed(self, path: PurePosixPath, target: Path, create: bool) -> bool:
-        if self._contains_symlink(path) or target.is_symlink():
+        protected_names = {"README", "README.md", "pyproject.toml", "setup.cfg", "tox.ini"}
+        if (
+            any(part.startswith(".") or part in {"docs", "config"} for part in path.parts)
+            or path.name in protected_names
+            or self._contains_symlink(path)
+            or target.is_symlink()
+        ):
             return False
         if not any(path.is_relative_to(directory) for directory in self.config.source_dirs + self.config.test_dirs):
             return False
@@ -240,13 +246,17 @@ class Workspace:
         replaced: list[Path] = []
         try:
             for target, content in prepared.items():
+                mode = target.stat().st_mode & 0o777 if target.exists() else None
                 with tempfile.NamedTemporaryFile(dir=target.parent, delete=False, mode="w") as handle:
                     handle.write(content)
                     staged[target] = Path(handle.name)
+                if mode is not None:
+                    os.chmod(staged[target], mode)
                 if target.exists():
                     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
                         handle.write(target.read_bytes())
                         backups[target] = Path(handle.name)
+                    os.chmod(backups[target], mode)
                 else:
                     backups[target] = None
             for target, temporary in staged.items():
@@ -312,14 +322,18 @@ class Workspace:
                 patch_path = old_path
 
             hunks: list[_Hunk] = []
-            while index < len(lines) and not lines[index].startswith("--- "):
+            while index < len(lines):
+                if lines[index].startswith("--- ") and index + 1 < len(lines) and lines[index + 1].startswith("+++ "):
+                    break
                 match = _HUNK_HEADER.match(lines[index].rstrip("\n"))
                 if match is None:
                     return None
                 old_start, old_count, _new_start, new_count = match.groups()
                 index += 1
                 hunk_lines: list[str] = []
-                while index < len(lines) and not lines[index].startswith(("@@ ", "--- ")):
+                while index < len(lines):
+                    if lines[index].startswith("@@ ") or (lines[index].startswith("--- ") and index + 1 < len(lines) and lines[index + 1].startswith("+++ ")):
+                        break
                     if not lines[index].startswith((" ", "+", "-")):
                         return None
                     hunk_lines.append(lines[index])
@@ -332,14 +346,7 @@ class Workspace:
                     return None
                 if sum(line[0] in " +" for line in hunk_lines) != parsed_new_count:
                     return None
-                hunks.append(
-                    _Hunk(
-                        int(old_start),
-                        parsed_old_count,
-                        parsed_new_count,
-                        tuple(hunk_lines),
-                    )
-                )
+                hunks.append(_Hunk(int(old_start), parsed_old_count, parsed_new_count, tuple(hunk_lines)))
             if not hunks:
                 return None
             patches.append(_FilePatch(PurePosixPath(patch_path), create, tuple(hunks)))
