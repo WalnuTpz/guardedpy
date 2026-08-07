@@ -288,40 +288,27 @@ class ConversationAgent:
     ) -> Iterator[SessionEvent]:
         session = self._session(session_id)
         turn = self._active_turn(session, turn_id, allow_cancelling=True)
-
         while True:
             yield self._event(turn, "turn_started")
-            if turn.cancelled:
-                terminal, promoted = self._terminate(
-                    session, turn, "interrupted", "turn_interrupted"
-                )
-                yield terminal
-                if promoted is None:
-                    return
-                turn = promoted
-                continue
+            paused = yield from self._advance(session, turn)
+            if paused or session.active_turn_id is None:
+                return
+            turn = session.turns[session.active_turn_id]
 
+    def _advance(self, session: Session, turn: Turn) -> Iterator[SessionEvent]:
+        while True:
+            if turn.cancelled:
+                terminal, _ = self._terminate(session, turn, "interrupted", "turn_interrupted")
+                yield terminal
+                return False
             while turn.pending_steers:
                 session.provider_messages.append(turn.pending_steers.popleft())
-
             if turn.provider_responses >= 20:
-                terminal, promoted = self._terminate(
-                    session,
-                    turn,
-                    "failed",
-                    "turn_failed",
-                    code="round_limit",
-                )
+                terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code="round_limit")
                 yield terminal
-                if promoted is None:
-                    return
-                turn = promoted
-                continue
-
+                return False
             assistant_item_id = uuid4()
-            yield self._event(
-                turn, "assistant_item_started", item_id=assistant_item_id
-            )
+            yield self._event(turn, "assistant_item_started", item_id=assistant_item_id)
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             call_parts: dict[int, _ToolCallParts] = {}
@@ -373,77 +360,64 @@ class ConversationAgent:
 
             if turn.cancelled or failure_code is not None:
                 _close_iterator(chunks)
-            yield self._event(
-                turn, "assistant_item_completed", item_id=assistant_item_id
-            )
+            yield self._event(turn, "assistant_item_completed", item_id=assistant_item_id)
             if turn.cancelled:
-                terminal, promoted = self._terminate(
-                    session, turn, "interrupted", "turn_interrupted"
-                )
+                terminal, _ = self._terminate(session, turn, "interrupted", "turn_interrupted")
+                yield terminal
+                return False
             elif failure_code is not None or finish_reason is None:
-                terminal, promoted = self._terminate(
-                    session,
-                    turn,
-                    "failed",
-                    "turn_failed",
-                    code=failure_code or "provider_protocol_error",
+                terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code=failure_code or "provider_protocol_error")
+                yield terminal
+                return False
+            try:
+                calls = self._complete_tool_calls(call_parts, finish_reason)
+            except _ProviderProtocolError:
+                terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code="provider_protocol_error")
+                yield terminal
+                return False
+            turn.provider_responses += 1
+            session.provider_messages.append(
+                ProviderMessage(
+                    role="assistant", content="".join(text_parts), tool_calls=calls,
+                    reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
                 )
-            else:
-                try:
-                    calls = self._complete_tool_calls(call_parts, finish_reason)
-                except _ProviderProtocolError:
-                    terminal, promoted = self._terminate(
-                        session,
-                        turn,
-                        "failed",
-                        "turn_failed",
-                        code="provider_protocol_error",
-                    )
+            )
+            if turn.tool_calls + len(calls) > 50:
+                terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code="round_limit")
+                yield terminal
+                return False
+            if not calls:
+                if turn.needs_full_verification:
+                    terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code="verification_required")
                 else:
-                    turn.provider_responses += 1
-                    session.provider_messages.append(
-                        ProviderMessage(
-                            role="assistant",
-                            content="".join(text_parts),
-                            tool_calls=calls,
-                            reasoning_content=(
-                                "".join(reasoning_parts)
-                                if reasoning_parts
-                                else None
-                            ),
-                        )
+                    terminal, _ = self._terminate(session, turn, "completed", "turn_completed")
+                yield terminal
+                return False
+            turn.tool_calls += len(calls)
+            if self._governor is None or self._executor is None:
+                terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code="tool_execution_unavailable")
+                yield terminal
+                return False
+            for index, call in enumerate(calls):
+                item_id = uuid4()
+                yield self._event(turn, "tool_item_started", item_id=item_id, data={"tool": call.name})
+                decision = self._governor.decide(turn, item_id, call)
+                if decision.verdict == "approval_required":
+                    assert decision.approval_id is not None
+                    turn.waiting_approval = PendingApproval(decision.approval_id, item_id, call, calls[index + 1 :])
+                    turn.status = "waiting_approval"
+                    yield self._event(
+                        turn, "approval_requested", item_id=item_id,
+                        data={"approval_id": str(decision.approval_id), "tool": call.name, "rule_id": decision.rule_id},
                     )
-                    if turn.tool_calls + len(calls) > 50:
-                        terminal, promoted = self._terminate(
-                            session,
-                            turn,
-                            "failed",
-                            "turn_failed",
-                            code="round_limit",
-                        )
-                    elif calls:
-                        turn.tool_calls += len(calls)
-                        if self._governor is None or self._executor is None:
-                            terminal, promoted = self._terminate(
-                                session,
-                                turn,
-                                "failed",
-                                "turn_failed",
-                                code="tool_execution_unavailable",
-                            )
-                        else:
-                            raise RuntimeError(
-                                "governed tool execution is introduced in Task 22.2"
-                            )
-                    else:
-                        terminal, promoted = self._terminate(
-                            session, turn, "completed", "turn_completed"
-                        )
-
-            yield terminal
-            if promoted is None:
-                return
-            turn = promoted
+                    return True
+                if decision.verdict == "deny":
+                    payload = {"ok": False, "code": decision.code, "summary": decision.code}
+                    self._append_tool_result(session, call, payload)
+                    yield self._event(turn, "tool_item_completed", item_id=item_id, data={"code": decision.code, "verdict": "deny"})
+                    continue
+                execution = self._executor.execute(turn, item_id, call)
+                yield from self._execution_events(session, turn, item_id, call, execution)
 
     def resolve_approval(
         self,
@@ -452,7 +426,6 @@ class ConversationAgent:
         approval_id: UUID,
         accepted: bool,
     ) -> Iterator[SessionEvent]:
-        del accepted
         session = self._session(session_id)
         turn = self._active_turn(session, turn_id)
         pending = turn.waiting_approval
@@ -462,8 +435,53 @@ class ConversationAgent:
             or pending.approval_id != approval_id
         ):
             raise TurnNotActiveError("approval is not active")
-        raise TurnNotActiveError("approval execution is unavailable")
-        yield  # pragma: no cover
+        normalized = self._governor.normalized_call(pending.call)
+        decision = self._governor.resolve(
+            session_id, turn_id, pending.item_id, normalized, approval_id, accepted
+        )
+        if decision.code == "approval_stale":
+            raise TurnNotActiveError("approval is stale")
+        yield self._event(
+            turn, "approval_resolved", item_id=pending.item_id,
+            data={"approval_id": str(approval_id), "accepted": str(accepted).lower()},
+        )
+        if decision.verdict == "allow":
+            execution = self._executor.execute(turn, pending.item_id, pending.call)
+            yield from self._execution_events(session, turn, pending.item_id, pending.call, execution)
+        else:
+            payload = {"ok": False, "code": decision.code, "summary": decision.code}
+            self._append_tool_result(session, pending.call, payload)
+            yield self._event(turn, "tool_item_completed", item_id=pending.item_id, data={"code": decision.code, "verdict": "deny"})
+        for call in pending.later_calls:
+            item_id = uuid4()
+            yield self._event(turn, "tool_item_started", item_id=item_id, data={"tool": call.name})
+            payload = {"ok": False, "code": "not_executed_after_approval", "summary": "not_executed_after_approval"}
+            self._append_tool_result(session, call, payload)
+            yield self._event(turn, "tool_item_completed", item_id=item_id, data={"code": "not_executed_after_approval", "verdict": "deny"})
+        turn.waiting_approval = None
+        turn.status = "running"
+        paused = yield from self._advance(session, turn)
+        if paused:
+            return
+        while session.active_turn_id is not None:
+            promoted = session.turns[session.active_turn_id]
+            yield self._event(promoted, "turn_started")
+            if (yield from self._advance(session, promoted)):
+                return
+
+    @staticmethod
+    def _append_tool_result(session: Session, call: ToolCall, payload: Mapping[str, object]) -> None:
+        session.provider_messages.append(
+            ProviderMessage(role="tool", content=json.dumps(payload, sort_keys=True, separators=(",", ":")), tool_call_id=call.id)
+        )
+
+    def _execution_events(self, session: Session, turn: Turn, item_id: UUID, call: ToolCall, execution: object) -> Iterator[SessionEvent]:
+        payload = execution.provider_result
+        self._append_tool_result(session, call, payload)
+        summary = str(execution.summary)
+        if summary:
+            yield self._event(turn, "tool_output", item_id=item_id, text=summary)
+        yield self._event(turn, "tool_item_completed", item_id=item_id, data={"code": str(execution.code), "verdict": str(execution.verdict)})
 
     def steer(
         self, session_id: UUID, turn_id: UUID, text: str
@@ -602,9 +620,14 @@ class ConversationAgent:
         ):
             raise _ProviderProtocolError
         calls: list[ToolCall] = []
-        for parts in call_parts.values():
+        seen_ids: set[str] = set()
+        for index in sorted(call_parts):
+            parts = call_parts[index]
             if not parts.id or not parts.id.strip() or not parts.name or not parts.name.strip():
                 raise _ProviderProtocolError
+            if parts.id in seen_ids:
+                raise _ProviderProtocolError
+            seen_ids.add(parts.id)
             try:
                 arguments = json.loads(parts.arguments)
             except (TypeError, json.JSONDecodeError):

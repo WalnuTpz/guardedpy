@@ -43,6 +43,15 @@ class PytestFeedback:
     excerpt: str
 
 
+@dataclass(frozen=True)
+class FeedbackProjection:
+    """Bounded pytest facts included in a provider tool result."""
+
+    kind: str
+    node_ids: tuple[str, ...]
+    excerpt: str
+
+
 class FeedbackCollector:
     """Classify pytest output without returning the full, untrusted report."""
 

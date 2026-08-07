@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from uuid import uuid4
+import json
+from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
 
+from conftest import safe_config
 from guardedpy.conversation import (
     ConversationAgent,
     ProviderMessage,
@@ -17,6 +20,260 @@ from guardedpy.conversation import (
     ToolCallDelta,
     TurnNotActiveError,
 )
+from guardedpy.executor import ToolExecutor
+from guardedpy.governor import ToolGovernor, governed_tool_definitions
+
+
+def _tool_response(*calls: tuple[str, str, dict[str, object]]) -> list[object]:
+    return [
+        *[
+            ToolCallDelta(index, call_id, name, json.dumps(arguments))
+            for index, (call_id, name, arguments) in enumerate(calls)
+        ],
+        ResponseFinished("tool_calls"),
+    ]
+
+
+def _governed_agent(tmp_path: Path, responses: list[list[object]]) -> tuple[ConversationAgent, ScriptedConversationModel]:
+    config = safe_config(tmp_path)
+    model = ScriptedConversationModel(responses)
+    return (
+        ConversationAgent(
+            model,
+            governed_tool_definitions(),
+            ToolGovernor(config),
+            ToolExecutor(tmp_path, config),
+        ),
+        model,
+    )
+
+
+def _patch(old: str, new: str) -> str:
+    return f"--- a/src/calc.py\n+++ b/src/calc.py\n@@ -1 +1 @@\n-{old}\n+{new}\n"
+
+
+def _prepare_project(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+
+
+@pytest.mark.parametrize("mode", ("plan", "review"))
+def test_read_only_mode_denies_mutation_with_zero_side_effect(
+    tmp_path: Path, mode: str
+) -> None:
+    _prepare_project(tmp_path)
+    target = tmp_path / "src" / "calc.py"
+    target.write_text("VALUE = 1\n")
+    agent, model = _governed_agent(
+        tmp_path,
+        [
+            _tool_response(
+                (
+                    "forbidden-patch",
+                    "apply_patch",
+                    {"unified_diff": _patch("VALUE = 1", "VALUE = 2")},
+                )
+            ),
+            [TextDelta("No mutation was performed."), ResponseFinished("stop")],
+        ],
+    )
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Inspect only", mode=mode)
+
+    events = list(agent.run_turn(session_id, turn_id))
+
+    tool_result = json.loads(model.received_messages[1][-1].content)
+    assert tool_result["code"] == "mode_read_only"
+    assert target.read_text() == "VALUE = 1\n"
+    assert events[-1].kind == "turn_completed"
+
+
+def test_repair_turn_receives_assertion_feedback_then_patches_and_full_retests(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    (tmp_path / "src" / "calc.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests" / "test_calc.py").write_text("from src.calc import VALUE\n\ndef test_value():\n    assert VALUE == 20\n")
+    agent, model = _governed_agent(tmp_path, [
+        _tool_response(("test-red", "run_pytest", {})),
+        _tool_response(("read", "read_file", {"path": "src/calc.py"})),
+        _tool_response(("fix", "apply_patch", {"unified_diff": _patch("VALUE = 1", "VALUE = 20")})),
+        _tool_response(("test-green", "run_pytest", {})),
+        [TextDelta("Fixed and verified."), ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Repair the failing test")
+
+    events = list(agent.run_turn(session_id, turn_id))
+
+    first_result = json.loads(model.received_messages[1][-1].content)
+    assert first_result["feedback"]["kind"] == "assertion_failure"
+    assert first_result["feedback"]["node_ids"] == ["tests/test_calc.py::test_value"]
+    assert (tmp_path / "src" / "calc.py").read_text() == "VALUE = 20\n"
+    assert (events[-1].kind, events[-1].data) == ("turn_completed", {})
+
+
+def test_invalid_patch_returns_tool_result_then_same_turn_corrects_it(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    (tmp_path / "src" / "calc.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests" / "test_calc.py").write_text("def test_ok(): assert True\n")
+    agent, model = _governed_agent(tmp_path, [
+        _tool_response(("read", "read_file", {"path": "src/calc.py"})),
+        _tool_response(("bad", "apply_patch", {"unified_diff": "not a diff"})),
+        _tool_response(("fix", "apply_patch", {"unified_diff": _patch("VALUE = 1", "VALUE = 2")})),
+        _tool_response(("full", "run_pytest", {})),
+        [ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Fix")
+
+    events = list(agent.run_turn(session_id, turn_id))
+
+    invalid_result = json.loads(model.received_messages[2][-1].content)
+    assert invalid_result["code"] == "patch_invalid"
+    assert (tmp_path / "src" / "calc.py").read_text() == "VALUE = 2\n"
+    assert events[-1].kind == "turn_completed"
+
+
+@pytest.mark.parametrize("stale", (False, True), ids=("unread", "stale"))
+def test_unread_or_stale_file_patch_is_denied_without_write(tmp_path: Path, stale: bool) -> None:
+    _prepare_project(tmp_path)
+    target = tmp_path / "src" / "calc.py"
+    target.write_text("VALUE = 1\n")
+    responses = []
+    if stale:
+        responses.append(_tool_response(("read", "read_file", {"path": "src/calc.py"})))
+    responses.extend([
+        _tool_response(("patch", "apply_patch", {"unified_diff": _patch("VALUE = 1", "VALUE = 2")})),
+        [ResponseFinished("stop")],
+    ])
+    agent, model = _governed_agent(tmp_path, responses)
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Patch")
+    iterator = iter(agent.run_turn(session_id, turn_id))
+    if stale:
+        for event in iterator:
+            if event.kind == "tool_item_completed":
+                break
+        target.write_text("VALUE = 9\n")
+
+    events = list(iterator)
+
+    result = json.loads(model.received_messages[-1][-1].content)
+    assert result["code"] == ("stale_read" if stale else "read_required")
+    assert target.read_text() == ("VALUE = 9\n" if stale else "VALUE = 1\n")
+    assert events[-1].kind == "turn_completed"
+
+
+def test_delete_rejection_preserves_target_and_approval_acceptance_continues_same_turn(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    target = tmp_path / "src" / "obsolete.py"
+    target.write_text("obsolete\n")
+    agent, model = _governed_agent(tmp_path, [
+        _tool_response(("delete-1", "delete_path", {"path": "src/obsolete.py"})),
+        [TextDelta("Kept it."), ResponseFinished("stop")],
+        _tool_response(("delete-2", "delete_path", {"path": "src/obsolete.py"})),
+        _tool_response(("full", "run_pytest", {})),
+        [TextDelta("Deleted it."), ResponseFinished("stop")],
+    ])
+    (tmp_path / "tests" / "test_ok.py").write_text("def test_ok(): assert True\n")
+    session_id = agent.create_session()
+    rejected_turn, _ = agent.begin_turn(session_id, "Maybe delete")
+    paused = list(agent.run_turn(session_id, rejected_turn))
+    approval_id = next(UUID(event.data["approval_id"]) for event in paused if event.kind == "approval_requested")
+    rejected = list(agent.resolve_approval(session_id, rejected_turn, approval_id, False))
+    assert target.exists()
+    assert rejected[-1].kind == "turn_completed"
+
+    accepted_turn, _ = agent.begin_turn(session_id, "Delete")
+    paused = list(agent.run_turn(session_id, accepted_turn))
+    approval_id = next(UUID(event.data["approval_id"]) for event in paused if event.kind == "approval_requested")
+    accepted = list(agent.resolve_approval(session_id, accepted_turn, approval_id, True))
+    assert not target.exists()
+    assert accepted[-1].kind == "turn_completed"
+    assert json.loads(model.received_messages[-1][-1].content)["feedback"]["kind"] == "passed"
+
+
+def test_stale_or_forged_approval_id_cannot_execute_delete(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    target = tmp_path / "src" / "obsolete.py"
+    target.write_text("obsolete\n")
+    agent, _ = _governed_agent(tmp_path, [_tool_response(("delete", "delete_path", {"path": "src/obsolete.py"}))])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Delete")
+    paused = list(agent.run_turn(session_id, turn_id))
+    real_id = UUID(next(event.data["approval_id"] for event in paused if event.kind == "approval_requested"))
+    with pytest.raises(TurnNotActiveError):
+        list(agent.resolve_approval(session_id, turn_id, uuid4(), True))
+    assert target.exists()
+    agent.interrupt(session_id, turn_id)
+    with pytest.raises(TurnNotActiveError):
+        list(agent.resolve_approval(session_id, turn_id, real_id, True))
+    assert target.exists()
+
+
+def test_multiple_tool_calls_pause_at_first_approval_and_pair_later_calls_without_execution(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    target = tmp_path / "src" / "obsolete.py"
+    target.write_text("obsolete\n")
+    agent, model = _governed_agent(tmp_path, [
+        _tool_response(
+            ("delete", "delete_path", {"path": "src/obsolete.py"}),
+            ("read-later", "read_file", {"path": "src/obsolete.py"}),
+        ),
+        [ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Delete then read")
+    paused = list(agent.run_turn(session_id, turn_id))
+    approval_id = UUID(next(event.data["approval_id"] for event in paused if event.kind == "approval_requested"))
+
+    events = list(agent.resolve_approval(session_id, turn_id, approval_id, False))
+
+    results = [json.loads(message.content) for message in model.received_messages[1] if message.role == "tool"]
+    assert [result["code"] for result in results] == ["approval_rejected", "not_executed_after_approval"]
+    assert target.exists()
+    assert events[-1].kind == "turn_completed"
+
+
+def test_duplicate_tool_call_id_fails_before_tool_io(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    target = tmp_path / "src" / "calc.py"
+    target.write_text("VALUE = 1\n")
+    agent, model = _governed_agent(tmp_path, [
+        _tool_response(
+            ("same", "read_file", {"path": "src/calc.py"}),
+            ("same", "delete_path", {"path": "src/calc.py"}),
+        )
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Bad provider response")
+
+    events = list(agent.run_turn(session_id, turn_id))
+
+    assert events[-1].kind == "turn_failed"
+    assert events[-1].data == {"code": "provider_protocol_error"}
+    assert target.exists()
+    assert len(model.received_messages) == 1
+
+
+def test_mutation_cannot_complete_before_full_pytest_passes(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    target = tmp_path / "src" / "calc.py"
+    target.write_text("VALUE = 1\n")
+    (tmp_path / "tests" / "test_ok.py").write_text("def test_ok(): assert True\n")
+    agent, _ = _governed_agent(tmp_path, [
+        _tool_response(("read", "read_file", {"path": "src/calc.py"})),
+        _tool_response(("patch", "apply_patch", {"unified_diff": _patch("VALUE = 1", "VALUE = 2")})),
+        _tool_response(("targeted", "run_pytest", {"nodes": ["tests/test_ok.py"]})),
+        [ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Patch")
+
+    events = list(agent.run_turn(session_id, turn_id))
+
+    assert target.read_text() == "VALUE = 2\n"
+    assert events[-1].kind == "turn_failed"
+    assert events[-1].data == {"code": "verification_required"}
 
 
 def test_normal_chat_returns_immediate_user_event_then_text_deltas_and_terminal() -> None:
@@ -211,7 +468,7 @@ def test_interrupt_closes_a_mid_stream_iterator_before_terminal_event() -> None:
     assert model.closed is True
 
 
-def test_steer_queue_and_interrupt_preserve_single_active_turn_ownership() -> None:
+def test_steer_queue_and_interrupt_have_single_active_turn_semantics() -> None:
     model = ScriptedConversationModel(
         [
             [TextDelta("first"), ResponseFinished("stop")],
