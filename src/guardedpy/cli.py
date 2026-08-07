@@ -145,7 +145,7 @@ def main(
             return 1
         return run_plain_conversation(
             continuous_runtime(runtime, profile), str(profile.root), source, output,
-            arguments.target,
+            arguments.target, runtime,
         )
 
     from guardedpy.tui import GuardedPyApp

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import StringIO
 import subprocess
 import sys
 from typing import Any, TextIO
@@ -261,6 +262,7 @@ def run_plain_conversation(
     input_stream: TextIO,
     output: TextIO,
     initial_text: str | None = None,
+    local_runtime: Any | None = None,
 ) -> int:
     """Consume the continuous SessionEvent stream without approving side effects."""
     session_id = runtime.create_session(project_title)
@@ -272,6 +274,14 @@ def run_plain_conversation(
         if text == "/exit":
             return 0
         name, _, argument = text.partition(" ")
+        if local_runtime is not None and name in {
+            "/help", "/history", "/conversations", "/clear", "/tests", "/diff",
+            "/permissions", "/credentials", "/memory", "/model", "/effort", "/goal", "/doctor",
+        }:
+            code = run_plain_session(local_runtime, StringIO(f"{text}\n"), output)
+            if code:
+                return code
+            continue
         mode = "normal"
         if name in {"/plan", "/review"}:
             mode = name.removeprefix("/")

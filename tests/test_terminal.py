@@ -321,3 +321,21 @@ def test_plain_continuous_session_renders_events_and_stops_nonzero_for_approval(
 
     assert code == 1
     assert output.getvalue().splitlines() == ["› repair", "助手：Checking.", "需要精确审批，非交互模式已安全停止。"]
+
+
+def test_plain_continuous_session_keeps_fixed_help_local() -> None:
+    from guardedpy.terminal import run_plain_conversation
+    from uuid import uuid4
+    from guardedpy.conversation import SessionEvent
+
+    class Conversation:
+        def create_session(self, title: str) -> object:
+            return uuid4()
+
+        def begin_turn(self, session: object, text: str, mode: str = "normal") -> tuple[object, SessionEvent]:
+            raise AssertionError("/help must not become a model turn")
+
+    output = StringIO()
+
+    assert run_plain_conversation(Conversation(), "project", StringIO("/help\n/exit\n"), output, local_runtime=object()) == 0
+    assert "会话与对话" in output.getvalue()
