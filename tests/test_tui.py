@@ -1338,3 +1338,32 @@ def test_tui_continuous_approval_queue_and_stop_controls_reach_runtime(tmp_path:
             assert conversation.interrupts == 2
 
     asyncio.run(check())
+
+
+def test_new_command_replaces_the_continuous_session_without_creating_a_task(tmp_path: Path) -> None:
+    """Catches `/new` resetting only legacy task state instead of creating a new thread."""
+    import asyncio
+    from uuid import uuid4
+
+    from guardedpy.tui import GuardedPyApp
+
+    profile = _profile(tmp_path)
+
+    class _Conversation:
+        def __init__(self) -> None:
+            self.created: list[str] = []
+
+        def create_session(self, project_title: str) -> object:
+            self.created.append(project_title)
+            return uuid4()
+
+    conversation = _Conversation()
+    app = GuardedPyApp(_Runtime(profile), profile, conversation=conversation)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("/new")
+            await pilot.pause()
+            assert conversation.created == [str(profile.root)]
+
+    asyncio.run(check())

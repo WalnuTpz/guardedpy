@@ -106,6 +106,11 @@ class TranscriptLog(Log):
         for _item_id, text in self._continuous_entries:
             self.write(text)
 
+    def reset_continuous(self) -> None:
+        """Discard the current session's rendered event projection."""
+        self._continuous_entries.clear()
+        self.clear()
+
 
 class Composer(TextArea):
     """TextArea with explicit submit and multiline key boundaries."""
@@ -691,6 +696,12 @@ class GuardedPyApp(App[None]):
             self.query_one("#transcript", Log).clear()
             return
         if name == "/new":
+            if self._conversation_runtime is not None:
+                if self._continuous_turn_id is None:
+                    self._new_conversation()
+                else:
+                    self.push_screen(NewConversationScreen(), self._new_conversation_resolved)
+                return
             if self._active_task is None:
                 self._new_conversation()
             else:
@@ -911,6 +922,20 @@ class GuardedPyApp(App[None]):
             self._new_conversation()
 
     def _new_conversation(self) -> None:
+        if self._conversation_runtime is not None:
+            self._continuous_session_id = self._conversation_runtime.create_session(
+                str(self.profile.root)
+            )
+            self._continuous_turn_id = None
+            self._transcript_presenter = TranscriptPresenter()
+            self._session_goal = None
+            self._mode = "coding"
+            self._refresh_composer_controls()
+            self.query_one("#transcript", TranscriptLog).reset_continuous()
+            composer = self.query_one("#composer", Composer)
+            composer.focus()
+            composer.cursor_location = composer.document.end
+            return
         self._conversation_id = None
         self._session_goal = None
         self._mode = "coding"
