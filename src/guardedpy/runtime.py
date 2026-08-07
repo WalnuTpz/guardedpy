@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -29,6 +31,14 @@ from guardedpy.domain import ApprovalDecision, CommandApprovalRule, TaskIntent, 
 from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.lease import ExecutionLease, GlobalExecutionLease, GlobalStateLease
 from guardedpy.memory import MemoryEntry, MemoryStore
+from guardedpy.conversation import (
+    ConversationAgent,
+    ConversationSummary,
+    SafeTurnSummary,
+    SessionEvent,
+    TurnMode,
+)
+from guardedpy.conversations import ConversationStore
 
 
 class CredentialPort(Protocol):
@@ -99,6 +109,107 @@ class RuntimeCommandRuleNotFoundError(KeyError):
 
     def __init__(self) -> None:
         super().__init__("未找到命令规则。")
+
+
+class ConversationRuntime:
+    """Runtime ownership boundary for one in-memory continuous Agent."""
+
+    def __init__(self, agent: ConversationAgent, store: ConversationStore) -> None:
+        self._agent = agent
+        self.store = store
+        self._summaries: dict[UUID, ConversationSummary] = {}
+        self._texts: dict[tuple[UUID, UUID], list[str]] = {}
+        self._facts: dict[tuple[UUID, UUID], dict[str, object]] = {}
+
+    def create_session(self, project_title: str, summary_id: UUID | None = None) -> UUID:
+        prior = None if summary_id is None else self.store.load_summary(summary_id)
+        session_id = self._agent.create_session(prior)
+        now = datetime.now(timezone.utc)
+        self._summaries[session_id] = ConversationSummary(
+            id=session_id,
+            project_title=project_title,
+            created_at=now,
+            updated_at=now,
+            turns=() if prior is None else prior.turns,
+        )
+        self.store.save_summary(self._summaries[session_id])
+        return session_id
+
+    def summary(self, session_id: UUID) -> ConversationSummary:
+        try:
+            return self._summaries[session_id]
+        except KeyError:
+            summary = self.store.load_summary(session_id)
+            self._summaries[session_id] = summary
+            return summary
+
+    def begin_turn(
+        self, session_id: UUID, text: str, mode: TurnMode = "normal"
+    ) -> tuple[UUID, SessionEvent]:
+        return self._agent.begin_turn(session_id, text, mode)
+
+    def run_turn(self, session_id: UUID, turn_id: UUID):
+        return self._capture(session_id, turn_id, self._agent.run_turn(session_id, turn_id))
+
+    def resolve_approval(self, session_id: UUID, turn_id: UUID, approval_id: UUID, accepted: bool):
+        return self._capture(
+            session_id, turn_id,
+            self._agent.resolve_approval(session_id, turn_id, approval_id, accepted),
+        )
+
+    def steer(self, session_id: UUID, turn_id: UUID, text: str) -> SessionEvent:
+        return self._agent.steer(session_id, turn_id, text)
+
+    def queue(self, session_id: UUID, text: str, mode: TurnMode = "normal") -> tuple[UUID, SessionEvent]:
+        return self._agent.queue(session_id, text, mode)
+
+    def interrupt(self, session_id: UUID, turn_id: UUID) -> SessionEvent | None:
+        event = self._agent.interrupt(session_id, turn_id)
+        if event is not None:
+            self._record_terminal(session_id, turn_id, event)
+        return event
+
+    def _capture(self, session_id: UUID, turn_id: UUID, events: object):
+        for event in events:  # type: ignore[union-attr]
+            if event.kind == "assistant_text_delta":
+                self._texts.setdefault((session_id, turn_id), []).append(event.text)
+            facts = self._facts.setdefault(
+                (session_id, turn_id), {"changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none"}
+            )
+            if event.kind == "tool_item_completed":
+                raw_paths = event.data.get("changed_paths")
+                if raw_paths is not None:
+                    facts["changed_paths"].update(json.loads(raw_paths))  # type: ignore[union-attr]
+                if "pytest_outcome" in event.data:
+                    facts["pytest_outcome"] = event.data["pytest_outcome"]
+            if event.kind == "approval_resolved":
+                facts["approval_outcome"] = "approved" if event.data["accepted"] == "true" else "rejected"
+            if event.kind in {"turn_completed", "turn_interrupted", "turn_failed"}:
+                self._record_terminal(session_id, turn_id, event)
+            yield event
+
+    def _record_terminal(self, session_id: UUID, turn_id: UUID, event: SessionEvent) -> None:
+        summary = self.summary(session_id)
+        status = {
+            "turn_completed": "completed",
+            "turn_interrupted": "interrupted",
+            "turn_failed": "failed",
+        }[event.kind]
+        facts = self._facts.pop(
+            (session_id, turn_id), {"changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none"}
+        )
+        turn = SafeTurnSummary(
+            terminal_status=status,
+            changed_paths=tuple(sorted(facts["changed_paths"])),
+            pytest_outcome=facts["pytest_outcome"],
+            approval_outcome=facts["approval_outcome"],
+            final_text="".join(self._texts.pop((session_id, turn_id), [])),
+        )
+        updated = summary.model_copy(
+            update={"updated_at": datetime.now(timezone.utc), "turns": (*summary.turns, turn)}
+        )
+        self._summaries[session_id] = updated
+        self.store.save_summary(updated)
 
 
 _ACTIVE_STATUSES = {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL}

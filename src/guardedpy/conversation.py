@@ -481,7 +481,12 @@ class ConversationAgent:
         summary = str(execution.summary)
         if summary:
             yield self._event(turn, "tool_output", item_id=item_id, text=summary)
-        yield self._event(turn, "tool_item_completed", item_id=item_id, data={"code": str(execution.code), "verdict": str(execution.verdict)})
+        data = {"code": str(execution.code), "verdict": str(execution.verdict)}
+        if execution.changed_paths:
+            data["changed_paths"] = json.dumps(execution.changed_paths)
+        if execution.feedback is not None:
+            data["pytest_outcome"] = execution.feedback.kind.value
+        yield self._event(turn, "tool_item_completed", item_id=item_id, data=data)
 
     def steer(
         self, session_id: UUID, turn_id: UUID, text: str

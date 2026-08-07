@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict
 
 from guardedpy.config import app_state_dir
+from guardedpy.conversation import ConversationSummary as SafeConversationSummary
 
 
 class ConversationSummary(BaseModel):
@@ -44,8 +45,39 @@ class ConversationStore:
                     position INTEGER NOT NULL,
                     PRIMARY KEY (conversation_id, task_id)
                 );
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    id TEXT PRIMARY KEY,
+                    summary_json TEXT NOT NULL
+                );
                 """
             )
+
+    def save_summary(self, summary: SafeConversationSummary) -> None:
+        """Durably replace one whitelist-validated session summary."""
+        with closing(self._connect()) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO conversation_summaries (id, summary_json) VALUES (?, ?)",
+                (str(summary.id), summary.model_dump_json()),
+            )
+            connection.commit()
+
+    def load_summary(self, conversation_id: UUID) -> SafeConversationSummary:
+        """Load a safe summary without reconstructing provider history."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT summary_json FROM conversation_summaries WHERE id = ?",
+                (str(conversation_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return SafeConversationSummary.model_validate_json(row[0])
+
+    def summaries(self) -> tuple[SafeConversationSummary, ...]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT summary_json FROM conversation_summaries"
+            ).fetchall()
+        return tuple(SafeConversationSummary.model_validate_json(row[0]) for row in rows)
 
     def create(self) -> ConversationSummary:
         conversation_id = uuid4()
