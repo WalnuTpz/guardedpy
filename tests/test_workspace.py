@@ -61,7 +61,11 @@ def test_read_file_returns_a_bounded_line_page(tmp_path: Path) -> None:
     )
 
     assert result.ok is True
-    assert result.data == {"path": "notes.txt", "content": "one\ntwo\n", "next_offset": 3}
+    assert result.data["path"] == "notes.txt"
+    assert result.data["content"] == "one\ntwo\n"
+    assert result.data["next_offset"] == 3
+    assert result.data["complete"] is False
+    assert len(result.data["sha256"]) == 64
 
 
 def test_patch_mismatch_writes_nothing(tmp_path: Path) -> None:
@@ -111,12 +115,13 @@ def test_patch_can_create_a_file_from_an_empty_hunk(tmp_path: Path) -> None:
 
 def test_patch_rejects_out_of_range_zero_line_hunk_without_writing(tmp_path: Path) -> None:
     """Catches a zero-line hunk silently appending at a different location."""
-    target = tmp_path / "notes.txt"
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "notes.txt"
     target.write_text("one\n")
 
     result = Workspace(tmp_path, safe_config(tmp_path)).apply_patch(
-        """--- a/notes.txt
-+++ b/notes.txt
+        """--- a/src/notes.txt
++++ b/src/notes.txt
 @@ -999,0 +999 @@
 +late
 """
@@ -129,12 +134,13 @@ def test_patch_rejects_out_of_range_zero_line_hunk_without_writing(tmp_path: Pat
 
 def test_patch_allows_zero_line_hunk_at_end_of_file(tmp_path: Path) -> None:
     """Catches a boundary check that rejects the valid insertion position after EOF."""
-    target = tmp_path / "notes.txt"
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "notes.txt"
     target.write_text("one\n")
 
     result = Workspace(tmp_path, safe_config(tmp_path)).apply_patch(
-        """--- a/notes.txt
-+++ b/notes.txt
+        """--- a/src/notes.txt
++++ b/src/notes.txt
 @@ -2,0 +3 @@
 +two
 """
@@ -175,3 +181,22 @@ def test_delete_rejects_project_escape(tmp_path: Path) -> None:
 
     assert result.ok is False
     assert result.data["reason"] == "path_outside_project"
+
+
+def test_delete_rejects_symlink_and_allows_empty_directory(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "real.py"
+    target.write_text("value = 1\n")
+    alias = tmp_path / "src" / "alias.py"
+    alias.symlink_to(target)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    workspace = Workspace(tmp_path, safe_config(tmp_path))
+
+    rejected = workspace.delete_path(PurePosixPath("src/alias.py"))
+    deleted = workspace.delete_path(PurePosixPath("empty"))
+
+    assert rejected.data["reason"] == "protected_path"
+    assert target.exists()
+    assert deleted.ok is True
+    assert not empty.exists()

@@ -64,6 +64,12 @@ def test_collector_treats_noncollection_error_as_execution_error_before_assertio
     assert result.node_ids == ()
 
 
+def test_collector_maps_exit_two_to_collection_error_without_provider_text() -> None:
+    result = FeedbackCollector().collect(PytestRun(2, "", "", False))
+
+    assert result.kind is FeedbackKind.COLLECTION_ERROR
+
+
 def test_collector_does_not_treat_source_assert_in_a_runtime_traceback_as_assertion_evidence() -> None:
     """Catches a source assertion line making a TypeError look like an assertion failure."""
     run = PytestRun(
