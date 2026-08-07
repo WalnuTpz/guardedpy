@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -118,6 +119,7 @@ class ConversationRuntime:
         self.store = store
         self._summaries: dict[UUID, ConversationSummary] = {}
         self._texts: dict[tuple[UUID, UUID], list[str]] = {}
+        self._facts: dict[tuple[UUID, UUID], dict[str, object]] = {}
 
     def create_session(self, project_title: str, summary_id: UUID | None = None) -> UUID:
         prior = None if summary_id is None else self.store.load_summary(summary_id)
@@ -171,6 +173,17 @@ class ConversationRuntime:
         for event in events:  # type: ignore[union-attr]
             if event.kind == "assistant_text_delta":
                 self._texts.setdefault((session_id, turn_id), []).append(event.text)
+            facts = self._facts.setdefault(
+                (session_id, turn_id), {"changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none"}
+            )
+            if event.kind == "tool_item_completed":
+                raw_paths = event.data.get("changed_paths")
+                if raw_paths is not None:
+                    facts["changed_paths"].update(json.loads(raw_paths))  # type: ignore[union-attr]
+                if "pytest_outcome" in event.data:
+                    facts["pytest_outcome"] = event.data["pytest_outcome"]
+            if event.kind == "approval_resolved":
+                facts["approval_outcome"] = "approved" if event.data["accepted"] == "true" else "rejected"
             if event.kind in {"turn_completed", "turn_interrupted", "turn_failed"}:
                 self._record_terminal(session_id, turn_id, event)
             yield event
@@ -182,11 +195,14 @@ class ConversationRuntime:
             "turn_interrupted": "interrupted",
             "turn_failed": "failed",
         }[event.kind]
+        facts = self._facts.pop(
+            (session_id, turn_id), {"changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none"}
+        )
         turn = SafeTurnSummary(
             terminal_status=status,
-            changed_paths=(),
-            pytest_outcome="not_run",
-            approval_outcome="none",
+            changed_paths=tuple(sorted(facts["changed_paths"])),
+            pytest_outcome=facts["pytest_outcome"],
+            approval_outcome=facts["approval_outcome"],
             final_text="".join(self._texts.pop((session_id, turn_id), [])),
         )
         updated = summary.model_copy(
