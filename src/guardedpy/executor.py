@@ -61,6 +61,7 @@ class ToolExecutor:
             kind = feedback.kind.value
             return ToolExecution(call.id, "allow", kind, "pytest completed", {
                 "ok": kind == "passed", "code": kind, "summary": "pytest completed",
+                "kind": kind, "nodes": feedback.node_ids, "excerpt": feedback.excerpt,
                 "feedback": {
                     "kind": kind, "node_ids": list(feedback.node_ids),
                     "excerpt": feedback.excerpt,
