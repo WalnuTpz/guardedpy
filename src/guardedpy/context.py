@@ -62,16 +62,19 @@ class ContextBuilder:
     ) -> LlmContext:
         """Build trusted task facts while keeping read file bodies explicitly untrusted."""
         trusted_feedback, untrusted_data = self._split_feedback(feedback)
+        task_context = {
+            "description": task.description,
+            "intent": task.intent.value,
+            "path": task.path.value,
+            "repair_targets": task.repair_targets,
+            "review_path": task.review_path,
+        }
+        if task.session_goal is not None:
+            task_context["session_goal"] = task.session_goal
         return LlmContext(
             system_rules=_SYSTEM_RULES,
             trusted_data={
-                "task": {
-                    "description": task.description,
-                    "intent": task.intent.value,
-                    "path": task.path.value,
-                    "repair_targets": task.repair_targets,
-                    "review_path": task.review_path,
-                },
+                "task": task_context,
                 "tdd_phase": task.tdd_phase.value,
                 "project_tree": self._project_tree(),
                 "configuration": {

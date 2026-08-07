@@ -249,6 +249,21 @@ def test_register_task_persists_static_metadata_and_forces_pending_state(
     assert restored[0].status is TaskStatus.PENDING
 
 
+def test_register_task_omits_the_ephemeral_session_goal_from_restart_history(
+    store: EventStore,
+) -> None:
+    """Catches a session-only Goal being written to task metadata."""
+    task = TaskState(
+        description="Keep this task after restart",
+        config=safe_config(store.project_root),
+        session_goal="release checklist",
+    )
+
+    store.register_task(task)
+
+    assert EventStore(store.project_root).tasks()[0].session_goal is None
+
+
 def test_register_task_persists_validated_review_scope(store: EventStore) -> None:
     """Catches restart history dropping the immutable path that scopes a review task."""
     (store.project_root / "src").mkdir(exist_ok=True)

@@ -88,3 +88,17 @@ def test_context_marks_pytest_excerpt_untrusted_and_exposes_action_kinds() -> No
         "propose_memory",
         "finish",
     }
+
+
+def test_context_includes_the_live_session_goal_only_in_structured_task_data() -> None:
+    """Catches the ephemeral Goal being omitted before a live model decision."""
+    task = TaskState(
+        description="Repair the parser",
+        config=safe_config(Path.cwd()),
+        session_goal="  release checklist  ",
+    )
+
+    context = ContextBuilder().build(task, None, [])
+
+    assert task.session_goal == "release checklist"
+    assert context.trusted_data["task"]["session_goal"] == "release checklist"

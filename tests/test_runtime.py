@@ -321,7 +321,7 @@ def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate
     """Catches restart recovery leaving persisted work active in the runtime cache."""
     first = _runtime(tmp_path)
     first.setup(_profile(tmp_path), api_key=None)
-    task = first.create_task("interrupted", TaskIntent.CODING)
+    task = first.create_task("interrupted", TaskIntent.CODING, session_goal="release checklist")
     first._release_lease()
 
     recovered = _runtime(tmp_path)
@@ -329,6 +329,7 @@ def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate
 
     assert interrupted == (task.id,)
     assert recovered.task(task.id).status is TaskStatus.INTERRUPTED
+    assert recovered.task(task.id).session_goal is None
     assert recovered.create_task("next", TaskIntent.CODING).status is TaskStatus.PENDING
 
 
@@ -349,6 +350,17 @@ def test_runtime_registers_a_task_after_orchestrator_startup_recovery(tmp_path: 
     assert EventStore(tmp_path).tasks()[0].id == task.id
     assert EventStore(tmp_path).tasks()[0].status is TaskStatus.PENDING
     assert EventStore(tmp_path).events_for(task.id) == []
+
+
+def test_runtime_keeps_a_session_goal_only_on_the_live_task(tmp_path: Path) -> None:
+    """Catches task creation dropping the live Goal or persisting it for restart."""
+    runtime = _runtime(tmp_path)
+    runtime.setup(_profile(tmp_path), api_key=None)
+
+    task = runtime.create_task("keep checklist", TaskIntent.CODING, session_goal="release checklist")
+
+    assert task.session_goal == "release checklist"
+    assert EventStore(tmp_path).tasks()[0].session_goal is None
 
 
 def test_runtime_registers_review_intent_with_validated_project_scope(tmp_path: Path) -> None:

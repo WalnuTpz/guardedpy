@@ -215,6 +215,31 @@ def test_plain_session_requires_exact_command_names_before_mutating_defaults(tmp
     assert output.getvalue() == "未知命令。\n未知命令。\n"
 
 
+def test_plain_session_goal_command_is_interactive_only_and_never_creates_a_task(tmp_path: Path) -> None:
+    """Catches redirected input creating or persisting a Goal context."""
+    from guardedpy.terminal import run_plain_session
+
+    runtime = _Runtime(_profile(tmp_path))
+    output = StringIO()
+
+    assert run_plain_session(runtime, StringIO("/goal release checklist\n/exit\n"), output) == 0
+    assert runtime.created == []
+    assert output.getvalue() == "会话目标仅支持交互终端，且不会持久化。\n"
+
+
+def test_terminal_lifecycle_never_renders_a_live_session_goal(tmp_path: Path) -> None:
+    """Catches a session-only Goal leaking into plain history or final summaries."""
+    from guardedpy.terminal import lifecycle_lines
+
+    runtime = _Runtime(_profile(tmp_path))
+    task = TaskState(
+        description="repair value", config=runtime.config, session_goal="release checklist"
+    )
+    task.status = TaskStatus.COMPLETED
+
+    assert "release checklist" not in "\n".join(lifecycle_lines(runtime, task))
+
+
 def test_plain_session_manages_only_explicit_permission_and_memory_identifiers(tmp_path: Path) -> None:
     """Catches rule or memory management being a display-only command surface."""
     from guardedpy.terminal import run_plain_session

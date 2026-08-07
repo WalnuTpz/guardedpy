@@ -16,7 +16,7 @@ from guardedpy.events import StoredRunEvent
 
 COMMANDS = (
     "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review", "/tests", "/diff",
-    "/permissions", "/credentials", "/memory", "/model", "/effort", "/doctor", "/help",
+    "/permissions", "/credentials", "/memory", "/model", "/effort", "/goal", "/doctor", "/help",
 )
 
 
@@ -117,8 +117,8 @@ def render_help() -> tuple[str, ...]:
     return (
         "会话与对话：/history /conversations /new /clear /exit",
         "任务与检查：/plan <任务> /review <路径> /tests /diff",
-        "设置与安全：/model /effort /permissions /credentials /memory /doctor",
-        "参数：/plan <任务> 创建规划；/review <路径> 审查指定路径。",
+        "设置与安全：/model /effort /goal /permissions /credentials /memory /doctor",
+        "参数：/plan <任务> 创建规划；/review <路径> 审查指定路径；/goal <目标> 仅交互终端可用。",
         "交互：键盘 Enter 提交，Shift+Enter 或 Ctrl+J 换行；鼠标可选择候选命令和设置。",
         "凭据：仅交互终端的系统安全存储可录入 Key，绝不接受明文回退。",
         "安全与非交互：重定向会话不能录入凭据或自动审批，并在需要凭据时安全停止。",
@@ -237,6 +237,9 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
             continue
         if name == "/effort":
             _update_default(runtime, "reasoning_effort", argument, output)
+            continue
+        if name == "/goal":
+            output.write("会话目标仅支持交互终端，且不会持久化。\n")
             continue
         if name == "/doctor" and not argument:
             _doctor(runtime, output)

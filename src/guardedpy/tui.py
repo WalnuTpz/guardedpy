@@ -8,7 +8,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -98,6 +98,29 @@ class SettingsScreen(ModalScreen[str | None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(str(event.item.query_one(Static).render()))
+
+
+class ModePickerScreen(ModalScreen[Literal["plan", "review", "goal"] | None]):
+    """Select the next in-composer task mode without attachment semantics."""
+
+    _options = (("plan", "计划"), ("review", "审查"), ("goal", "目标"))
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            ListView(
+                *(ListItem(Static(label), id=f"mode-{mode}") for mode, label in self._options),
+                id="mode-picker-list",
+            ),
+            id="mode-picker-modal",
+        )
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#mode-picker-list", ListView)
+        picker.index = 0
+        picker.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss((event.item.id or "").removeprefix("mode-") or None)
 
 
 class HelpScreen(ModalScreen[None]):
@@ -283,9 +306,14 @@ class GuardedPyApp(App[None]):
     #transcript-shell { height: 1fr; border: round $primary; }
     #transcript { height: 1fr; }
     #live-task-status { height: 1; padding: 0 1; color: $text-muted; }
-    #composer-shell { height: 5; layers: composer send; align: right bottom; }
-    #composer { height: 5; border: round $accent; padding: 0 10 2 0; layer: composer; }
-    #send { width: 8; height: 1; layer: send; }
+    #composer-shell { height: 6; layers: composer controls; }
+    #composer { height: 6; border: round $accent; padding: 0 35 2 0; layer: composer; }
+    #composer-controls { height: 2; layer: controls; dock: bottom; align: right middle; }
+    #mode-picker, #mode-chip, #composer-model, #composer-effort, #send { height: 1; color: $text-muted; }
+    #mode-picker { width: 3; }
+    #mode-chip { width: auto; }
+    #composer-model, #composer-effort { width: auto; }
+    #send { width: 8; }
     #command-palette { display: none; height: auto; max-height: 12; border: round $secondary; }
     """
 
@@ -301,15 +329,16 @@ class GuardedPyApp(App[None]):
         self._session_command_workers: dict[str, Thread] = {}
         self._palette_index = -1
         self._suppress_palette_once = False
-        self._pending_credential_request: tuple[str, TaskIntent, str | None] | None = None
+        self._pending_credential_request: tuple[str, TaskIntent, str | None, str | None] | None = None
         self._conversation_store: ConversationStore | None = None
         self._conversation_id: UUID | None = None
         self._live_event_cursors: dict[UUID, int] = {}
         self._live_finalized_task_ids: set[UUID] = set()
         self._live_task_timer: Timer | None = None
+        self._session_goal: str | None = None
+        self._mode: Literal["coding", "plan", "review", "goal"] = "coding"
 
     def compose(self) -> ComposeResult:
-        config = self.runtime.config
         yield Static(self._status_text(), id="status")
         yield Vertical(
             TranscriptLog(id="transcript", highlight=False),
@@ -320,16 +349,29 @@ class GuardedPyApp(App[None]):
             *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}" ) for command in COMMANDS),
             id="command-palette",
         )
-        yield Vertical(Composer(id="composer"), Button("发送", id="send", disabled=True), id="composer-shell")
+        yield Vertical(
+            Composer(id="composer"),
+            Horizontal(
+                Button("＋", id="mode-picker"),
+                Static("", id="mode-chip"),
+                Button(self.runtime.config.model, id="composer-model"),
+                Button(self.runtime.config.reasoning_effort, id="composer-effort"),
+                Button("发送", id="send", disabled=True),
+                id="composer-controls",
+            ),
+            id="composer-shell",
+        )
 
     def on_mount(self) -> None:
         self._clear_live_task_status()
+        self._refresh_composer_controls()
         if self.initial_task:
             self.call_after_refresh(self.submit, self.initial_task)
 
     def on_unmount(self) -> None:
         """Request cancellation before the app relinquishes a daemon worker's runtime lease."""
         self._stop_live_task(clear_status=False)
+        self._session_goal = None
         self._cancel_active_task(render=False)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
@@ -400,7 +442,21 @@ class GuardedPyApp(App[None]):
         if request.startswith("/"):
             self._submit_command(request)
             return
-        self._require_credential_then_submit(request, TaskIntent.CODING)
+        mode = self._mode
+        if mode == "goal":
+            self._set_session_goal(request)
+            return
+        self._mode = "coding"
+        self._refresh_composer_controls()
+        if mode == "plan":
+            self._require_credential_then_submit(request, TaskIntent.PLAN, session_goal=self._session_goal)
+            return
+        if mode == "review":
+            self._require_credential_then_submit(
+                "Review project", TaskIntent.REVIEW, request, session_goal=self._session_goal
+            )
+            return
+        self._require_credential_then_submit(request, TaskIntent.CODING, session_goal=self._session_goal)
 
     def request_approval(
         self,
@@ -483,14 +539,27 @@ class GuardedPyApp(App[None]):
         if name == "/effort":
             self._open_settings("reasoning_effort", ("high", "max"))
             return
+        if name == "/goal":
+            if argument == "clear":
+                self._session_goal = None
+                self._mode = "coding"
+                self._refresh_composer_controls()
+            elif argument:
+                self._set_session_goal(argument)
+            else:
+                self._write("目标不能为空。")
+            return
         if name == "/plan":
-            self._require_credential_then_submit(argument, TaskIntent.PLAN)
+            self._require_credential_then_submit(argument, TaskIntent.PLAN, session_goal=self._session_goal)
             return
         if name == "/review":
-            self._require_credential_then_submit("Review project", TaskIntent.REVIEW, argument or None)
+            self._require_credential_then_submit(
+                "Review project", TaskIntent.REVIEW, argument or None, session_goal=self._session_goal
+            )
             return
         if name == "/exit":
             if self._active_task is None:
+                self._session_goal = None
                 self.exit()
             else:
                 self.push_screen(ExitScreen(), self._exit_resolved)
@@ -525,6 +594,7 @@ class GuardedPyApp(App[None]):
         composer.text = ""
         composer.focus()
         self.query_one("#status", Static).update(self._status_text())
+        self._refresh_composer_controls()
 
     def _start_session_command(self, command: str) -> None:
         if command in self._session_command_workers:
@@ -563,7 +633,8 @@ class GuardedPyApp(App[None]):
             self._write("凭据操作失败。")
 
     def _require_credential_then_submit(
-        self, text: str, intent: TaskIntent, review_path: str | None = None
+        self, text: str, intent: TaskIntent, review_path: str | None = None,
+        session_goal: str | None = None,
     ) -> None:
         if not text.strip():
             self._write("任务描述不能为空。")
@@ -577,9 +648,9 @@ class GuardedPyApp(App[None]):
             self._write("凭据状态不可用。")
             return
         if configured:
-            self._start_task(text, intent, review_path)
+            self._start_task(text, intent, review_path, session_goal)
             return
-        self._pending_credential_request = (text, intent, review_path)
+        self._pending_credential_request = (text, intent, review_path, session_goal)
         self.push_screen(CredentialScreen(False), self._credential_resolved)
 
     def _resume_pending_credential_request(self) -> None:
@@ -601,14 +672,20 @@ class GuardedPyApp(App[None]):
         if not confirmed:
             return
         self._cancel_active_task()
+        self._session_goal = None
         self.exit()
 
-    def _start_task(self, description: str, intent: TaskIntent, review_path: str | None = None) -> None:
+    def _start_task(
+        self, description: str, intent: TaskIntent, review_path: str | None = None,
+        session_goal: str | None = None,
+    ) -> None:
         if not description.strip():
             self._write("任务描述不能为空。")
             return
         try:
-            task = self.runtime.create_task(description, intent, review_path=review_path)
+            task = self.runtime.create_task(
+                description, intent, review_path=review_path, session_goal=session_goal
+            )
             store = self._conversation_store_for_session()
             if self._conversation_id is None:
                 self._conversation_id = store.create().id
@@ -629,6 +706,9 @@ class GuardedPyApp(App[None]):
 
     def _new_conversation(self) -> None:
         self._conversation_id = None
+        self._session_goal = None
+        self._mode = "coding"
+        self._refresh_composer_controls()
         self._stop_live_task()
         self.query_one("#transcript", Log).clear()
         composer = self.query_one("#composer", Composer)
@@ -786,8 +866,47 @@ class GuardedPyApp(App[None]):
             self._clear_live_task_status()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "send":
+        if event.button.id == "mode-picker":
+            self.push_screen(ModePickerScreen(), self._mode_resolved)
+        elif event.button.id == "composer-model":
+            self._open_settings("model", ("deepseek-v4-flash", "deepseek-v4-pro"))
+        elif event.button.id == "composer-effort":
+            self._open_settings("reasoning_effort", ("high", "max"))
+        elif event.button.id == "send":
             self.submit(self.query_one("#composer", Composer).text)
+
+    def _mode_resolved(self, mode: Literal["plan", "review", "goal"] | None) -> None:
+        if mode is None:
+            return
+        self._mode = mode
+        self._refresh_composer_controls()
+        composer = self.query_one("#composer", Composer)
+        composer.focus()
+
+    def _set_session_goal(self, value: str) -> None:
+        goal = value.strip()
+        if not goal:
+            self._write("目标不能为空。")
+            return
+        self._session_goal = goal
+        self._mode = "coding"
+        self._refresh_composer_controls()
+
+    def _refresh_composer_controls(self) -> None:
+        composer = self.query_one("#composer", Composer)
+        chip = self.query_one("#mode-chip", Static)
+        labels = {"plan": "[计划]", "review": "[审查]", "goal": "[目标]"}
+        label = labels.get(self._mode) or ("[目标]" if self._session_goal else "")
+        chip.update(label)
+        chip.display = bool(label)
+        composer.placeholder = {
+            "coding": "输入任务",
+            "plan": "输入规划任务",
+            "review": "输入项目根内相对审查路径",
+            "goal": "输入会话目标",
+        }[self._mode]
+        self.query_one("#composer-model", Button).label = self.runtime.config.model
+        self.query_one("#composer-effort", Button).label = self.runtime.config.reasoning_effort
 
     def _status_text(self, task: TaskState | None = None) -> str:
         del task

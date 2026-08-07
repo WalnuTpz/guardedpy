@@ -56,8 +56,14 @@ class _Runtime:
         assert key
         self.configured = True
 
-    def create_task(self, description: str, intent: object, review_path: str | None = None) -> TaskState:
-        task = TaskState(description=description, config=self.config, intent=intent, review_path=review_path)
+    def create_task(
+        self, description: str, intent: object, review_path: str | None = None,
+        session_goal: str | None = None,
+    ) -> TaskState:
+        task = TaskState(
+            description=description, config=self.config, intent=intent,
+            review_path=review_path, session_goal=session_goal,
+        )
         self.created.append(task)
         return task
 
@@ -145,7 +151,7 @@ def test_tui_mounts_safe_session_widgets_and_filters_exact_command_palette(tmp_p
             assert tuple(COMMANDS) == (
                 "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
                 "/tests", "/diff", "/permissions", "/credentials", "/memory",
-                "/model", "/effort", "/doctor", "/help",
+                "/model", "/effort", "/goal", "/doctor", "/help",
             )
 
     asyncio.run(check())
@@ -250,7 +256,7 @@ def test_tui_cancels_a_real_blocking_local_runtime_without_freezing_the_session(
     app = GuardedPyApp(runtime, profile)
 
     async def check() -> None:
-        timer = Timer(0.3, orchestrator.release.set)
+        timer = Timer(1, orchestrator.release.set)
         timer.start()
         try:
             async with app.run_test() as pilot:
@@ -743,6 +749,7 @@ def test_tui_palette_wheel_and_click_are_fill_first_before_enter(tmp_path: Path)
             composer.text = "/h"
             await pilot.pause()
             await pilot.click("#command-history")
+            await pilot.pause()
             assert composer.text == "/history"
             assert runtime.history_reads == 0
             await pilot.press("enter")
@@ -893,7 +900,7 @@ def test_tui_send_button_is_inside_composer_and_matches_enter(tmp_path: Path) ->
             composer = app.query_one("#composer", Composer)
             send = app.query_one("#send", Button)
             shell = app.query_one("#composer-shell")
-            assert composer.parent is shell and send.parent is shell
+            assert composer.parent is shell and send.parent.parent is shell
             assert send.region.x >= composer.region.x + composer.region.width - send.region.width
             assert send.region.y >= composer.region.y + composer.region.height - send.region.height
             assert send.region.right <= composer.region.right
@@ -905,6 +912,84 @@ def test_tui_send_button_is_inside_composer_and_matches_enter(tmp_path: Path) ->
             await pilot.click("#send")
             await pilot.pause()
             assert runtime.created[0].description == "click sends"
+
+    asyncio.run(check())
+
+
+def test_tui_composer_modes_dispatch_once_and_keep_goal_ephemeral(tmp_path: Path) -> None:
+    """Catches a decorative mode picker or Goal reaching task, credential, or transcript state."""
+    from guardedpy.tui import Composer, GuardedPyApp
+    from textual.css.query import NoMatches
+    from textual.widgets import Button, ListItem, Static
+
+    profile = _profile(tmp_path)
+    runtime = _Runtime(profile)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            shell = app.query_one("#composer-shell")
+            assert shell.styles.height.value == 6
+            assert app.query_one("#mode-chip", Static).display is False
+            mode_picker = app.query_one("#mode-picker", Button)
+            assert mode_picker.styles.height.value == 1
+            assert mode_picker.styles.color is not None
+            assert runtime.config.model in str(app.query_one("#composer-model", Button).render())
+            assert runtime.config.reasoning_effort in str(app.query_one("#composer-effort", Button).render())
+
+            await pilot.click("#mode-picker")
+            await pilot.pause()
+            assert [str(item.query_one(Static).render()) for item in app.screen.query(ListItem)] == [
+                "计划", "审查", "目标"
+            ]
+            await pilot.press("enter")
+            await pilot.pause()
+            assert str(app.query_one("#mode-chip", Static).render()) == "[计划]"
+            app.submit("draft migration")
+            await pilot.pause()
+            assert runtime.created[-1].intent is TaskIntent.PLAN
+            assert app.query_one("#mode-chip", Static).display is False
+            app._cancel_active_task()
+
+            await pilot.click("#mode-picker")
+            await pilot.pause()
+            await pilot.click("#mode-review")
+            await pilot.pause()
+            app.submit("src/app.py")
+            await pilot.pause()
+            assert runtime.created[-1].intent is TaskIntent.REVIEW
+            assert runtime.created[-1].review_path == "src/app.py"
+            app._cancel_active_task()
+
+            runtime.configured = False
+            await pilot.click("#mode-picker")
+            await pilot.pause()
+            await pilot.press("down", "down", "enter")
+            await pilot.pause()
+            assert str(app.query_one("#mode-chip", Static).render()) == "[目标]"
+            before_goal = len(runtime.created)
+            app.submit("release checklist")
+            await pilot.pause()
+            assert len(runtime.created) == before_goal
+            assert "release checklist" not in "\n".join(app.query_one("#transcript").lines)
+            with pytest.raises(NoMatches):
+                app.screen.query_one("#credential-value")
+            runtime.configured = True
+            app.submit("repair value")
+            await pilot.pause()
+            assert runtime.created[-1].session_goal == "release checklist"
+            app._cancel_active_task()
+
+            app.submit("/goal clear")
+            await pilot.pause()
+            assert app.query_one("#mode-chip", Static).display is False
+            app.submit("/goal release checklist")
+            await pilot.pause()
+            assert str(app.query_one("#mode-chip", Static).render()) == "[目标]"
+            app.submit("/new")
+            await pilot.pause()
+            assert app.query_one("#mode-chip", Static).display is False
+            assert isinstance(app.query_one("#composer"), Composer)
 
     asyncio.run(check())
 
