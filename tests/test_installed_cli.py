@@ -266,7 +266,7 @@ def test_local_wheel_runs_the_cli_and_sdist_is_scanned_without_the_source_checko
     demo_result = _run([str(guardedpy), "demo"], cwd=target, env=command_env)
     assert demo_result.returncode == 0, demo_result.stderr
     assert demo_result.stdout.splitlines() == [
-        "dangerous_action_denied status=blocked",
-        "failure_feedback_corrects status=completed",
-        "tdd_source_patch_denied status=blocked",
+        "delete_approval_rejected status=completed",
+        "feedback_repair status=completed",
+        "stale_approval_denied status=completed",
     ]
