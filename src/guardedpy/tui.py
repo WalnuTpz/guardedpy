@@ -41,7 +41,7 @@ class TranscriptLog(Log):
     """Selectable log that preserves one fixed safe UI projection per line."""
 
     def write(self, data: str, scroll_end: bool | None = None) -> "TranscriptLog":
-        super().write_lines([data], scroll_end=scroll_end)
+        super().write(f"{data}\n", scroll_end=scroll_end)
         return self
 
 

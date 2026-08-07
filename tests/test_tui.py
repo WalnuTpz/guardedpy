@@ -189,11 +189,14 @@ def test_tui_transcript_records_the_submitted_user_request_before_lifecycle(tmp_
 
     async def check() -> None:
         async with app.run_test() as pilot:
+            app._write("first safe projection")
+            app._write("second safe projection")
+            transcript = app.query_one("#transcript", Log)
+            assert transcript.lines[:2] == ["first safe projection", "second safe projection"]
             app.submit("repair value")
             await pilot.pause()
             await app.workers.wait_for_complete()
-            transcript = app.query_one("#transcript", Log)
-            assert transcript.lines[0] == "用户：repair value"
+            assert transcript.lines[2] == "用户：repair value"
 
     asyncio.run(check())
 
@@ -373,7 +376,7 @@ def test_tui_status_is_unknown_and_idle_status_explains_first_task_test_scope(tm
             assert "首个任务将运行完整测试" not in str(
                 app.query_one("#status").render()
             )
-            assert app.query_one("#transcript", Log).lines[-1] == "未知命令。"
+            assert app.query_one("#transcript", Log).lines[-2] == "未知命令。"
 
     asyncio.run(check())
 
@@ -400,7 +403,7 @@ def test_tui_rejects_trailing_arguments_for_no_argument_commands(
             await pilot.pause()
 
             assert transcript.lines[0] == "保留的会话记录"
-            assert transcript.lines[-1] == "未知命令。"
+            assert transcript.lines[-2] == "未知命令。"
 
     asyncio.run(check())
 
@@ -859,7 +862,7 @@ def test_tui_requires_masked_credential_before_creating_llm_task(tmp_path: Path)
             await pilot.click("#credential-cancel")
             await pilot.pause()
             transcript = app.query_one("#transcript", Log)
-            assert transcript.lines[-1] == "未配置凭据，任务未开始。"
+            assert transcript.lines[-2] == "未配置凭据，任务未开始。"
 
     asyncio.run(check())
 
