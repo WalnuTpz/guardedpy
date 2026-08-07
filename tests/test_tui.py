@@ -11,7 +11,7 @@ from textual.css.query import NoMatches
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import TaskIntent, TaskState, TaskStatus
+from guardedpy.domain import FeedbackKind, TaskIntent, TaskState, TaskStatus
 from guardedpy.events import StoredRunEvent
 from guardedpy.runtime import LocalRuntime, RuntimeServices
 
@@ -164,9 +164,10 @@ def test_tui_lifecycle_tracks_baseline_task_and_safe_cancel_exit(tmp_path: Path)
             app.submit("repair value")
             await pilot.pause()
             await app.workers.wait_for_complete()
-            assert "基线：baseline_pending · 任务：waiting_approval" in str(
-                app.query_one("#status").render()
-            )
+            status = str(app.query_one("#status").render())
+            assert str(profile.root) in status
+            assert "baseline" not in status
+            assert "waiting_approval" not in status
             await pilot.press("ctrl+c")
             assert runtime.cancelled == [runtime.created[0].id]
             app.submit("repair value")
@@ -196,7 +197,7 @@ def test_tui_transcript_records_the_submitted_user_request_before_lifecycle(tmp_
             app.submit("repair value")
             await pilot.pause()
             await app.workers.wait_for_complete()
-            assert transcript.lines[2] == "用户：repair value"
+            assert transcript.lines[2] == "› repair value"
 
     asyncio.run(check())
 
@@ -439,6 +440,7 @@ def test_tui_approval_modal_shows_only_safe_projection(tmp_path: Path) -> None:
 def test_tui_rejected_approval_closes_modal_and_renders_the_blocked_task(tmp_path: Path) -> None:
     """Catches a valid rejection being treated like an invalid approval response."""
     from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Log
 
     class RejectingRuntime(_Runtime):
         def resolve_approval(self, task_id: object, action_hash: str, decision: object) -> bool:
@@ -467,7 +469,7 @@ def test_tui_rejected_approval_closes_modal_and_renders_the_blocked_task(tmp_pat
             await pilot.pause()
 
             assert app._active_task is None
-            assert "任务：blocked" in str(app.query_one("#status").render())
+            assert "GuardedPy：任务已阻止。" in "\n".join(app.query_one("#transcript", Log).lines)
 
     asyncio.run(check())
 
@@ -583,6 +585,136 @@ def test_tui_palette_selection_fills_then_second_enter_executes_and_model_picker
             assert runtime.updated == {"model": "deepseek-v4-pro"}
             assert composer.text == ""
             assert not isinstance(app.screen, SettingsScreen)
+
+    asyncio.run(check())
+
+
+def test_tui_message_flow_renders_safe_incremental_history_and_one_live_task_status(
+    tmp_path: Path,
+) -> None:
+    """Catches a delayed lifecycle dump, duplicate events, or raw audit leakage."""
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Log, Static
+
+    class BlockingLiveRuntime(_Runtime):
+        def __init__(self, profile: ProjectProfile) -> None:
+            super().__init__(profile)
+            self.started = Event()
+            self.release = Event()
+            self._events: list[StoredRunEvent] = []
+
+        def events(self, task_id: object) -> list[StoredRunEvent]:
+            assert self.created and task_id == self.created[0].id
+            return list(self._events)
+
+        def run(self, task_id: object) -> TaskState:
+            task = next(task for task in self.created if task.id == task_id)
+            task.status = TaskStatus.RUNNING
+            self.started.set()
+            self.release.wait(timeout=2)
+            task.status = TaskStatus.COMPLETED
+            return task
+
+    profile = _profile(tmp_path)
+    runtime = BlockingLiveRuntime(profile)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("repair value")
+            await pilot.pause()
+            assert runtime.started.is_set()
+            transcript = app.query_one("#transcript", Log)
+            live_status = app.query_one("#live-task-status", Static)
+            assert "› repair value" in transcript.lines
+            assert live_status.display is True
+            initial_live_status = str(live_status.render())
+
+            task = runtime.created[0]
+            runtime._events.append(
+                StoredRunEvent(
+                    id=1,
+                    task_id=task.id,
+                    task_status=TaskStatus.RUNNING,
+                    action_summary="run configured tests",
+                    feedback_kind=FeedbackKind.PASSED,
+                    action_projection="raw-secret-marker",
+                )
+            )
+            await asyncio.sleep(0.2)
+            history = "\n".join(transcript.lines)
+            assert history.count("运行配置测试") == 1
+            assert history.count("pytest passed") == 1
+            assert "raw-secret-marker" not in history
+            assert str(live_status.render()) != initial_live_status
+            assert live_status.display is True
+
+            runtime.release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert live_status.display is False
+            assert str(live_status.render()) == ""
+            assert "GuardedPy：任务完成。" in "\n".join(transcript.lines)
+            status = str(app.query_one("#status", Static).render())
+            assert str(profile.root) in status
+            for removed_detail in ("模型", "effort", "基线", "任务"):
+                assert removed_detail not in status
+
+    asyncio.run(check())
+
+
+def test_tui_transcript_history_replays_safe_completed_messages_without_live_task_status(
+    tmp_path: Path,
+) -> None:
+    """Catches restored conversations rebuilding a lifecycle dump or stale live row."""
+    from guardedpy.conversations import ConversationStore
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Log, Static
+
+    class HistoryRuntime(_Runtime):
+        def __init__(self, profile: ProjectProfile) -> None:
+            super().__init__(profile)
+            self.completed = TaskState(description="repair value", config=self.config)
+            self.completed.status = TaskStatus.COMPLETED
+            self._events = [
+                StoredRunEvent(
+                    id=1,
+                    task_id=self.completed.id,
+                    task_status=TaskStatus.COMPLETED,
+                    action_summary="run configured tests",
+                    feedback_kind=FeedbackKind.PASSED,
+                    action_projection="raw-secret-marker",
+                )
+            ]
+
+        def task(self, task_id: object) -> TaskState:
+            assert task_id == self.completed.id
+            return self.completed
+
+        def events(self, task_id: object) -> list[StoredRunEvent]:
+            assert task_id == self.completed.id
+            return list(self._events)
+
+    profile = _profile(tmp_path)
+    runtime = HistoryRuntime(profile)
+    store = ConversationStore(profile.root)
+    conversation = store.create()
+    store.attach_task(conversation.id, runtime.completed.id)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test():
+            app._conversation_selected(conversation.id)
+            transcript = app.query_one("#transcript", Log)
+            history = "\n".join(transcript.lines)
+            assert "› repair value" in history
+            assert history.count("运行配置测试") == 1
+            assert history.count("pytest passed") == 1
+            assert "GuardedPy：任务完成。" in history
+            assert "raw-secret-marker" not in history
+            live_status = app.query_one("#live-task-status", Static)
+            assert live_status.display is False
+            assert str(live_status.render()) == ""
 
     asyncio.run(check())
 
@@ -806,10 +938,10 @@ def test_tui_transcript_is_selectable_safe_log_and_unavailable_keyring_never_ope
     asyncio.run(check())
 
 
-def test_tui_conversation_selection_restores_safe_lifecycle_and_new_confirms_active_cancel(
+def test_tui_conversation_selection_restores_cli_history_and_new_confirms_active_cancel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catches historical selection leaking task descriptions or /new abandoning active work."""
+    """Catches history losing its safe user entry or /new abandoning active work."""
     from guardedpy.conversations import ConversationStore
     from guardedpy.tui import Composer, GuardedPyApp
     from textual.widgets import Log
@@ -817,7 +949,7 @@ def test_tui_conversation_selection_restores_safe_lifecycle_and_new_confirms_act
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     profile = _profile(tmp_path)
     runtime = _Runtime(profile)
-    task = TaskState(description="raw secret prompt", config=runtime.config)
+    task = TaskState(description="repair value", config=runtime.config)
     task.status = TaskStatus.COMPLETED
     runtime.created.append(task)
     conversation = ConversationStore(profile.root).create()
@@ -832,8 +964,8 @@ def test_tui_conversation_selection_restores_safe_lifecycle_and_new_confirms_act
             await pilot.pause()
             transcript = app.query_one("#transcript", Log)
             rendered = "\n".join(line for line in transcript.lines)
-            assert f"任务 {task.id}：completed" in rendered
-            assert "raw secret prompt" not in rendered
+            assert "› repair value" in rendered
+            assert "GuardedPy：任务完成。" in rendered
             composer = app.query_one("#composer", Composer)
             assert app.focused is composer
             assert composer.cursor_location == composer.document.end

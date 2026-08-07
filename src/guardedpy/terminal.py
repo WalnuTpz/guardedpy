@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import subprocess
 import sys
 from typing import Any, TextIO
@@ -10,12 +11,105 @@ from uuid import UUID
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialBackendUnavailableError
+from guardedpy.events import StoredRunEvent
 
 
 COMMANDS = (
     "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review", "/tests", "/diff",
     "/permissions", "/credentials", "/memory", "/model", "/effort", "/doctor", "/help",
 )
+
+
+_ACTION_MESSAGES = {
+    "list workspace files": "查看项目文件",
+    "read workspace file": "读取项目文件",
+    "apply source patch": "应用源码修改",
+    "delete workspace path": "删除项目内路径",
+    "run configured tests": "运行配置测试",
+    "run approved command": "运行已批准命令",
+    "request action approval": "请求人工审批",
+    "propose memory for user review": "提交记忆建议供用户审查",
+    "finish task": "结束任务",
+}
+_FEEDBACK_MESSAGES = {
+    "passed": "pytest passed",
+    "assertion_failure": "pytest assertion failure",
+    "collection_error": "pytest collection error",
+    "execution_error": "pytest execution error",
+    "timeout": "pytest timed out",
+}
+_POLICY_MESSAGES = {
+    "allow": "允许",
+    "approval_required": "需要人工审批",
+    "deny": "拒绝",
+}
+_STOP_MESSAGES = {
+    "service_restarted": "服务已重启",
+    "completed": "任务完成",
+    "blocked": "任务已阻止",
+    "cancelled": "任务已取消",
+    "interrupted": "任务已中断",
+    "round_limit": "达到轮次上限",
+    "repeated_action": "检测到重复动作",
+    "invalid_model_output": "模型输出无效",
+    "provider_temporary_failure": "提供方暂时不可用",
+    "unrecoverable_error": "发生不可恢复错误",
+}
+_FINAL_MESSAGES = {
+    TaskStatus.WAITING_APPROVAL: "GuardedPy：等待人工审批。",
+    TaskStatus.COMPLETED: "GuardedPy：任务完成。",
+    TaskStatus.BLOCKED: "GuardedPy：任务已阻止。",
+    TaskStatus.CANCELLED: "GuardedPy：任务已取消。",
+    TaskStatus.INTERRUPTED: "GuardedPy：任务已中断。",
+}
+
+
+@dataclass(frozen=True)
+class TaskMessageFlow:
+    """A safe TUI projection derived solely from task state and stored audit events."""
+
+    user_message: str
+    event_messages: tuple[str, ...]
+    final_message: str | None
+    live_status: str | None
+
+
+def task_message_flow(task: TaskState, events: tuple[StoredRunEvent, ...]) -> TaskMessageFlow:
+    """Map persisted safe audit fields to the CLI-like transcript without raw payloads."""
+    messages: list[str] = []
+    for event in events:
+        if event.action_summary:
+            messages.append(
+                f"GuardedPy：动作：{_ACTION_MESSAGES.get(event.action_summary, '执行受控动作')}"
+            )
+        if event.policy_verdict:
+            messages.append(
+                f"GuardedPy：策略：{_POLICY_MESSAGES[event.policy_verdict.value]}"
+            )
+        if event.feedback_kind:
+            messages.append(
+                f"GuardedPy：反馈：{_FEEDBACK_MESSAGES[event.feedback_kind.value]}"
+            )
+        if event.stop_reason:
+            messages.append(
+                f"GuardedPy：停止：{_STOP_MESSAGES[event.stop_reason.value]}"
+            )
+    final_message = _FINAL_MESSAGES.get(task.status)
+    live_status: str | None = None
+    if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
+        action = events[-1].action_summary if events else None
+        action_message = _ACTION_MESSAGES.get(action or "")
+        live_status = (
+            f"GuardedPy：正在{action_message}。"
+            if action_message
+            else "GuardedPy：正在处理任务。"
+        )
+    return TaskMessageFlow(
+        user_message=f"› {task.description}",
+        event_messages=tuple(messages),
+        final_message=final_message,
+        live_status=live_status,
+    )
 
 
 def render_help() -> tuple[str, ...]:

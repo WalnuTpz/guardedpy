@@ -12,13 +12,14 @@ from textual.containers import Vertical
 from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialBackendUnavailableError
 from guardedpy.mechanism_demo import ScenarioName, run_scenario
-from guardedpy.terminal import COMMANDS, lifecycle_lines, render_help, run_plain_session
+from guardedpy.terminal import COMMANDS, render_help, run_plain_session, task_message_flow
 
 
 _NO_ARGUMENT_COMMANDS = frozenset(
@@ -278,8 +279,10 @@ class GuardedPyApp(App[None]):
     """The single-project interactive terminal session."""
 
     CSS = """
-    #status { height: 3; padding: 0 1; background: $panel; }
-    #transcript { height: 1fr; border: round $primary; }
+    #status { height: 1; padding: 0 1; background: $panel; }
+    #transcript-shell { height: 1fr; border: round $primary; }
+    #transcript { height: 1fr; }
+    #live-task-status { height: 1; padding: 0 1; color: $text-muted; }
     #composer-shell { height: 5; layers: composer send; align: right bottom; }
     #composer { height: 5; border: round $accent; padding: 0 10 2 0; layer: composer; }
     #send { width: 8; height: 1; layer: send; }
@@ -301,11 +304,18 @@ class GuardedPyApp(App[None]):
         self._pending_credential_request: tuple[str, TaskIntent, str | None] | None = None
         self._conversation_store: ConversationStore | None = None
         self._conversation_id: UUID | None = None
+        self._live_event_cursors: dict[UUID, int] = {}
+        self._live_finalized_task_ids: set[UUID] = set()
+        self._live_task_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         config = self.runtime.config
         yield Static(self._status_text(), id="status")
-        yield TranscriptLog(id="transcript", highlight=False)
+        yield Vertical(
+            TranscriptLog(id="transcript", highlight=False),
+            Static("", id="live-task-status"),
+            id="transcript-shell",
+        )
         yield ListView(
             *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}" ) for command in COMMANDS),
             id="command-palette",
@@ -313,11 +323,13 @@ class GuardedPyApp(App[None]):
         yield Vertical(Composer(id="composer"), Button("发送", id="send", disabled=True), id="composer-shell")
 
     def on_mount(self) -> None:
+        self._clear_live_task_status()
         if self.initial_task:
             self.call_after_refresh(self.submit, self.initial_task)
 
     def on_unmount(self) -> None:
         """Request cancellation before the app relinquishes a daemon worker's runtime lease."""
+        self._stop_live_task(clear_status=False)
         self._cancel_active_task(render=False)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
@@ -596,14 +608,14 @@ class GuardedPyApp(App[None]):
             self._write("任务描述不能为空。")
             return
         try:
-            self._write(f"用户：{description}")
             task = self.runtime.create_task(description, intent, review_path=review_path)
             store = self._conversation_store_for_session()
             if self._conversation_id is None:
                 self._conversation_id = store.create().id
             store.attach_task(self._conversation_id, task.id)
             self._active_task = task
-            self.query_one("#status", Static).update(self._status_text(task))
+            self._write(task_message_flow(task, ()).user_message)
+            self._start_live_task(task)
             worker = Thread(target=self._run_task_in_thread, args=(task,), daemon=True)
             self._run_threads[task.id] = worker
             worker.start()
@@ -617,6 +629,7 @@ class GuardedPyApp(App[None]):
 
     def _new_conversation(self) -> None:
         self._conversation_id = None
+        self._stop_live_task()
         self.query_one("#transcript", Log).clear()
         composer = self.query_one("#composer", Composer)
         composer.focus()
@@ -631,10 +644,16 @@ class GuardedPyApp(App[None]):
         if conversation_id is None:
             return
         transcript = self.query_one("#transcript", Log)
+        self._stop_live_task()
         transcript.clear()
         for task_id in self._conversation_store_for_session().tasks(conversation_id):
             task = self.runtime.task(task_id)
-            for line in lifecycle_lines(self.runtime, task):
+            try:
+                events = tuple(self.runtime.events(task.id))
+            except Exception:
+                events = ()
+            flow = task_message_flow(task, events)
+            for line in (flow.user_message, *flow.event_messages, *([flow.final_message] if flow.final_message else [])):
                 self._write(line)
         self._conversation_id = conversation_id
         composer = self.query_one("#composer", Composer)
@@ -680,6 +699,9 @@ class GuardedPyApp(App[None]):
         if task_id in self._cancelled_task_ids:
             self._cancelled_task_ids.remove(task_id)
             return
+        self._stop_live_task(task_id)
+        if self._active_task is not None and self._active_task.id == task_id:
+            self._active_task = None
         self._write("无法启动任务。")
 
     def _task_run_finished(self, task: TaskState) -> None:
@@ -705,9 +727,7 @@ class GuardedPyApp(App[None]):
 
     def _render_task(self, task: TaskState) -> None:
         self._active_task = task if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL} else None
-        self.query_one("#status", Static).update(self._status_text(task))
-        for line in lifecycle_lines(self.runtime, task):
-            self._write(line)
+        self._render_live_task(task)
         if task.status is TaskStatus.WAITING_APPROVAL:
             for event in reversed(self.runtime.events(task.id)):
                 if event.action_projection and event.policy_rule_id and event.action_hash:
@@ -723,24 +743,55 @@ class GuardedPyApp(App[None]):
     def _write(self, value: object) -> None:
         self.query_one("#transcript", Log).write(str(value))
 
+    def _start_live_task(self, task: TaskState) -> None:
+        self._stop_live_task()
+        self._live_event_cursors[task.id] = 0
+        self._render_live_task(task)
+        self._live_task_timer = self.set_interval(0.1, lambda: self._render_live_task(task))
+
+    def _render_live_task(self, task: TaskState) -> None:
+        """Append only unseen safe audit messages and maintain one transient live row."""
+        try:
+            events = tuple(self.runtime.events(task.id))
+        except Exception:
+            events = ()
+        cursor = self._live_event_cursors.get(task.id, 0)
+        for event in events[cursor:]:
+            for line in task_message_flow(task, (event,)).event_messages:
+                self._write(line)
+        self._live_event_cursors[task.id] = len(events)
+        flow = task_message_flow(task, events)
+        if flow.live_status is not None:
+            live_status = self.query_one("#live-task-status", Static)
+            live_status.update(flow.live_status)
+            live_status.display = True
+            return
+        if task.id not in self._live_finalized_task_ids and flow.final_message is not None:
+            self._write(flow.final_message)
+            self._live_finalized_task_ids.add(task.id)
+        self._stop_live_task(task.id)
+
+    def _clear_live_task_status(self) -> None:
+        live_status = self.query_one("#live-task-status", Static)
+        live_status.update("")
+        live_status.display = False
+
+    def _stop_live_task(self, task_id: UUID | None = None, *, clear_status: bool = True) -> None:
+        if self._live_task_timer is not None:
+            self._live_task_timer.stop()
+            self._live_task_timer = None
+        if task_id is not None:
+            self._live_event_cursors.pop(task_id, None)
+        if clear_status:
+            self._clear_live_task_status()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "send":
             self.submit(self.query_one("#composer", Composer).text)
 
     def _status_text(self, task: TaskState | None = None) -> str:
-        config = self.runtime.config
-        active = task or self._active_task
-        if active is None:
-            return (
-                f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort}\n"
-                "已就绪 · 尚未提交任务"
-            )
-        baseline = active.path.value
-        status = active.status.value
-        return (
-            f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort}\n"
-            f"基线：{baseline} · 任务：{status} · 测试：完整套件"
-        )
+        del task
+        return f"项目：{self.profile.root}"
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id != "command-palette":
