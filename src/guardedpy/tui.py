@@ -27,7 +27,7 @@ from guardedpy.terminal import COMMANDS, render_help, run_plain_session, task_me
 _NO_ARGUMENT_COMMANDS = frozenset(
     {
         "/new", "/clear", "/history", "/conversations", "/exit", "/tests", "/diff",
-        "/credentials", "/doctor", "/help", "/model", "/effort",
+        "/credentials", "/doctor", "/help", "/model", "/effort", "/stop",
     }
 )
 
@@ -415,6 +415,7 @@ class GuardedPyApp(App[None]):
         self._conversation_runtime = conversation
         self._continuous_session_id: UUID | None = None
         self._continuous_turn_id: UUID | None = None
+        self._continuous_pending_approval: tuple[UUID, UUID, UUID] | None = None
         self._transcript_presenter = TranscriptPresenter()
 
     def compose(self) -> ComposeResult:
@@ -468,10 +469,15 @@ class GuardedPyApp(App[None]):
             self.query_one("#send", Button).disabled = not bool(event.text_area.text.strip())
 
     def on_key(self, event: Any) -> None:
-        if event.key == "ctrl+c" and self._active_task is not None:
+        if event.key == "ctrl+c" and (
+            self._active_task is not None or self._continuous_turn_id is not None
+        ):
             event.prevent_default()
             event.stop()
-            self._cancel_active_task()
+            if self._continuous_turn_id is not None:
+                self._interrupt_continuous()
+            else:
+                self._cancel_active_task()
 
     def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         """Make the custom composer message the sole interactive submit path."""
@@ -579,7 +585,54 @@ class GuardedPyApp(App[None]):
 
     def on_session_event_received(self, message: SessionEventReceived) -> None:
         self._present_session_event(message.event)
+        if message.event.kind == "approval_requested":
+            approval_id = UUID(message.event.data["approval_id"])
+            self._continuous_pending_approval = (
+                message.event.session_id, message.event.turn_id, approval_id
+            )
+            self.push_screen(
+                ApprovalScreen(
+                    message.event.data.get("tool", "受控操作"),
+                    message.event.data.get("rule_id", "approval.required"),
+                    False,
+                ),
+                self._continuous_approval_resolved,
+            )
         if message.event.kind in {"turn_completed", "turn_interrupted", "turn_failed"}:
+            self._continuous_turn_id = None
+
+    def _continuous_approval_resolved(self, decision: str | None) -> None:
+        pending = self._continuous_pending_approval
+        if decision is None or pending is None:
+            return
+        self._continuous_pending_approval = None
+        Thread(
+            target=self._resolve_continuous_approval,
+            args=(*pending, decision != "reject"),
+            daemon=True,
+        ).start()
+
+    def _resolve_continuous_approval(
+        self, session_id: UUID, turn_id: UUID, approval_id: UUID, accepted: bool
+    ) -> None:
+        try:
+            for event in self._conversation_runtime.resolve_approval(
+                session_id, turn_id, approval_id, accepted
+            ):
+                self.post_message(SessionEventReceived(event))
+        except Exception:
+            self.post_message(SessionEventReceived(
+                SessionEvent(session_id, turn_id, 0, "turn_failed", data={"code": "surface_failure"})
+            ))
+
+    def _interrupt_continuous(self) -> None:
+        if self._continuous_session_id is None or self._continuous_turn_id is None:
+            return
+        event = self._conversation_runtime.interrupt(
+            self._continuous_session_id, self._continuous_turn_id
+        )
+        if event is not None:
+            self._present_session_event(event)
             self._continuous_turn_id = None
 
     def _present_session_event(self, event: SessionEvent) -> None:
@@ -678,10 +731,32 @@ class GuardedPyApp(App[None]):
             else:
                 self._write("目标不能为空。")
             return
+        if name == "/stop":
+            self._interrupt_continuous()
+            return
+        if name == "/queue":
+            if not argument or self._continuous_session_id is None or self._continuous_turn_id is None:
+                self._write("没有可排队的活跃会话。")
+                return
+            try:
+                _, event = self._conversation_runtime.queue(
+                    self._continuous_session_id, argument, "normal"
+                )
+            except Exception:
+                self._write("无法排队下一轮。")
+                return
+            self._present_session_event(event)
+            return
         if name == "/plan":
+            if self._conversation_runtime is not None:
+                self._submit_continuous(argument, "plan")
+                return
             self._require_credential_then_submit(argument, TaskIntent.PLAN, session_goal=self._session_goal)
             return
         if name == "/review":
+            if self._conversation_runtime is not None:
+                self._submit_continuous(argument or "Review project", "review")
+                return
             self._require_credential_then_submit(
                 "Review project", TaskIntent.REVIEW, argument or None, session_goal=self._session_goal
             )
@@ -1051,14 +1126,14 @@ class DemoApp(App[None]):
     """Offline, fixed-scenario Textual mechanism demonstration."""
 
     _scenarios: tuple[ScenarioName, ...] = (
-        "dangerous_action_denied",
-        "failure_feedback_corrects",
-        "tdd_source_patch_denied",
+        "delete_approval_rejected",
+        "feedback_repair",
+        "stale_approval_denied",
     )
     _requests = {
-        "dangerous_action_denied": "Attempt a prohibited privileged action.",
-        "failure_feedback_corrects": "Correct the selected assertion failure.",
-        "tdd_source_patch_denied": "Attempt a source patch before observing red.",
+        "delete_approval_rejected": "Reject an exact deletion approval.",
+        "feedback_repair": "Correct the selected assertion failure.",
+        "stale_approval_denied": "Reject a forged or stale approval identifier.",
     }
 
     def __init__(self) -> None:

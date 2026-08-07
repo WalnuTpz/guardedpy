@@ -119,9 +119,9 @@ def test_demo_non_tty_is_offline_and_never_composes_project_runtime(monkeypatch:
     output = StringIO()
     assert main(["demo"], runtime_factory=lambda: (_ for _ in ()).throw(AssertionError()), stdin=StringIO(), stdout=output) == 0
     assert output.getvalue().splitlines() == [
-        "dangerous_action_denied status=blocked",
-        "failure_feedback_corrects status=completed",
-        "tdd_source_patch_denied status=blocked",
+        "delete_approval_rejected status=completed",
+        "feedback_repair status=completed",
+        "stale_approval_denied status=completed",
     ]
 
 

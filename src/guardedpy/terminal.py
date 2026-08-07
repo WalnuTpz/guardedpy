@@ -18,6 +18,7 @@ from guardedpy.events import StoredRunEvent
 COMMANDS = (
     "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review", "/tests", "/diff",
     "/permissions", "/credentials", "/memory", "/model", "/effort", "/goal", "/doctor", "/help",
+    "/stop", "/queue",
 )
 
 
@@ -270,7 +271,15 @@ def run_plain_conversation(
             continue
         if text == "/exit":
             return 0
-        turn_id, user_event = runtime.begin_turn(session_id, text, "normal")
+        name, _, argument = text.partition(" ")
+        mode = "normal"
+        if name in {"/plan", "/review"}:
+            mode = name.removeprefix("/")
+            text = argument or ("Review project" if mode == "review" else "")
+            if not text:
+                output.write("任务描述不能为空。\n")
+                return 2
+        turn_id, user_event = runtime.begin_turn(session_id, text, mode)
         _render_conversation_event(user_event, output)
         for event in runtime.run_turn(session_id, turn_id):
             if event.kind == "approval_requested":

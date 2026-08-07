@@ -151,7 +151,7 @@ def test_tui_mounts_safe_session_widgets_and_filters_exact_command_palette(tmp_p
             assert tuple(COMMANDS) == (
                 "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
                 "/tests", "/diff", "/permissions", "/credentials", "/memory",
-                "/model", "/effort", "/goal", "/doctor", "/help",
+                "/model", "/effort", "/goal", "/doctor", "/help", "/stop", "/queue",
             )
 
     asyncio.run(check())
@@ -1143,7 +1143,7 @@ def test_demo_selector_presents_fixed_request_then_runs_selected_scenario(
 
     def runner(name: str) -> ScenarioResult:
         calls.append(name)
-        return ScenarioResult(name, "completed", None, None, False, (), "fixed")
+        return ScenarioResult(name, "completed", (), "fixed")
 
     monkeypatch.setattr("guardedpy.tui.run_scenario", runner)
     app = DemoApp()
@@ -1155,7 +1155,7 @@ def test_demo_selector_presents_fixed_request_then_runs_selected_scenario(
                 app.query_one("#demo-request").render()
             )
             await pilot.press("enter")
-            assert calls == ["failure_feedback_corrects"]
+            assert calls == ["feedback_repair"]
 
     asyncio.run(check())
 
@@ -1277,3 +1277,64 @@ def test_transcript_presenter_uses_safe_tool_and_approval_status_wording(
 
     assert update.text == expected
     assert all(prefix not in update.text for prefix in ("GuardedPy：动作", "GuardedPy：策略", "GuardedPy：反馈", "GuardedPy：停止"))
+
+
+def test_tui_continuous_approval_queue_and_stop_controls_reach_runtime(tmp_path: Path) -> None:
+    import asyncio
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import ApprovalScreen, GuardedPyApp
+
+    session_id, turn_id, approval_id, queued_id = uuid4(), uuid4(), uuid4(), uuid4()
+
+    class Conversation:
+        def __init__(self) -> None:
+            self.resolutions: list[bool] = []
+            self.queues: list[str] = []
+            self.interrupts = 0
+
+        def create_session(self, title: str) -> object:
+            return session_id
+
+        def begin_turn(self, session: object, text: str, mode: str) -> tuple[object, SessionEvent]:
+            return turn_id, SessionEvent(session_id, turn_id, 1, "user_message", uuid4(), text)
+
+        def run_turn(self, session: object, turn: object) -> tuple[SessionEvent, ...]:
+            return (SessionEvent(session_id, turn_id, 2, "approval_requested", uuid4(), data={"approval_id": str(approval_id), "tool": "delete_path", "rule_id": "delete.approval"}),)
+
+        def resolve_approval(self, session: object, turn: object, approval: object, accepted: bool) -> tuple[SessionEvent, ...]:
+            self.resolutions.append(accepted)
+            return (SessionEvent(session_id, turn_id, 3, "approval_resolved", uuid4(), data={"accepted": "false"}), SessionEvent(session_id, turn_id, 4, "turn_completed"))
+
+        def queue(self, session: object, text: str, mode: str) -> tuple[object, SessionEvent]:
+            self.queues.append(text)
+            return queued_id, SessionEvent(session_id, queued_id, 1, "user_message", uuid4(), text, {"queued": "true"})
+
+        def interrupt(self, session: object, turn: object) -> SessionEvent:
+            self.interrupts += 1
+            return SessionEvent(session_id, turn_id, 5, "turn_interrupted")
+
+    profile = _profile(tmp_path)
+    conversation = Conversation()
+    app = GuardedPyApp(_Runtime(profile), profile, conversation=conversation)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("hello")
+            await pilot.pause()
+            assert isinstance(app.screen, ApprovalScreen)
+            await pilot.click("#approval-reject")
+            await pilot.pause()
+            assert conversation.resolutions == [False]
+            app._continuous_session_id = session_id
+            app._continuous_turn_id = turn_id
+            app.submit("/queue later")
+            assert conversation.queues == ["later"]
+            await pilot.press("ctrl+c")
+            assert conversation.interrupts == 1
+            app._continuous_turn_id = turn_id
+            app.submit("/stop")
+            assert conversation.interrupts == 2
+
+    asyncio.run(check())
