@@ -466,6 +466,8 @@ class GuardedPyApp(App[None]):
                 command = str(item.query_one(Static).render())
                 item.display = command.startswith(prefix)
             self._palette_index = -1
+            palette.index = None
+            palette.scroll_home(animate=False)
             self.query_one("#send", Button).disabled = not bool(event.text_area.text.strip())
 
     def on_key(self, event: Any) -> None:
