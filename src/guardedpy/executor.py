@@ -53,7 +53,9 @@ class ToolExecutor:
             if not isinstance(nodes, list) or not all(isinstance(node, str) for node in nodes) or not len(nodes) <= 20:
                 return self._failure(call, "invalid_tool_call")
             run = self._workspace.run_pytest(tuple(nodes))
-            feedback = self._feedback.collect(run)
+            feedback = FeedbackCollector.normalize_nodes(
+                self._feedback.collect(run), self._workspace.root, self._workspace.config.test_dirs
+            )
             if not nodes and feedback.kind.value == "passed":
                 turn.needs_full_verification = False
             kind = feedback.kind.value
@@ -136,8 +138,9 @@ class ToolExecutor:
 
 def _existing_patch_paths(diff: str) -> tuple[str, ...]:
     paths: list[str] = []
-    for line in diff.splitlines():
-        if not line.startswith("--- "):
+    lines = diff.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("--- ") or index + 1 == len(lines) or not lines[index + 1].startswith("+++ "):
             continue
         path = line[4:].split("\t", 1)[0]
         if path == "/dev/null":
