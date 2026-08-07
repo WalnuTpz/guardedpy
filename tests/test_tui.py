@@ -747,6 +747,36 @@ def test_tui_help_is_scrollable_and_send_button_matches_enter(tmp_path: Path) ->
     asyncio.run(check())
 
 
+def test_tui_send_button_is_inside_composer_and_matches_enter(tmp_path: Path) -> None:
+    """Catches the send control consuming a row or falling outside the composer bottom-right."""
+    from guardedpy.tui import Composer, GuardedPyApp
+    from textual.widgets import Button
+
+    profile = _profile(tmp_path)
+    runtime = _Runtime(profile)
+    app = GuardedPyApp(runtime, profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            composer = app.query_one("#composer", Composer)
+            send = app.query_one("#send", Button)
+            shell = app.query_one("#composer-shell")
+            assert composer.parent is shell and send.parent is shell
+            assert send.region.x >= composer.region.x + composer.region.width - send.region.width
+            assert send.region.y >= composer.region.y + composer.region.height - send.region.height
+            assert send.region.right <= composer.region.right
+            assert send.region.bottom <= composer.region.bottom
+            assert send.disabled is True
+            composer.text = "click sends"
+            await pilot.pause()
+            assert send.disabled is False
+            await pilot.click("#send")
+            await pilot.pause()
+            assert runtime.created[0].description == "click sends"
+
+    asyncio.run(check())
+
+
 def test_tui_transcript_is_selectable_safe_log_and_unavailable_keyring_never_opens_input(tmp_path: Path) -> None:
     """Catches an unselectable transcript or an unsafe credential prompt without secure storage."""
     from guardedpy.credentials import CredentialBackendUnavailableError

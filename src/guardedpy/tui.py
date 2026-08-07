@@ -280,9 +280,9 @@ class GuardedPyApp(App[None]):
     CSS = """
     #status { height: 3; padding: 0 1; background: $panel; }
     #transcript { height: 1fr; border: round $primary; }
-    #composer-shell { height: 5; }
-    #composer { height: 5; border: round $accent; padding: 0 10 2 0; }
-    #send { dock: right; width: 8; height: 1; margin-top: 3; }
+    #composer-shell { height: 5; layers: composer send; align: right bottom; }
+    #composer { height: 5; border: round $accent; padding: 0 10 2 0; layer: composer; }
+    #send { width: 8; height: 1; layer: send; }
     #command-palette { display: none; height: auto; max-height: 12; border: round $secondary; }
     """
 
