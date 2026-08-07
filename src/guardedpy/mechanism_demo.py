@@ -1,236 +1,113 @@
-"""Provider-free, headless evidence from GuardedPy's retained Harness core."""
+"""Offline, new-core continuous-agent mechanism evidence."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Iterator, Literal
+from typing import Literal
+from uuid import UUID, uuid4
 
-from guardedpy.actions import RunCommandAction
 from guardedpy.config import HarnessConfig
-from guardedpy.context import LlmContext
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskIntent, TaskState
+from guardedpy.conversation import (
+    ConversationAgent, ResponseFinished, ScriptedConversationModel, TextDelta,
+    ToolCallDelta, TurnNotActiveError,
+)
 from guardedpy.discovery import discover_project
-from guardedpy.events import EventStore, StoredRunEvent
-from guardedpy.llm import ScriptedLLM
-from guardedpy.orchestrator import TaskOrchestrator
-from guardedpy.workspace import ToolResult
+from guardedpy.executor import ToolExecutor
+from guardedpy.governor import ToolGovernor, governed_tool_definitions
 
 
-ScenarioName = Literal[
-    "dangerous_action_denied",
-    "failure_feedback_corrects",
-    "tdd_source_patch_denied",
-]
+ScenarioName = Literal["delete_approval_rejected", "feedback_repair", "stale_approval_denied"]
 _SCENARIOS: tuple[ScenarioName, ...] = (
-    "dangerous_action_denied",
-    "failure_feedback_corrects",
-    "tdd_source_patch_denied",
-)
-_PYTEST_CONTROL_VARIABLES = (
-    "PYTEST_ADDOPTS",
-    "PYTEST_PLUGINS",
-    "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+    "delete_approval_rejected", "feedback_repair", "stale_approval_denied",
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ScenarioResult:
-    """Bounded facts derived from one fresh Harness run."""
-
     name: ScenarioName
     status: str
-    rule_id: str | None
-    feedback_kind: str | None
-    dispatched_command: bool
     event_kinds: tuple[str, ...]
     workspace_value: str
-
-
-class FeedbackAwareDemoLLM(ScriptedLLM):
-    """Return the repair patch only after trusted assertion feedback is present."""
-
-    def __init__(self) -> None:
-        super().__init__(_corrective_responses())
-
-    def complete(self, context: LlmContext) -> str:
-        if len(self.contexts) in {0, 2}:
-            feedback = context.trusted_data.get("feedback")
-            assert feedback == {
-                "type": "pytest_feedback",
-                "kind": "assertion_failure",
-                "node_ids": ("tests/test_value.py::test_value_is_fixed",),
-            }, "repair requires trusted pytest_feedback assertion_failure repair target"
-        return super().complete(context)
-
-
-class _DemoOrchestrator(TaskOrchestrator):
-    """Record generic command dispatch attempts without launching a process."""
-
-    def __init__(self, project_root: Path, llm: ScriptedLLM) -> None:
-        super().__init__(project_root, llm)
-        self.dispatched_commands: list[tuple[str, ...]] = []
-
-    def _run_command(self, action: RunCommandAction) -> ToolResult:
-        self.dispatched_commands.append(action.args)
-        return ToolResult(True, "Demo command dispatch was recorded", {})
+    stale_approval_denied: bool = False
 
 
 def run_scenario(name: ScenarioName) -> ScenarioResult:
-    """Execute one fixed scenario through the actual governed Harness loop."""
     if name not in _SCENARIOS:
         raise KeyError(name)
-
-    with _isolated_demo_root() as root:
-        _write_fixture(root, name)
-        task = TaskState(
-            description=_description_for(name),
-            intent=TaskIntent.CODING,
-            config=HarnessConfig(profile=discover_project(root)),
+    with TemporaryDirectory(prefix="guardedpy-continuous-demo-") as directory:
+        root = Path(directory)
+        _fixture(root, repair=name == "feedback_repair")
+        config = HarnessConfig(profile=discover_project(root))
+        model = ScriptedConversationModel(_responses(name))
+        agent = ConversationAgent(
+            model, governed_tool_definitions(), ToolGovernor(config), ToolExecutor(root, config)
         )
-        llm = FeedbackAwareDemoLLM() if name == "failure_feedback_corrects" else ScriptedLLM(
-            _responses_for(name)
-        )
-        orchestrator = _DemoOrchestrator(root, llm)
-        completed = orchestrator.run(task)
-        events = tuple(EventStore(root).events_for(task.id))
+        session_id = agent.create_session()
+        turn_id, _ = agent.begin_turn(session_id, "Run fixed offline scenario")
+        events = list(agent.run_turn(session_id, turn_id))
+        stale = False
+        if name != "feedback_repair":
+            approval_id = UUID(next(event.data["approval_id"] for event in events if event.kind == "approval_requested"))
+            if name == "stale_approval_denied":
+                try:
+                    list(agent.resolve_approval(session_id, turn_id, uuid4(), True))
+                except TurnNotActiveError:
+                    stale = True
+            events.extend(agent.resolve_approval(session_id, turn_id, approval_id, False))
         return ScenarioResult(
             name=name,
-            status=completed.status.value,
-            rule_id=_denial_rule(events),
-            feedback_kind=_assertion_feedback_kind(events),
-            dispatched_command=bool(orchestrator.dispatched_commands),
-            event_kinds=_event_kinds(events),
+            status=events[-1].kind.removeprefix("turn_"),
+            event_kinds=_facts(events),
             workspace_value=(root / "src" / "value.py").read_text().strip(),
+            stale_approval_denied=stale,
         )
 
 
 def run_all_scenarios() -> tuple[ScenarioResult, ...]:
-    """Execute the three literal scenarios in their stable evidence order."""
     return tuple(run_scenario(name) for name in _SCENARIOS)
 
 
-@contextmanager
-def _isolated_demo_root() -> Iterator[Path]:
-    original_state_home = os.environ.get("XDG_STATE_HOME")
-    original_pytest_environment = {
-        name: os.environ.get(name) for name in _PYTEST_CONTROL_VARIABLES
-    }
-    with TemporaryDirectory(prefix="guardedpy-demo-") as directory:
-        temporary = Path(directory)
-        os.environ["XDG_STATE_HOME"] = str(temporary / "state")
-        os.environ.pop("PYTEST_ADDOPTS", None)
-        os.environ.pop("PYTEST_PLUGINS", None)
-        os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-        try:
-            root = temporary / "project"
-            root.mkdir()
-            yield root
-        finally:
-            if original_state_home is None:
-                os.environ.pop("XDG_STATE_HOME", None)
-            else:
-                os.environ["XDG_STATE_HOME"] = original_state_home
-            for name, value in original_pytest_environment.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
-
-
-def _write_fixture(root: Path, name: ScenarioName) -> None:
+def _fixture(root: Path, *, repair: bool) -> None:
     (root / "src").mkdir()
     (root / "tests").mkdir()
-    (root / "src" / "value.py").write_text("broken\n")
-    expected = "broken" if name == "tdd_source_patch_denied" else "fixed"
-    (root / "tests" / "test_value.py").write_text(
-        "from pathlib import Path\n\n"
-        "def test_value_is_fixed() -> None:\n"
-        f"    assert Path('src/value.py').read_text() == '{expected}\\n'\n"
-    )
+    (root / "src" / "value.py").write_text("broken\n" if repair else "present\n")
+    if repair:
+        (root / "tests" / "test_value.py").write_text(
+            "from pathlib import Path\n\ndef test_value():\n"
+            "    assert Path('src/value.py').read_text() == 'fixed\\n'\n"
+        )
+    else:
+        (root / "tests" / "test_value.py").write_text("def test_value(): assert True\n")
 
 
-def _description_for(name: ScenarioName) -> str:
-    return {
-        "dangerous_action_denied": "Attempt a prohibited privileged action.",
-        "failure_feedback_corrects": "Correct the selected assertion failure.",
-        "tdd_source_patch_denied": "Attempt a source patch before observing red.",
-    }[name]
-
-
-def _responses_for(name: ScenarioName) -> list[str]:
-    if name == "dangerous_action_denied":
+def _responses(name: ScenarioName) -> list[list[object]]:
+    if name != "feedback_repair":
         return [
-            _action(kind="run_command", summary="attempt privilege escalation", args=["sudo", "id"]),
-            _action(kind="finish", summary="stop after policy denial", status="blocked"),
+            [ToolCallDelta(0, "delete", "delete_path", '{"path":"src/value.py"}'), ResponseFinished("tool_calls")],
+            [TextDelta("Kept the file."), ResponseFinished("stop")],
         ]
-    if name == "tdd_source_patch_denied":
-        return [
-            _action(kind="read_file", summary="inspect value", path="src/value.py"),
-            _repair_action(),
-            _action(kind="finish", summary="stop after TDD denial", status="blocked"),
-        ]
-    raise KeyError(name)
-
-
-def _corrective_responses() -> list[str]:
+    patch = "--- a/src/value.py\n+++ b/src/value.py\n@@ -1 +1 @@\n-broken\n+fixed\n"
     return [
-        _action(kind="read_file", summary="inspect value", path="src/value.py"),
-        _action(kind="run_pytest", summary="observe assertion feedback", targets=[]),
-        _repair_action(),
-        _action(kind="run_pytest", summary="run full suite", targets=[]),
-        _action(kind="finish", summary="finish after green", status="completed"),
+        [ToolCallDelta(0, "read", "read_file", '{"path":"src/value.py"}'), ResponseFinished("tool_calls")],
+        [ToolCallDelta(0, "red", "run_pytest", "{}"), ResponseFinished("tool_calls")],
+        [ToolCallDelta(0, "patch", "apply_patch", json.dumps({"unified_diff": patch})), ResponseFinished("tool_calls")],
+        [ToolCallDelta(0, "green", "run_pytest", "{}"), ResponseFinished("tool_calls")],
+        [TextDelta("Repaired and verified."), ResponseFinished("stop")],
     ]
 
 
-def _repair_action() -> str:
-    return _action(
-        kind="apply_patch",
-        summary="repair value",
-        diff="--- a/src/value.py\n+++ b/src/value.py\n@@ -1 +1 @@\n-broken\n+fixed\n",
-    )
-
-
-def _action(**payload: object) -> str:
-    return json.dumps(payload)
-
-
-def _denial_rule(events: tuple[StoredRunEvent, ...]) -> str | None:
-    return next(
-        (
-            event.policy_rule_id
-            for event in events
-            if event.policy_verdict is PolicyVerdict.DENY
-            and event.policy_rule_id is not None
-        ),
-        None,
-    )
-
-
-def _assertion_feedback_kind(events: tuple[StoredRunEvent, ...]) -> str | None:
-    return next(
-        (
-            event.feedback_kind.value
-            for event in events
-            if event.feedback_kind is FeedbackKind.ASSERTION_FAILURE
-        ),
-        None,
-    )
-
-
-def _event_kinds(events: tuple[StoredRunEvent, ...]) -> tuple[str, ...]:
-    kinds: list[str] = []
+def _facts(events: list[object]) -> tuple[str, ...]:
+    facts: list[str] = []
     for event in events:
-        if event.policy_verdict is PolicyVerdict.DENY:
-            kinds.append("policy_denial")
-        if event.feedback_kind is FeedbackKind.ASSERTION_FAILURE:
-            kinds.append("assertion_feedback")
-        if event.action_summary == "apply source patch" and event.policy_verdict is PolicyVerdict.ALLOW:
-            kinds.append("source_patch")
-        if event.feedback_kind is FeedbackKind.PASSED and event.action_summary == "run configured tests":
-            kinds.append("full_suite_pass")
-    return tuple(kinds)
+        if event.kind in {"approval_requested", "approval_resolved", "tool_item_completed"}:
+            facts.append(event.kind)
+        if event.data.get("pytest_outcome") == "assertion_failure":
+            facts.append("assertion_failure")
+        if event.data.get("changed_paths"):
+            facts.append("patch_applied")
+        if event.data.get("pytest_outcome") == "passed":
+            facts.append("pytest_passed")
+    return tuple(facts)
