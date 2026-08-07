@@ -10,9 +10,12 @@ import pytest
 from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import FeedbackKind
-from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
+from guardedpy.feedback import FeedbackCollector, FeedbackKind, PytestFeedback, PytestRun
 from guardedpy.workspace import Workspace
+
+
+def test_feedback_kind_is_owned_by_continuous_feedback_boundary() -> None:
+    assert FeedbackKind.__module__ == "guardedpy.feedback"
 
 
 def test_collector_extracts_assertion_failure_node_and_bounded_excerpt() -> None:

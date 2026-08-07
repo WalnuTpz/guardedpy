@@ -1,11 +1,8 @@
 from pathlib import Path, PurePosixPath
 import sys
 
-import pytest
-
 from guardedpy.config import HarnessConfig
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import TaskIntent, TaskPath, TaskState, TddPhase
 
 
 def safe_config(tmp_path: Path) -> HarnessConfig:
@@ -20,40 +17,3 @@ def safe_config(tmp_path: Path) -> HarnessConfig:
             pytest_command=(sys.executable, "-m", "pytest"),
         )
     )
-
-
-@pytest.fixture
-def feature_task(tmp_path: Path) -> TaskState:
-    return TaskState(
-        description="Add a feature",
-        intent=TaskIntent.CODING,
-        config=safe_config(tmp_path),
-    )
-
-
-@pytest.fixture
-def ready_bugfix_task(tmp_path: Path) -> TaskState:
-    task = TaskState(
-        description="Fix a failing test",
-        intent=TaskIntent.CODING,
-        config=safe_config(tmp_path),
-    )
-    task.path = TaskPath.REPAIR
-    task.repair_targets = ("tests/test_example.py::test_before",)
-    task.tdd_phase = TddPhase.RED_OBSERVED
-    return task
-
-
-SOURCE_DIFF = """--- a/src/example.py
-+++ b/src/example.py
-@@ -1 +1 @@
--before
-+after
-"""
-
-TEST_DIFF = """--- a/tests/test_example.py
-+++ b/tests/test_example.py
-@@ -1 +1 @@
--def test_before(): pass
-+def test_after(): pass
-"""

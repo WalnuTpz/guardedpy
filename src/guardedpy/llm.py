@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 from openai import APIConnectionError, APITimeoutError
 
@@ -18,63 +18,6 @@ from guardedpy.conversation import (
     ToolCallDelta,
     ToolDefinition,
 )
-from guardedpy.context import LlmContext
-
-
-class LLMClient(Protocol):
-    """Return exactly one untrusted action payload for one context."""
-
-    def complete(self, context: LlmContext) -> str:
-        """Produce one JSON action payload."""
-
-
-class ScriptedLLM:
-    """Offline deterministic LLM double that records its received contexts."""
-
-    def __init__(self, responses: list[str]) -> None:
-        self._responses = iter(responses)
-        self.contexts: list[str] = []
-
-    def complete(self, context: LlmContext) -> str:
-        self.contexts.append(context.render())
-        try:
-            return next(self._responses)
-        except StopIteration as error:
-            raise RuntimeError("scripted LLM has no remaining response") from error
-
-
-class DeepSeekClient:
-    """One OpenAI-compatible JSON completion using a key fetched at call time."""
-
-    def __init__(
-        self,
-        key_provider: Callable[[], str],
-        config: HarnessConfig,
-        transport_factory: Callable[[str], Any],
-    ) -> None:
-        self._key_provider = key_provider
-        self._config = config.model_copy(deep=True)
-        self._transport_factory = transport_factory
-
-    def complete(self, context: LlmContext) -> str:
-        """Return the provider payload unchanged, retrying one temporary transport failure."""
-        transport = self._transport_factory(self._key_provider())
-        for attempt in range(2):
-            try:
-                response = transport.chat.completions.create(
-                    model=self._config.model,
-                    messages=context.messages(),
-                    response_format={"type": "json_object"},
-                    reasoning_effort=self._config.reasoning_effort,
-                    extra_body={"thinking": {"type": "enabled"}},
-                )
-                return response.choices[0].message.content
-            except (ConnectionError, TimeoutError, APIConnectionError, APITimeoutError):
-                if attempt == 1:
-                    raise TemporaryProviderFailure from None
-        raise AssertionError("unreachable")
-
-
 class DeepSeekConversationModel:
     """Translate one DeepSeek streaming response into conversation chunks."""
 

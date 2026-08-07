@@ -8,14 +8,12 @@ from pathlib import Path
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 
 
 class _Runtime:
     def __init__(self) -> None:
         self.config: HarnessConfig | None = None
         self.project_root: Path | None = None
-        self.created: list[TaskState] = []
         self.setup_profiles: list[ProjectProfile] = []
         self.configured = True
 
@@ -24,20 +22,6 @@ class _Runtime:
         self.project_root = profile.root
         self.config = HarnessConfig(profile=profile)
         self.setup_profiles.append(profile)
-
-    def create_task(self, description: str, intent: TaskIntent, review_path: str | None = None) -> TaskState:
-        task = TaskState(description=description, intent=intent, config=self.config, review_path=review_path)
-        self.created.append(task)
-        return task
-
-    def run(self, task_id: object) -> TaskState:
-        task = next(task for task in self.created if task.id == task_id)
-        task.status = TaskStatus.COMPLETED
-        return task
-
-    def events(self, task_id: object) -> list[object]:
-        del task_id
-        return []
 
     def credential_status(self) -> CredentialStatus:
         return CredentialStatus(configured=self.configured)
@@ -93,7 +77,6 @@ def test_direct_task_discovers_cwd_and_uses_safe_non_tty_lifecycle(tmp_path: Pat
 
     assert code == 0
     assert runtime.setup_profiles[0].root == tmp_path.resolve()
-    assert runtime.created == []
     assert output.getvalue().splitlines() == ["› inspect project", "本轮回复已完成。"]
 
 
@@ -108,7 +91,6 @@ def test_direct_task_stops_before_creation_without_a_credential(tmp_path: Path, 
     output = StringIO()
 
     assert main(["inspect project"], runtime_factory=lambda: runtime, stdin=StringIO(), stdout=output) == 1
-    assert runtime.created == []
     assert output.getvalue() == "需要先在交互终端配置凭据。\n"
 
 
@@ -146,7 +128,7 @@ def test_continuous_runtime_composes_a_governed_session_for_the_interactive_surf
     _project(tmp_path)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
     profile = __import__("guardedpy.discovery", fromlist=["discover_project"]).discover_project(tmp_path)
-    runtime = LocalRuntime(RuntimeServices(Credentials(), lambda root, config, memory: object()))
+    runtime = LocalRuntime(RuntimeServices(Credentials()))
     runtime.setup(profile, api_key=None)
 
     session = continuous_runtime(runtime, profile)
