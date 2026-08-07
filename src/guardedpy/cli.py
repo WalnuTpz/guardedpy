@@ -13,12 +13,16 @@ import keyring
 from openai import OpenAI
 
 from guardedpy.config import HarnessConfig
+from guardedpy.conversation import ConversationAgent
+from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialService
 from guardedpy.discovery import ProjectDiscoveryError, discover_project
-from guardedpy.llm import DeepSeekClient
+from guardedpy.executor import ToolExecutor
+from guardedpy.governor import ToolGovernor, governed_tool_definitions
+from guardedpy.llm import DeepSeekClient, DeepSeekConversationModel
 from guardedpy.mechanism_demo import run_all_scenarios
 from guardedpy.orchestrator import TaskOrchestrator
-from guardedpy.runtime import LocalRuntime, RuntimeServices
+from guardedpy.runtime import ConversationRuntime, LocalRuntime, RuntimeServices
 from guardedpy.terminal import run_noninteractive_task, run_plain_session
 
 
@@ -47,6 +51,29 @@ def local_services() -> RuntimeServices:
         )
 
     return RuntimeServices(credentials=credentials, orchestrator_factory=orchestrator_factory)
+
+
+def continuous_runtime(runtime: LocalRuntime, profile: Any) -> ConversationRuntime:
+    """Compose the governed continuous runtime used by the interactive surface."""
+    config = runtime.config
+    if config is None:
+        raise RuntimeError("runtime is not configured")
+    model = DeepSeekConversationModel(
+        CredentialService(_system_keyring()).get_key,
+        config,
+        lambda api_key, *, max_retries: _deepseek_transport(
+            api_key, timeout_seconds=config.timeout_seconds
+        ),
+    )
+    return ConversationRuntime(
+        ConversationAgent(
+            model,
+            governed_tool_definitions(),
+            ToolGovernor(config),
+            ToolExecutor(profile.root, config),
+        ),
+        ConversationStore(profile.root),
+    )
 
 
 def _system_keyring() -> Any:
@@ -121,7 +148,8 @@ def main(
 
     from guardedpy.tui import GuardedPyApp
 
-    GuardedPyApp(runtime, profile, initial_task=arguments.target).run()
+    conversation = continuous_runtime(runtime, profile) if isinstance(runtime, LocalRuntime) else None
+    GuardedPyApp(runtime, profile, initial_task=arguments.target, conversation=conversation).run()
     return 0
 
 

@@ -1158,3 +1158,122 @@ def test_demo_selector_presents_fixed_request_then_runs_selected_scenario(
             assert calls == ["failure_feedback_corrects"]
 
     asyncio.run(check())
+
+
+def test_transcript_presenter_coalesces_assistant_deltas_by_item_id() -> None:
+    """Catches streaming text being rendered as separate transcript lines."""
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import TranscriptPresenter
+
+    session_id = uuid4()
+    turn_id = uuid4()
+    item_id = uuid4()
+    presenter = TranscriptPresenter()
+
+    first = presenter.present(
+        SessionEvent(
+            session_id=session_id,
+            turn_id=turn_id,
+            sequence=1,
+            kind="assistant_text_delta",
+            item_id=item_id,
+            text="第一段",
+        )
+    )
+    second = presenter.present(
+        SessionEvent(
+            session_id=session_id,
+            turn_id=turn_id,
+            sequence=2,
+            kind="assistant_text_delta",
+            item_id=item_id,
+            text="第二段",
+        )
+    )
+
+    assert (first.item_id, first.text, first.replace) == (item_id, "助手：第一段", True)
+    assert (second.item_id, second.text, second.replace) == (item_id, "助手：第一段第二段", True)
+
+
+def test_tui_renders_continuous_session_events_without_task_audit_polling(tmp_path: Path) -> None:
+    """Catches the Task 22 surface keeping new sessions on the retired task renderer."""
+    import asyncio
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import GuardedPyApp
+    from textual.widgets import Log
+
+    session_id = uuid4()
+    turn_id = uuid4()
+
+    class _Conversation:
+        def create_session(self, project_title: str) -> object:
+            assert project_title == str(profile.root)
+            return session_id
+
+        def begin_turn(self, received_session: object, text: str, mode: str) -> tuple[object, SessionEvent]:
+            assert received_session == session_id
+            assert (text, mode) == ("hello", "normal")
+            return turn_id, SessionEvent(session_id, turn_id, 1, "user_message", uuid4(), "hello")
+
+        def run_turn(self, received_session: object, received_turn: object) -> tuple[SessionEvent, ...]:
+            assert (received_session, received_turn) == (session_id, turn_id)
+            item_id = uuid4()
+            return (
+                SessionEvent(session_id, turn_id, 2, "assistant_item_started", item_id),
+                SessionEvent(session_id, turn_id, 3, "assistant_text_delta", item_id, "hello "),
+                SessionEvent(session_id, turn_id, 4, "assistant_text_delta", item_id, "there"),
+                SessionEvent(session_id, turn_id, 5, "assistant_item_completed", item_id),
+                SessionEvent(session_id, turn_id, 6, "turn_completed"),
+            )
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile, conversation=_Conversation())
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("hello")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            transcript = app.query_one("#transcript", Log)
+            assert transcript.lines[:-1] == ["› hello", "助手：hello there", "本轮回复已完成。"]
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("tool_item_started", "正在使用受控工具。"),
+        ("tool_output", "工具已返回受限结果。"),
+        ("tool_item_completed", "工具执行完成。"),
+        ("approval_requested", "需要精确审批。"),
+        ("approval_resolved", "审批已处理。"),
+    ],
+)
+def test_transcript_presenter_uses_safe_tool_and_approval_status_wording(
+    kind: str, expected: str
+) -> None:
+    """Catches raw tool details or retired audit prefixes entering the transcript."""
+    from uuid import uuid4
+
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import TranscriptPresenter
+
+    update = TranscriptPresenter().present(
+        SessionEvent(
+            session_id=uuid4(),
+            turn_id=uuid4(),
+            sequence=1,
+            kind=kind,  # type: ignore[arg-type]
+            item_id=uuid4(),
+            text="untrusted tool payload",
+            data={"detail": "untrusted tool payload"},
+        )
+    )
+
+    assert update.text == expected
+    assert all(prefix not in update.text for prefix in ("GuardedPy：动作", "GuardedPy：策略", "GuardedPy：反馈", "GuardedPy：停止"))

@@ -104,3 +104,32 @@ def test_demo_non_tty_is_offline_and_never_composes_project_runtime(monkeypatch:
         "failure_feedback_corrects status=completed",
         "tdd_source_patch_denied status=blocked",
     ]
+
+
+def test_continuous_runtime_composes_a_governed_session_for_the_interactive_surface(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """Catches the CLI leaving the new conversation runtime unreachable from its surface."""
+    from guardedpy.cli import continuous_runtime
+    from guardedpy.credentials import CredentialStatus
+    from guardedpy.runtime import LocalRuntime, RuntimeServices
+
+    class Credentials:
+        def status(self) -> CredentialStatus:
+            return CredentialStatus(configured=True)
+
+        def set_key(self, key: str) -> None:
+            del key
+
+        def clear_key(self) -> None:
+            return None
+
+    _project(tmp_path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
+    profile = __import__("guardedpy.discovery", fromlist=["discover_project"]).discover_project(tmp_path)
+    runtime = LocalRuntime(RuntimeServices(Credentials(), lambda root, config, memory: object()))
+    runtime.setup(profile, api_key=None)
+
+    session = continuous_runtime(runtime, profile)
+
+    assert session.create_session(str(profile.root))

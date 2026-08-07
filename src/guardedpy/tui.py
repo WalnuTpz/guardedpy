@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from io import StringIO
 from threading import Thread
 from typing import Any, Literal
@@ -15,6 +16,7 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
 
+from guardedpy.conversation import SessionEvent
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialBackendUnavailableError
@@ -38,12 +40,71 @@ class ComposerSubmitted(Message):
         super().__init__()
 
 
+@dataclass(frozen=True)
+class TranscriptUpdate:
+    """One safe, renderer-agnostic transcript change."""
+
+    item_id: UUID | None
+    text: str
+    replace: bool = False
+
+
+@dataclass
+class TranscriptPresenter:
+    """Project continuous-session events to text safe for a transcript."""
+
+    _assistant_text: dict[UUID, str] = field(default_factory=dict)
+
+    def present(self, event: SessionEvent) -> TranscriptUpdate | None:
+        """Return the visible update for one event without exposing tool payloads."""
+        if event.kind == "user_message":
+            return TranscriptUpdate(event.item_id, f"› {event.text}")
+        if event.kind == "assistant_text_delta":
+            if event.item_id is None:
+                return None
+            text = self._assistant_text.get(event.item_id, "") + event.text
+            self._assistant_text[event.item_id] = text
+            return TranscriptUpdate(event.item_id, f"助手：{text}", replace=True)
+        status = {
+            "tool_item_started": "正在使用受控工具。",
+            "tool_output": "工具已返回受限结果。",
+            "tool_item_completed": "工具执行完成。",
+            "approval_requested": "需要精确审批。",
+            "approval_resolved": "审批已处理。",
+            "turn_completed": "本轮回复已完成。",
+            "turn_interrupted": "本轮回复已中断。",
+            "turn_failed": "本轮回复未完成。",
+        }.get(event.kind)
+        if status is None:
+            return None
+        return TranscriptUpdate(event.item_id, status)
+
+
 class TranscriptLog(Log):
     """Selectable log that preserves one fixed safe UI projection per line."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._continuous_entries: list[tuple[UUID | None, str]] = []
 
     def write(self, data: str, scroll_end: bool | None = None) -> "TranscriptLog":
         super().write(f"{data}\n", scroll_end=scroll_end)
         return self
+
+    def apply_update(self, update: TranscriptUpdate) -> None:
+        """Replace streamed text in place while preserving event order."""
+        if update.replace:
+            for index, (item_id, _text) in enumerate(self._continuous_entries):
+                if item_id == update.item_id:
+                    self._continuous_entries[index] = (item_id, update.text)
+                    break
+            else:
+                self._continuous_entries.append((update.item_id, update.text))
+        else:
+            self._continuous_entries.append((update.item_id, update.text))
+        self.clear()
+        for _item_id, text in self._continuous_entries:
+            self.write(text)
 
 
 class Composer(TextArea):
@@ -298,6 +359,14 @@ class SessionCommandFinished(Message):
         super().__init__()
 
 
+class SessionEventReceived(Message):
+    """Deliver one continuous-session event to the Textual event loop."""
+
+    def __init__(self, event: SessionEvent) -> None:
+        self.event = event
+        super().__init__()
+
+
 class GuardedPyApp(App[None]):
     """The single-project interactive terminal session."""
 
@@ -317,7 +386,13 @@ class GuardedPyApp(App[None]):
     #command-palette { display: none; height: auto; max-height: 12; border: round $secondary; }
     """
 
-    def __init__(self, runtime: Any, profile: Any, initial_task: str | None = None) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        profile: Any,
+        initial_task: str | None = None,
+        conversation: Any | None = None,
+    ) -> None:
         super().__init__()
         self.runtime = runtime
         self.profile = profile
@@ -337,6 +412,10 @@ class GuardedPyApp(App[None]):
         self._live_task_timer: Timer | None = None
         self._session_goal: str | None = None
         self._mode: Literal["coding", "plan", "review", "goal"] = "coding"
+        self._conversation_runtime = conversation
+        self._continuous_session_id: UUID | None = None
+        self._continuous_turn_id: UUID | None = None
+        self._transcript_presenter = TranscriptPresenter()
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text(), id="status")
@@ -448,6 +527,9 @@ class GuardedPyApp(App[None]):
             return
         self._mode = "coding"
         self._refresh_composer_controls()
+        if self._conversation_runtime is not None:
+            self._submit_continuous(request, {"coding": "normal", "plan": "plan", "review": "review"}[mode])
+            return
         if mode == "plan":
             self._require_credential_then_submit(request, TaskIntent.PLAN, session_goal=self._session_goal)
             return
@@ -457,6 +539,53 @@ class GuardedPyApp(App[None]):
             )
             return
         self._require_credential_then_submit(request, TaskIntent.CODING, session_goal=self._session_goal)
+
+    def _submit_continuous(self, text: str, mode: Literal["normal", "plan", "review"]) -> None:
+        """Start or steer one continuous session without the legacy task renderer."""
+        try:
+            if not self.runtime.credential_status().configured:
+                self._write("需要先在交互终端配置凭据。")
+                return
+            if self._continuous_session_id is None:
+                self._continuous_session_id = self._conversation_runtime.create_session(str(self.profile.root))
+            if self._continuous_turn_id is not None:
+                event = self._conversation_runtime.steer(
+                    self._continuous_session_id, self._continuous_turn_id, text
+                )
+                self._present_session_event(event)
+                return
+            turn_id, event = self._conversation_runtime.begin_turn(
+                self._continuous_session_id, text, mode
+            )
+        except Exception:
+            self._write("无法启动会话。")
+            return
+        self._continuous_turn_id = turn_id
+        self._present_session_event(event)
+        Thread(
+            target=self._run_continuous_turn,
+            args=(self._continuous_session_id, turn_id),
+            daemon=True,
+        ).start()
+
+    def _run_continuous_turn(self, session_id: UUID, turn_id: UUID) -> None:
+        try:
+            for event in self._conversation_runtime.run_turn(session_id, turn_id):
+                self.post_message(SessionEventReceived(event))
+        except Exception:
+            self.post_message(SessionEventReceived(
+                SessionEvent(session_id, turn_id, 0, "turn_failed", data={"code": "surface_failure"})
+            ))
+
+    def on_session_event_received(self, message: SessionEventReceived) -> None:
+        self._present_session_event(message.event)
+        if message.event.kind in {"turn_completed", "turn_interrupted", "turn_failed"}:
+            self._continuous_turn_id = None
+
+    def _present_session_event(self, event: SessionEvent) -> None:
+        update = self._transcript_presenter.present(event)
+        if update is not None:
+            self.query_one("#transcript", TranscriptLog).apply_update(update)
 
     def request_approval(
         self,
