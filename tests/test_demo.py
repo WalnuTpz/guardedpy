@@ -82,13 +82,8 @@ def test_feedback_aware_demo_llm_refuses_to_patch_without_trusted_assertion_feed
     """Catches the corrective mock returning its patch on scripted timing alone."""
     from guardedpy.mechanism_demo import FeedbackAwareDemoLLM
 
-    llm = FeedbackAwareDemoLLM()
-    context = LlmContext.minimal()
-    llm.complete(context)
-    llm.complete(context)
-
-    with pytest.raises(AssertionError, match="trusted assertion feedback"):
-        llm.complete(context)
+    with pytest.raises(AssertionError, match="assertion_failure"):
+        FeedbackAwareDemoLLM().complete(LlmContext.minimal())
 
 
 def test_demo_isolates_pytest_controls_and_restores_the_caller_environment(

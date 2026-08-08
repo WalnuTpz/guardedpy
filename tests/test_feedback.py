@@ -11,7 +11,7 @@ from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.discovery import ProjectProfile
 from guardedpy.domain import FeedbackKind
-from guardedpy.feedback import FeedbackCollector, PytestRun
+from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
 from guardedpy.workspace import Workspace
 
 
@@ -46,6 +46,22 @@ def test_collector_treats_failed_runtime_with_node_as_execution_error() -> None:
 
     assert result.kind is FeedbackKind.EXECUTION_ERROR
     assert result.node_ids == ("tests/test_parser.py::test_bad_input",)
+
+
+def test_collector_treats_noncollection_error_as_execution_error_before_assertion() -> None:
+    """Catches an ERROR-phase fixture failure being mistaken for an assertion-only suite."""
+    run = PytestRun(
+        1,
+        "FAILED tests/test_example.py::test_assertion - AssertionError: assert 0\n"
+        "ERROR tests/test_example.py::test_fixture\n",
+        "",
+        False,
+    )
+
+    result = FeedbackCollector().collect(run)
+
+    assert result.kind is FeedbackKind.EXECUTION_ERROR
+    assert result.node_ids == ()
 
 
 def test_collector_does_not_treat_source_assert_in_a_runtime_traceback_as_assertion_evidence() -> None:
@@ -100,6 +116,51 @@ def test_collector_classifies_the_remaining_pytest_outcomes(
 
     assert result.kind is expected_kind
     assert result.node_ids == expected_nodes
+
+
+def test_normalize_nodes_keeps_ordered_existing_test_nodes_and_drops_unsafe_tokens(
+    tmp_path: Path,
+) -> None:
+    """Catches automatic repair targets retaining duplicates, missing files, or root escapes."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_a.py").write_text("def test_a() -> None:\n    assert False\n")
+    feedback = PytestFeedback(
+        FeedbackKind.ASSERTION_FAILURE,
+        (
+            "tests/test_a.py::test_a",
+            "tests/test_a.py::test_a",
+            "tests/missing.py::test_missing",
+            "../outside.py::test_outside",
+        ),
+        "assert False",
+    )
+
+    normalized = FeedbackCollector.normalize_nodes(
+        feedback, tmp_path, (PurePosixPath("tests"),)
+    )
+
+    assert normalized == PytestFeedback(
+        FeedbackKind.ASSERTION_FAILURE,
+        ("tests/test_a.py::test_a",),
+        "assert False",
+    )
+
+
+def test_collector_keeps_every_observed_assertion_node_beyond_twenty() -> None:
+    """Catches automatic repair discovery silently truncating a large repair set."""
+    nodes = tuple(f"tests/test_many.py::test_{index}" for index in range(25))
+    run = PytestRun(
+        1,
+        "\n".join(f"FAILED {node} - AssertionError" for node in nodes),
+        "",
+        False,
+    )
+
+    feedback = FeedbackCollector().collect(run)
+
+    assert feedback.kind is FeedbackKind.ASSERTION_FAILURE
+    assert feedback.node_ids == nodes
 
 
 def test_run_pytest_uses_the_selected_root_as_its_working_directory(tmp_path: Path) -> None:

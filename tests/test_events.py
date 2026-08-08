@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from guardedpy.actions import parse_action
 from conftest import safe_config
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TaskStatus
+from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskIntent, TaskState, TaskStatus
 from guardedpy.events import EventStore, FeedbackAudit, RunEvent, StopReason
 
 
@@ -233,8 +233,7 @@ def test_register_task_persists_static_metadata_and_forces_pending_state(
     )
     task = TaskState(
         description="Keep this task after restart",
-        mode=TaskMode.BUGFIX,
-        bugfix_target="tests/test_value.py::test_value",
+        intent=TaskIntent.CODING,
         config=config,
         status=TaskStatus.COMPLETED,
     )
@@ -245,10 +244,52 @@ def test_register_task_persists_static_metadata_and_forces_pending_state(
     assert len(restored) == 1
     assert restored[0].id == task.id
     assert restored[0].description == "Keep this task after restart"
-    assert restored[0].mode is TaskMode.BUGFIX
-    assert restored[0].bugfix_target == "tests/test_value.py::test_value"
+    assert restored[0].intent is TaskIntent.CODING
     assert restored[0].config == config
     assert restored[0].status is TaskStatus.PENDING
+
+
+def test_register_task_persists_validated_review_scope(store: EventStore) -> None:
+    """Catches restart history dropping the immutable path that scopes a review task."""
+    (store.project_root / "src").mkdir(exist_ok=True)
+    (store.project_root / "src" / "value.py").write_text("VALUE = 1\n")
+    task = TaskState(
+        description="Review value",
+        intent=TaskIntent.REVIEW,
+        review_path="src/value.py",
+        config=safe_config(store.project_root),
+    )
+
+    store.register_task(task)
+
+    restored = EventStore(store.project_root).tasks()[0]
+    assert restored.intent is TaskIntent.REVIEW
+    assert restored.review_path == "src/value.py"
+
+
+def test_completed_review_history_survives_later_reviewed_path_deletion(
+    store: EventStore,
+) -> None:
+    """Catches history restoration reapplying mutable existence checks to saved review scope."""
+    (store.project_root / "src").mkdir(exist_ok=True)
+    reviewed = store.project_root / "src" / "value.py"
+    reviewed.write_text("VALUE = 1\n")
+    task = TaskState(
+        description="Review value",
+        intent=TaskIntent.REVIEW,
+        review_path="src/value.py",
+        config=safe_config(store.project_root),
+    )
+    store.register_task(task)
+    store.append(RunEvent(task_id=task.id, task_status=TaskStatus.COMPLETED))
+    reviewed.unlink()
+
+    restored = EventStore(store.project_root).tasks()
+
+    assert len(restored) == 1
+    assert restored[0].status is TaskStatus.COMPLETED
+    assert restored[0].intent is TaskIntent.REVIEW
+    assert restored[0].review_path == "src/value.py"
 
 
 def test_existing_event_database_adds_task_metadata_without_losing_events(
@@ -264,10 +305,63 @@ def test_existing_event_database_adds_task_metadata_without_losing_events(
     migrated = EventStore(store.project_root)
     new_task = TaskState(
         description="Registered after migration",
-        mode=TaskMode.FEATURE,
+        intent=TaskIntent.CODING,
         config=safe_config(store.project_root),
     )
     migrated.register_task(new_task)
 
     assert migrated.events_for(existing_task_id)[0].task_status is TaskStatus.COMPLETED
     assert [task.id for task in migrated.tasks()] == [new_task.id]
+
+
+def test_manual_mode_metadata_schema_migrates_without_blocking_new_intent_tasks(
+    store: EventStore,
+) -> None:
+    """Catches legacy NOT NULL mode columns preventing registration after the intent migration."""
+    existing = TaskState(
+        description="Existing task",
+        intent=TaskIntent.CODING,
+        config=safe_config(store.project_root),
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("DROP TABLE task_metadata")
+        connection.execute(
+            """
+            CREATE TABLE task_metadata (
+                task_id TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                bugfix_target TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO task_metadata VALUES (?, ?, ?, ?, ?)",
+            (
+                str(existing.id),
+                existing.description,
+                "feature",
+                existing.config.model_dump_json(),
+                None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO task_states (task_id, task_status) VALUES (?, ?)",
+            (str(existing.id), TaskStatus.COMPLETED.value),
+        )
+        connection.commit()
+
+    migrated = EventStore(store.project_root)
+    new_task = TaskState(
+        description="New intent task",
+        intent=TaskIntent.REVIEW,
+        config=safe_config(store.project_root),
+    )
+    migrated.register_task(new_task)
+
+    restored = migrated.tasks()
+    assert [(task.id, task.intent) for task in restored] == [
+        (existing.id, TaskIntent.CODING),
+        (new_task.id, TaskIntent.REVIEW),
+    ]

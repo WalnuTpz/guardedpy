@@ -12,7 +12,7 @@ from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState, TaskStatus
+from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskIntent, TaskState, TaskStatus
 from guardedpy.events import StopReason, StoredRunEvent
 
 
@@ -51,12 +51,11 @@ class FakeRuntime:
         return CredentialStatus(configured=self.configured)
 
     def create_task(
-        self, description: str, mode: TaskMode, bugfix_target: str | None
+        self, description: str, intent: TaskIntent = TaskIntent.CODING
     ) -> TaskState:
         task = TaskState(
             description=description,
-            mode=mode,
-            bugfix_target=bugfix_target,
+            intent=intent,
             config=self.config or _config(),
         )
         self.created.append(task)
@@ -140,8 +139,8 @@ def test_repl_refuses_credential_update_secret_entry_from_non_tty_without_getpas
     assert output.getvalue().endswith("非交互终端不能录入凭据。\n")
 
 
-def test_one_shot_bugfix_requires_an_explicit_pytest_node() -> None:
-    """Catches a bugfix one-shot creating a task without its required node."""
+def test_one_shot_rejects_the_removed_manual_bugfix_mode() -> None:
+    """Catches the obsolete user-selected coding mode reappearing in the CLI."""
     from guardedpy.cli import main
 
     assert main(["--prompt", "repair", "--mode", "bugfix"], runtime_factory=FakeRuntime) == 2
@@ -188,8 +187,8 @@ def test_main_fails_safely_without_composing_a_runtime_for_unsupported_cwd(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_one_shot_bugfix_rejects_a_whitespace_only_pytest_node_before_composition() -> None:
-    """Catches a whitespace target constructing a runtime or creating a malformed task."""
+def test_one_shot_rejects_the_removed_manual_bugfix_target_before_composition() -> None:
+    """Catches the obsolete user-selected repair target reaching runtime composition."""
     from guardedpy.cli import main
 
     composed: list[FakeRuntime] = []
@@ -249,7 +248,7 @@ def test_repl_runs_ordinary_feature_text_and_renders_only_safe_progress() -> Non
     rendered = output.getvalue()
     assert code == 0
     assert runtime.created[0].description == "implement safely"
-    assert runtime.created[0].mode is TaskMode.FEATURE
+    assert runtime.created[0].intent is TaskIntent.CODING
     assert str(runtime.created[0].id) in rendered
     assert "completed" in rendered
     assert "删除项目内文件" in rendered
@@ -343,18 +342,20 @@ def test_repl_cancels_the_waiting_task_when_ctrl_c_interrupts_the_approval_promp
     assert "cancelled" in output.getvalue()
 
 
-def test_task_command_requires_target_for_bugfix_before_runtime_mutation() -> None:
-    """Catches `/task` forwarding a malformed bugfix request to the runtime."""
+def test_task_command_creates_one_automatic_coding_task_without_mode_prompt() -> None:
+    """Catches `/task` restoring the retired manual feature/bugfix selection."""
     from guardedpy.cli import run_repl
 
     runtime = FakeRuntime()
     output = StringIO()
 
-    code = run_repl(runtime, StringIO("/task\nbugfix\nrepair\n \n/exit\n"), output, lambda: False)
+    code = run_repl(runtime, StringIO("/task\nrepair automatically\n/exit\n"), output, lambda: False)
 
     assert code == 0
-    assert runtime.created == []
-    assert "缺陷修复任务必须提供 pytest node。" in output.getvalue()
+    assert len(runtime.created) == 1
+    assert runtime.created[0].description == "repair automatically"
+    assert runtime.created[0].intent is TaskIntent.CODING
+    assert "feature/bugfix" not in output.getvalue()
 
 
 def test_repl_help_omits_retired_manual_init() -> None:

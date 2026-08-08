@@ -13,7 +13,7 @@ import pytest
 
 from guardedpy.config import HarnessConfig
 from guardedpy.context import LlmContext
-from guardedpy.domain import TaskMode, TaskState, TaskStatus
+from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 from guardedpy.discovery import ProjectProfile
 from guardedpy.events import EventStore, StopReason
 from guardedpy.llm import DeepSeekClient, TemporaryProviderFailure
@@ -56,11 +56,15 @@ class _Transport:
 
 
 def _config(
-    *, model: str = "deepseek-v4-flash", reasoning_effort: str = "high", timeout: int = 120
+    root: Path | None = None,
+    *,
+    model: str = "deepseek-v4-flash",
+    reasoning_effort: str = "high",
+    timeout: int = 120,
 ) -> HarnessConfig:
     return HarnessConfig(
         profile=ProjectProfile(
-            root=Path.cwd().resolve(),
+            root=(root or Path.cwd()).resolve(),
             discovery_source="tests_dir",
             source_dirs=(PurePosixPath("src"),),
             test_dirs=(PurePosixPath("tests"),),
@@ -258,14 +262,18 @@ def test_local_services_composes_the_task_config_timeout_into_openai_transport(
     monkeypatch.setattr(cli, "_system_keyring", lambda: Keyring())
     monkeypatch.setattr(cli, "OpenAI", openai_factory)
     services = cli.local_services()
-    config = _config(model="deepseek-v4-pro", reasoning_effort="max", timeout=19)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_baseline.py").write_text(
+        "def test_baseline() -> None:\n    assert True\n"
+    )
+    config = _config(tmp_path, model="deepseek-v4-pro", reasoning_effort="max", timeout=19)
     orchestrator = services.orchestrator_factory(tmp_path, config, MemoryStore(tmp_path))
 
     orchestrator.run(
         TaskState(
             description="Stop",
-            mode=TaskMode.BUGFIX,
-            bugfix_target="tests/test_value.py::test_value_is_fixed",
+            intent=TaskIntent.CODING,
             config=config,
         )
     )
@@ -284,13 +292,18 @@ def test_two_temporary_provider_failures_stop_with_their_own_audit_reason(
 ) -> None:
     """Catches retry exhaustion being misrepresented as a model-selected finish action."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_baseline.py").write_text(
+        "def test_baseline() -> None:\n    assert True\n"
+    )
     transport = _Transport([ConnectionError("offline"), ConnectionError("offline")])
-    client = DeepSeekClient(lambda: "secret", _config(), lambda key: transport)
+    config = _config(tmp_path)
+    client = DeepSeekClient(lambda: "secret", config, lambda key: transport)
     task = TaskState(
         description="Repair the selected failure",
-        mode=TaskMode.BUGFIX,
-        bugfix_target="tests/test_value.py::test_value_is_fixed",
-        config=_config(),
+        intent=TaskIntent.CODING,
+        config=config,
     )
 
     stopped = TaskOrchestrator(tmp_path, client).run(task)

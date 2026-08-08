@@ -10,10 +10,18 @@ import pytest
 
 import guardedpy.orchestrator as orchestrator_module
 from conftest import safe_config
-from guardedpy.actions import RunCommandAction
+from guardedpy.actions import RunCommandAction, parse_action, stable_hash
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
-from guardedpy.domain import ApprovalDecision, TaskMode, TaskState, TaskStatus, TddPhase
+from guardedpy.domain import (
+    ApprovalDecision,
+    PolicyVerdict,
+    TaskIntent,
+    TaskPath,
+    TaskState,
+    TaskStatus,
+    TddPhase,
+)
 from guardedpy.events import EventStore, RunEvent, StopReason
 from guardedpy.feedback import PytestRun
 from guardedpy.llm import ScriptedLLM
@@ -30,17 +38,24 @@ def _action(**payload: object) -> str:
     return json.dumps(payload)
 
 
-def _bugfix_task() -> TaskState:
+def _bugfix_task(root: Path) -> TaskState:
+    config = safe_config(root)
+    (root / "tests" / "test_guardedpy_baseline.py").write_text(
+        "def test_guardedpy_baseline() -> None:\n    assert True\n"
+    )
     return TaskState(
         description="Repair the selected failure",
-        mode=TaskMode.BUGFIX,
-        bugfix_target="tests/test_value.py::test_value_is_fixed",
-        config=_config(),
+        intent=TaskIntent.CODING,
+        config=config,
     )
 
 
-def _feature_task() -> TaskState:
-    return TaskState(description="Add a created module", mode=TaskMode.FEATURE, config=_config())
+def _feature_task(root: Path) -> TaskState:
+    config = safe_config(root)
+    (root / "tests" / "test_guardedpy_baseline.py").write_text(
+        "def test_guardedpy_baseline() -> None:\n    assert True\n"
+    )
+    return TaskState(description="Add a created module", intent=TaskIntent.CODING, config=config)
 
 
 def test_submit_registers_a_pending_task_before_its_background_run(
@@ -48,14 +63,14 @@ def test_submit_registers_a_pending_task_before_its_background_run(
 ) -> None:
     """Catches WebUI admission bypassing the core's one-active-task registry."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([]))
 
     submitted = orchestrator.submit(task)
 
     assert submitted is task
     with pytest.raises(ValueError, match="another task is already active"):
-        orchestrator.submit(_bugfix_task())
+        orchestrator.submit(_bugfix_task(tmp_path))
 
 
 def test_scripted_loop_returns_failure_feedback_then_corrects_and_completes(
@@ -84,7 +99,7 @@ def test_scripted_loop_returns_failure_feedback_then_corrects_and_completes(
             _action(kind="finish", summary="work complete", status="completed"),
         ]
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
 
     finished = TaskOrchestrator(tmp_path, llm).run(task)
 
@@ -96,12 +111,66 @@ def test_scripted_loop_returns_failure_feedback_then_corrects_and_completes(
     assert events[-1].stop_reason is StopReason.COMPLETED
 
 
+def test_stateful_pytest_denial_is_audited_and_not_promoted_to_llm_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a feature red without a test change advancing the loop as trusted feedback."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "value.py").write_text("VALUE = 'unchanged'\n")
+    task = _feature_task(tmp_path)
+    pytest_runs = iter(
+        (
+            PytestRun(0, "1 passed\n", "", False),
+            PytestRun(
+                1,
+                "FAILED tests/test_guardedpy_baseline.py::test_guardedpy_baseline - AssertionError\n",
+                "",
+                False,
+            ),
+        )
+    )
+    monkeypatch.setattr(Workspace, "run_pytest", lambda *_args: next(pytest_runs))
+    llm = ScriptedLLM(
+        [
+            _action(kind="run_pytest", summary="observe unmodified red", targets=[]),
+            _action(
+                kind="apply_patch",
+                summary="attempt source patch",
+                diff="--- a/src/value.py\n+++ b/src/value.py\n@@ -1 +1 @@\n-VALUE = 'unchanged'\n+VALUE = 'changed'\n",
+            ),
+            _action(kind="finish", summary="report blocked", status="blocked"),
+        ]
+    )
+
+    result = TaskOrchestrator(tmp_path, llm).run(task)
+
+    denial_context = json.loads(llm.contexts[1])
+    assert result.status is TaskStatus.BLOCKED
+    assert denial_context["context"]["feedback"] == {
+        "type": "policy_denial",
+        "rule_id": "tdd.test_change_required",
+        "reason": "a feature task must change a test before observing red",
+    }
+    assert (tmp_path / "src" / "value.py").read_text() == "VALUE = 'unchanged'\n"
+    pytest_event = next(
+        event
+        for event in EventStore(tmp_path).events_for(task.id)
+        if event.policy_rule_id == "tdd.test_change_required"
+    )
+    assert (pytest_event.policy_verdict, pytest_event.policy_rule_id) == (
+        PolicyVerdict.DENY,
+        "tdd.test_change_required",
+    )
+
+
 def test_orchestrator_injects_relevant_approved_memories_into_the_llm_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Catches approved memories being accepted by a builder but never reaching a real loop call."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     memories = MemoryStore(tmp_path)
     for number in range(6):
         memories.approve(memories.propose(task.id, f"repair selected failure memory {number}").id)
@@ -121,7 +190,7 @@ def test_terminal_memory_proposal_enters_queue_but_not_persistent_search(
 ) -> None:
     """Catches a model proposal being persisted or ignored before human approval."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     memory_store = MemoryStore(tmp_path)
     sentinel = "SENTINEL-PRIVATE-PROPOSAL"
     proposal = _action(kind="propose_memory", summary="save parser note", text=sentinel)
@@ -168,7 +237,7 @@ def test_orchestrator_records_a_normalized_created_test_before_source_creation(
         ]
     )
 
-    stopped = TaskOrchestrator(tmp_path, llm).run(_feature_task())
+    stopped = TaskOrchestrator(tmp_path, llm).run(_feature_task(tmp_path))
 
     assert stopped.status is TaskStatus.BLOCKED
     assert (tmp_path / "src" / "created.py").read_text() == "VALUE = 'created'\n"
@@ -195,7 +264,7 @@ def test_source_spelled_through_tests_parent_does_not_register_as_a_test_or_cras
 @@ -0,0 +1 @@
 +VALUE = 'created'
 """
-    task = _feature_task()
+    task = _feature_task(tmp_path)
     llm = ScriptedLLM(
         [
             _action(kind="run_pytest", summary="establish baseline", targets=[]),
@@ -241,7 +310,7 @@ def test_failed_workspace_test_creation_does_not_register_a_feature_test(
             _action(kind="finish", summary="stop", status="blocked"),
         ]
     )
-    task = _feature_task()
+    task = _feature_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, llm)
 
     orchestrator.run(task)
@@ -257,14 +326,15 @@ def test_invalid_model_json_stops_without_executing_a_workspace_tool(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     target = tmp_path / "untouched.txt"
     target.write_text("safe\n")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
 
     stopped = TaskOrchestrator(tmp_path, ScriptedLLM(["not-json"])).run(task)
 
     assert stopped.status is TaskStatus.BLOCKED
     assert target.read_text() == "safe\n"
     events = EventStore(tmp_path).events_for(task.id)
-    assert len(events) == 2
+    assert len(events) == 3
+    assert events[1].feedback_kind and events[1].feedback_kind.value == "passed"
     assert events[-1].stop_reason is StopReason.INVALID_MODEL_OUTPUT
 
 
@@ -275,7 +345,7 @@ def test_repeated_action_stops_before_a_second_tool_execution(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "notes.txt").write_text("one\n")
     action = _action(kind="read_file", summary="inspect note", path="notes.txt")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
 
     stopped = TaskOrchestrator(tmp_path, ScriptedLLM([action, action])).run(task)
 
@@ -289,7 +359,7 @@ def test_repeated_operation_with_only_a_changed_summary_still_stops(
     """Catches model-controlled summaries bypassing the no-progress repeat detector."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "notes.txt").write_text("one\n")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     llm = ScriptedLLM(
         [
             _action(kind="read_file", summary="first wording", path="notes.txt"),
@@ -310,7 +380,7 @@ def test_cancellation_of_waiting_task_is_terminal_and_exact_approval_does_not_ru
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     target = tmp_path / "obsolete.txt"
     target.write_text("remove only when approved\n")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     action = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
 
@@ -330,7 +400,7 @@ def test_cancelled_task_does_not_dispatch_action_returned_after_completion(
 ) -> None:
     """Catches an action returned by the LLM after cancellation reaching the workspace."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     workspace_calls: list[PurePosixPath] = []
     action = _action(kind="list_files", summary="list project", path=".")
 
@@ -361,7 +431,7 @@ def test_cancelled_task_does_not_dispatch_an_approved_action(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     target = tmp_path / "obsolete.txt"
     target.write_text("preserve when cancellation wins\n")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     delete = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([delete]))
 
@@ -389,7 +459,7 @@ def test_cancellation_during_action_parsing_remains_terminal_before_approval_tra
 ) -> None:
     """Catches parsing-time cancellation being overwritten by waiting-for-approval state."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     action = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
     original_parse = orchestrator_module.parse_action
@@ -414,7 +484,7 @@ def test_exact_approved_action_executes_once_and_keeps_full_action_out_of_event_
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     target = tmp_path / "obsolete.txt"
     target.write_text("remove only when approved\n")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     action = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
 
@@ -446,7 +516,7 @@ def test_explicit_approval_request_pauses_with_safe_nonpermanent_projection(
         reason=sentinel,
     )
     llm = ScriptedLLM([request, _action(kind="finish", summary="stop", status="blocked")])
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
 
     waiting = TaskOrchestrator(tmp_path, llm).run(task)
     pending = EventStore(tmp_path).events_for(task.id)[-1]
@@ -469,7 +539,7 @@ def test_rejecting_explicit_approval_request_blocks_without_resuming_model(
             _action(kind="finish", summary="must not resume", status="blocked"),
         ]
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, llm)
 
     waiting = orchestrator.run(task)
@@ -501,7 +571,7 @@ def test_allow_once_on_explicit_approval_request_resumes_without_tool_dispatch(
             _action(kind="finish", summary="stop after consent", status="blocked"),
         ]
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, llm)
 
     waiting = orchestrator.run(task)
@@ -522,7 +592,7 @@ def test_forged_always_for_explicit_approval_request_keeps_exact_pending_retryab
 ) -> None:
     """Catches invalid permanent consent consuming a non-command approval request."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(
         tmp_path,
         ScriptedLLM(
@@ -557,7 +627,7 @@ def test_once_approval_is_consumed_without_creating_a_persistent_rule(
         "_run_command",
         lambda _self, _action: ToolResult(True, "simulated command", {}),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
 
     waiting = orchestrator.run(task)
@@ -593,7 +663,7 @@ def test_branch_change_before_decision_keeps_push_pending_and_unexecuted(
         lambda _self, command: executions.append(command.args)
         or ToolResult(True, "simulated command", {}),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(
         tmp_path,
         ScriptedLLM([action]),
@@ -642,7 +712,7 @@ def test_approval_registration_uses_the_original_single_fresh_decision(
         lambda _self, command: executions.append(command.args)
         or ToolResult(True, "simulated command", {}),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(
         tmp_path,
         ScriptedLLM([action]),
@@ -696,7 +766,7 @@ def test_branch_is_revalidated_immediately_before_approved_push_dispatch(
         lambda _self, command: executions.append(command.args)
         or ToolResult(True, "simulated command", {}),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(
         tmp_path,
         ScriptedLLM([action]),
@@ -737,7 +807,7 @@ def test_invalid_approval_input_does_not_execute_and_pending_remains_retryable(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     target = tmp_path / "obsolete.txt"
     target.write_text("preserve until a valid decision\n")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     action = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
 
@@ -771,7 +841,7 @@ def test_always_approval_survives_store_restart_without_raw_pending_action(
         "_run_command",
         lambda _self, _action: ToolResult(True, "simulated command", {}),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([pending.model_dump_json()]))
 
     orchestrator.run(task)
@@ -802,11 +872,11 @@ def test_external_rule_revocation_is_seen_by_the_same_long_lived_orchestrator(
     )
     orchestrator = TaskOrchestrator(tmp_path, llm, command_rules=store)
 
-    first = orchestrator.run(_bugfix_task())
+    first = orchestrator.run(_bugfix_task(tmp_path))
     assert first.status is TaskStatus.BLOCKED
     assert CommandRuleStore(tmp_path).delete(rule.id) is True
 
-    second = orchestrator.run(_bugfix_task())
+    second = orchestrator.run(_bugfix_task(tmp_path))
 
     assert second.status is TaskStatus.WAITING_APPROVAL
     pending = EventStore(tmp_path).events_for(second.id)[-1]
@@ -838,8 +908,7 @@ def test_failed_patch_does_not_advance_tdd_phase_before_the_tool_succeeds(
     (tmp_path / "tests").mkdir()
     (tmp_path / "src" / "value.py").write_text("VALUE = 'broken'\n")
     (tmp_path / "tests" / "test_value.py").write_text("def test_stays_red() -> None:\n    assert False\n")
-    task = _bugfix_task()
-    task.bugfix_target = "tests/test_value.py::test_stays_red"
+    task = _bugfix_task(tmp_path)
     llm = ScriptedLLM(
         [
             _action(kind="run_pytest", summary="observe red", targets=[]),
@@ -859,15 +928,14 @@ def test_failed_patch_does_not_advance_tdd_phase_before_the_tool_succeeds(
     assert (tmp_path / "src" / "value.py").read_text() == "VALUE = 'broken'\n"
 
 
-def test_pytest_execution_error_does_not_count_as_the_required_red_observation(
+def test_pytest_execution_error_baseline_blocks_before_the_first_model_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Catches a collector or timeout error advancing TDD as if a test assertion had failed."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     task = TaskState(
         description="Repair a test",
-        mode=TaskMode.BUGFIX,
-        bugfix_target="tests/test_value.py::test_value_is_fixed",
+        intent=TaskIntent.CODING,
         config=safe_config(tmp_path),
     )
     llm = ScriptedLLM(
@@ -877,9 +945,12 @@ def test_pytest_execution_error_does_not_count_as_the_required_red_observation(
         ]
     )
 
-    TaskOrchestrator(tmp_path, llm).run(task)
+    stopped = TaskOrchestrator(tmp_path, llm).run(task)
 
-    assert '"tdd_phase": "test_design"' in llm.contexts[1]
+    assert stopped.status is TaskStatus.BLOCKED
+    assert stopped.path is TaskPath.BASELINE_PENDING
+    assert llm.contexts == []
+    assert EventStore(tmp_path).events_for(task.id)[-1].feedback_kind.value == "execution_error"
 
 
 def test_pytest_audit_discards_failed_token_outside_configured_test_roots(
@@ -898,7 +969,7 @@ def test_pytest_audit_discards_failed_token_outside_configured_test_roots(
             False,
         ),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     llm = ScriptedLLM(
         [
             _action(kind="run_pytest", summary="run configured suite", targets=[]),
@@ -938,7 +1009,7 @@ def test_pytest_audit_discards_untrusted_suffix_from_rooted_test_node(
             False,
         ),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     llm = ScriptedLLM(
         [
             _action(kind="run_pytest", summary="run configured suite", targets=[]),
@@ -973,7 +1044,7 @@ def test_pytest_audit_discards_nonexistent_path_inside_configured_test_root(
             False,
         ),
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
 
     TaskOrchestrator(
         tmp_path,
@@ -1003,7 +1074,7 @@ def test_approved_action_consumes_its_original_round_budget_before_resuming(
     target.write_text("remove only once\n")
     delete = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     llm = ScriptedLLM([delete, _action(kind="finish", summary="should not run", status="blocked")])
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, llm, max_rounds=1)
 
     waiting = orchestrator.run(task)
@@ -1028,7 +1099,7 @@ def test_resumed_task_keeps_repeat_history_across_waiting_approval(
     target.write_text("remove only once\n")
     first = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     second = _action(kind="delete_path", summary="wording changed", path="obsolete.txt")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([first, second]), max_rounds=2)
 
     waiting = orchestrator.run(task)
@@ -1054,7 +1125,7 @@ def test_successful_approved_delete_invalidates_full_suite_green_before_finish(
     )
     target = tmp_path / "obsolete.txt"
     target.write_text("remove after approval\n")
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     task.tdd_phase = TddPhase.IMPLEMENTATION
     delete = _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")
     llm = ScriptedLLM(
@@ -1098,14 +1169,17 @@ def test_allowed_workspace_tool_exception_stops_and_audits_the_failed_action(
         raise OSError("workspace failed")
 
     monkeypatch.setattr(Workspace, method, raise_tool)
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
 
     stopped = TaskOrchestrator(tmp_path, ScriptedLLM([response])).run(task)
 
     event = EventStore(tmp_path).events_for(task.id)[-1]
     assert stopped.status is TaskStatus.BLOCKED
     assert event.stop_reason is StopReason.UNRECOVERABLE_ERROR
-    assert event.action_hash == EventStore(tmp_path).events_for(task.id)[1].action_hash
+    if method == "run_pytest":
+        assert event.action_hash is not None
+    else:
+        assert event.action_hash == stable_hash(parse_action(response))
 
 
 def test_allowed_patch_exception_stops_and_audits_the_failed_action(
@@ -1131,7 +1205,7 @@ def test_allowed_patch_exception_stops_and_audits_the_failed_action(
         summary="repair value",
         diff="--- a/src/value.py\n+++ b/src/value.py\n@@ -1 +1 @@\n-VALUE = 'broken'\n+VALUE = 'fixed'\n",
     )
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
 
     stopped = TaskOrchestrator(
         tmp_path,
@@ -1162,7 +1236,7 @@ def test_approved_delete_exception_stops_and_audits_the_failed_action(
         raise OSError("delete failed")
 
     monkeypatch.setattr(Workspace, "delete_path", raise_delete)
-    task = _bugfix_task()
+    task = _bugfix_task(tmp_path)
     orchestrator = TaskOrchestrator(
         tmp_path,
         ScriptedLLM([_action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt")]),
@@ -1186,8 +1260,8 @@ def test_orchestrator_rejects_a_second_task_while_first_waits_for_approval(
     """Catches a second task entering the loop while a dangerous action awaits approval."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     (tmp_path / "obsolete.txt").write_text("remove only when approved\n")
-    first = _bugfix_task()
-    second = _bugfix_task()
+    first = _bugfix_task(tmp_path)
+    second = _bugfix_task(tmp_path)
     llm = ScriptedLLM(
         [
             _action(kind="delete_path", summary="delete obsolete file", path="obsolete.txt"),

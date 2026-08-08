@@ -17,7 +17,7 @@ from guardedpy.domain import (
     FeedbackKind,
     PolicyDecision,
     PolicyVerdict,
-    TaskMode,
+    TaskIntent,
     TaskState,
     TaskStatus,
 )
@@ -241,15 +241,15 @@ class EventStore:
             connection.execute(
                 """
                 INSERT INTO task_metadata (
-                    task_id, description, mode, config_json, bugfix_target
+                    task_id, description, intent, config_json, review_path
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     str(task.id),
                     task.description,
-                    task.mode.value,
+                    task.intent.value,
                     task.config.model_dump_json(),
-                    task.bugfix_target,
+                    task.review_path,
                 ),
             )
             connection.execute(
@@ -267,21 +267,24 @@ class EventStore:
             rows = connection.execute(
                 """
                 SELECT task_metadata.task_id, task_metadata.description,
-                       task_metadata.mode, task_metadata.config_json,
-                       task_metadata.bugfix_target, task_states.task_status
+                       task_metadata.intent, task_metadata.config_json,
+                       task_states.task_status, task_metadata.review_path
                 FROM task_metadata
                 JOIN task_states ON task_states.task_id = task_metadata.task_id
                 ORDER BY task_metadata.rowid
                 """
             ).fetchall()
         return [
-            TaskState(
-                id=UUID(row[0]),
-                description=row[1],
-                mode=TaskMode(row[2]),
-                config=HarnessConfig.model_validate_json(row[3]),
-                bugfix_target=row[4],
-                status=TaskStatus(row[5]),
+            TaskState.model_validate(
+                {
+                    "id": UUID(row[0]),
+                    "description": row[1],
+                    "intent": TaskIntent(row[2]),
+                    "config": HarnessConfig.model_validate_json(row[3]),
+                    "status": TaskStatus(row[4]),
+                    "review_path": row[5],
+                },
+                context={"source": "event_store_history"},
             )
             for row in rows
         ]
@@ -394,9 +397,9 @@ class EventStore:
                 CREATE TABLE IF NOT EXISTS task_metadata (
                     task_id TEXT PRIMARY KEY,
                     description TEXT NOT NULL,
-                    mode TEXT NOT NULL,
+                    intent TEXT NOT NULL,
                     config_json TEXT NOT NULL,
-                    bugfix_target TEXT
+                    review_path TEXT
                 );
                 CREATE TABLE IF NOT EXISTS event_policies (
                     event_id INTEGER PRIMARY KEY,
@@ -424,4 +427,28 @@ class EventStore:
             }
             if "feedback_node_id" not in event_columns:
                 connection.execute("ALTER TABLE events ADD COLUMN feedback_node_id TEXT")
+            metadata_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(task_metadata)")
+            }
+            if "intent" not in metadata_columns:
+                connection.executescript(
+                    """
+                    ALTER TABLE task_metadata RENAME TO task_metadata_manual_mode;
+                    CREATE TABLE task_metadata (
+                        task_id TEXT PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        intent TEXT NOT NULL,
+                        config_json TEXT NOT NULL,
+                        review_path TEXT
+                    );
+                    INSERT INTO task_metadata (
+                        task_id, description, intent, config_json, review_path
+                    )
+                    SELECT task_id, description, 'coding', config_json, NULL
+                    FROM task_metadata_manual_mode;
+                    DROP TABLE task_metadata_manual_mode;
+                    """
+                )
+            elif "review_path" not in metadata_columns:
+                connection.execute("ALTER TABLE task_metadata ADD COLUMN review_path TEXT")
             connection.commit()
