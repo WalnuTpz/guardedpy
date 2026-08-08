@@ -6,15 +6,20 @@ import argparse
 from collections.abc import Callable, Sequence
 from getpass import getpass
 from pathlib import Path
-import shlex
+import subprocess
 import sys
-from typing import TextIO
+from typing import Any, TextIO
 from uuid import UUID
 
+import keyring
+from openai import OpenAI
+
 from guardedpy.config import HarnessConfig
+from guardedpy.credentials import CredentialService
 from guardedpy.domain import TaskMode, TaskState, TaskStatus, is_approval_decision
-from guardedpy.runtime import LocalRuntime
-from guardedpy.web import local_services, server_main as _server_main
+from guardedpy.llm import DeepSeekClient
+from guardedpy.orchestrator import TaskOrchestrator
+from guardedpy.runtime import LocalRuntime, RuntimeServices
 
 
 _TERMINAL_STATUSES = {
@@ -23,7 +28,7 @@ _TERMINAL_STATUSES = {
     TaskStatus.CANCELLED,
     TaskStatus.INTERRUPTED,
 }
-_HELP = "可用命令：/init /task /help /status /tasks /memory /rules /credentials /clear /exit\n"
+_HELP = "可用命令：/task /help /status /tasks /memory /rules /credentials /clear /exit\n"
 
 
 class _ArgumentError(ValueError):
@@ -39,8 +44,51 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 def local_runtime() -> LocalRuntime:
-    """Compose the same local runtime services used by the loopback server."""
+    """Compose the provider-backed services used only after CLI parsing."""
     return LocalRuntime(local_services())
+
+
+def local_services() -> RuntimeServices:
+    """Compose injectable CLI runtime services without reading a credential."""
+    credentials = CredentialService(_system_keyring())
+
+    def orchestrator_factory(
+        project_root: Path, config: HarnessConfig, memory_store: Any
+    ) -> TaskOrchestrator:
+        def transport_factory(api_key: str) -> Any:
+            return _deepseek_transport(
+                api_key,
+                timeout_seconds=config.timeout_seconds,
+            )
+
+        llm = DeepSeekClient(credentials.get_key, config.model, transport_factory)
+        return TaskOrchestrator(
+            project_root,
+            llm,
+            memory_store=memory_store,
+            current_branch_provider=lambda: _current_git_branch(project_root),
+        )
+
+    return RuntimeServices(credentials=credentials, orchestrator_factory=orchestrator_factory)
+
+
+def _system_keyring() -> Any:
+    return keyring.get_keyring()
+
+
+def _deepseek_transport(
+    api_key: str,
+    *,
+    timeout_seconds: int,
+    openai_factory: Callable[..., Any] | None = None,
+) -> Any:
+    factory = OpenAI if openai_factory is None else openai_factory
+    return factory(
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        timeout=timeout_seconds,
+        max_retries=0,
+    )
 
 
 def main(
@@ -50,7 +98,7 @@ def main(
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
 ) -> int:
-    """Dispatch one local REPL, one prompt, or compatible server/demo commands."""
+    """Dispatch one local REPL or one prompt."""
     parser = _parser()
     try:
         arguments = parser.parse_args(argv)
@@ -59,12 +107,6 @@ def main(
     except SystemExit as error:
         return int(error.code)
 
-    if arguments.command == "serve":
-        return _server_main(())
-    if arguments.command == "demo":
-        from guardedpy.web import demo_main
-
-        return demo_main(())
     if arguments.mode == TaskMode.BUGFIX.value and not (
         arguments.target and arguments.target.strip()
     ):
@@ -85,11 +127,6 @@ def main(
     return run_repl(runtime, source, output, source.isatty)
 
 
-def server_main(argv: Sequence[str] | None = None) -> int:
-    """Expose the loopback-only server entrypoint for package metadata."""
-    return _server_main(argv)
-
-
 def run_repl(
     runtime: LocalRuntime,
     stdin: TextIO,
@@ -105,9 +142,6 @@ def run_repl(
             return 0
         if line == "/help":
             stdout.write(_HELP)
-            continue
-        if line == "/init":
-            _initialize(runtime, stdout, stdin.readline, isatty)
             continue
         if line == "/task":
             _interactive_task(runtime, stdout, stdin.readline)
@@ -143,45 +177,23 @@ def _parser() -> _ArgumentParser:
     parser.add_argument("--prompt")
     parser.add_argument("--mode", choices=tuple(mode.value for mode in TaskMode), default="feature")
     parser.add_argument("--target")
-    parser.add_argument("command", nargs="?", choices=("serve", "demo"))
     return parser
 
 
-def _initialize(
-    runtime: LocalRuntime,
-    stdout: TextIO,
-    read_line: Callable[[], str],
-    isatty: Callable[[], bool],
-) -> None:
-    if not isatty():
-        stdout.write("非交互终端不能录入凭据。\n")
-        return
-    project_root = Path(_prompt(stdout, read_line, "项目目录: ")).expanduser()
-    source_dirs_text = _prompt(stdout, read_line, "源码目录（空格分隔）: ")
-    test_dirs_text = _prompt(stdout, read_line, "测试目录（空格分隔）: ")
-    pytest_command_text = _prompt(stdout, read_line, "pytest 命令（空格分隔）: ")
-    model = _prompt(stdout, read_line, "模型: ")
-    timeout = _prompt(stdout, read_line, "超时秒数: ")
-    key = getpass("DeepSeek API Key（留空保留已有凭据）: ")
-    if not key and not _credential_configured(runtime):
-        stdout.write("尚未配置凭据。\n")
-        return
+def _current_git_branch(project_root: Path) -> str | None:
     try:
-        config = HarnessConfig(
-            source_dirs=tuple(Path(value) for value in _tokens(source_dirs_text)),
-            test_dirs=tuple(Path(value) for value in _tokens(test_dirs_text)),
-            pytest_command=_tokens(pytest_command_text),
-            model=model,
-            timeout_seconds=int(timeout),
+        completed = subprocess.run(
+            ["git", "-C", str(project_root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=5,
         )
-        runtime.setup(project_root, config, key if key else None)
-    except (TypeError, ValueError):
-        stdout.write("初始化参数无效。\n")
-        return
     except Exception:
-        stdout.write("无法保存设置。\n")
-        return
-    stdout.write("设置已保存。\n")
+        return None
+    branch = completed.stdout.strip()
+    return branch if completed.returncode == 0 and branch else None
 
 
 def _interactive_task(runtime: LocalRuntime, stdout: TextIO, read_line: Callable[[], str]) -> int:
@@ -393,7 +405,3 @@ def _credential_configured(runtime: LocalRuntime) -> bool:
 def _prompt(stdout: TextIO, read_line: Callable[[], str], label: str) -> str:
     stdout.write(label)
     return read_line().strip()
-
-
-def _tokens(value: str) -> tuple[str, ...]:
-    return tuple(shlex.split(value))
