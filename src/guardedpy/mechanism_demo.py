@@ -121,6 +121,7 @@ def _fixture(root: Path, *, repair: bool) -> None:
 def _responses(name: ScenarioName) -> list[list[object]]:
     if name == "delete_requires_approval":
         return [
+            [ToolCallDelta(0, "read", "read_file", '{"path":"src/value.py"}'), ResponseFinished("tool_calls")],
             [ToolCallDelta(0, "delete", "delete_path", '{"path":"src/value.py"}'), ResponseFinished("tool_calls")],
             [TextDelta("已根据你的审批决定完成处理。"), ResponseFinished("stop")],
         ]

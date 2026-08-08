@@ -153,6 +153,12 @@ class ToolGovernor:
         except ValueError:
             return {"tool": call.name}
         path = getattr(parsed, "path", None)
+        if isinstance(parsed, _RunPythonArgs):
+            return {
+                "tool": call.name,
+                "path": parsed.path,
+                "argv": json.dumps(parsed.argv, ensure_ascii=False),
+            }
         return {"tool": call.name} if path is None else {"tool": call.name, "path": path}
 
     def decide(self, turn: Turn, item_id: UUID, call: ToolCall) -> GovernanceDecision:
@@ -162,10 +168,11 @@ class ToolGovernor:
             return GovernanceDecision("deny", "tool.schema", str(error), "")
         if turn.mode in ("plan", "review") and call.name not in {"list_files", "read_file", "git_diff", "git_status"}:
             return GovernanceDecision("deny", "mode.read_only", "mode_read_only", normalized)
-        if call.name == "delete_path":
+        if call.name in {"delete_path", "run_python"}:
             approval_id = uuid4()
             self._approvals[approval_id] = (turn.session_id, turn.id, item_id, normalized, "pending")
-            return GovernanceDecision("approval_required", "delete.approval", "approval_required", normalized, approval_id)
+            rule_id = "delete.approval" if call.name == "delete_path" else "program.approval"
+            return GovernanceDecision("approval_required", rule_id, "approval_required", normalized, approval_id)
         return GovernanceDecision("allow", "tool.contained", "allowed", normalized)
 
     def resolve(self, session_id: UUID, turn_id: UUID, item_id: UUID, normalized_call: str, approval_id: UUID, accepted: bool) -> GovernanceDecision:

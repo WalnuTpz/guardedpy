@@ -315,6 +315,14 @@ def test_transcript_presenter_explains_safe_tool_completion_and_denial() -> None
     assert failed is None
 
 
+def test_approval_projection_identifies_the_exact_python_program_and_arguments() -> None:
+    from guardedpy.tui import approval_projection
+
+    assert approval_projection({
+        "tool": "run_python", "path": "src/hello.py", "argv": '["--name","Ada Lovelace"]',
+    }) == '运行 src/hello.py（参数：["--name", "Ada Lovelace"]）'
+
+
 def test_transcript_presenter_groups_reads_flattens_finished_markdown_and_hides_success_terminal() -> None:
     from guardedpy.conversation import SessionEvent
     from guardedpy.tui import TranscriptPresenter

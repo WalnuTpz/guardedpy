@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 import re
 from threading import Event as ThreadEvent, Thread
@@ -61,6 +62,23 @@ _NO_ARGUMENT_COMMANDS = frozenset(
         "/doctor",
     }
 )
+
+
+def approval_projection(data: dict[str, str]) -> str:
+    """Render the exact, schema-validated action that needs a human decision."""
+    tool = data.get("tool")
+    path = data.get("path")
+    if tool == "delete_path" and path:
+        return f"删除 {path}"
+    if tool == "run_python" and path:
+        try:
+            argv = json.loads(data.get("argv", "[]"))
+        except json.JSONDecodeError:
+            argv = []
+        if isinstance(argv, list) and all(isinstance(argument, str) for argument in argv):
+            return f"运行 {path}（参数：{json.dumps(argv, ensure_ascii=False)}）"
+        return f"运行 {path}"
+    return tool or "受控项目操作"
 
 
 class ComposerSubmitted(Message):
@@ -642,12 +660,9 @@ class GuardedPyApp(App[None]):
             self._continuous_pending_approval = (
                 message.event.session_id, message.event.turn_id, approval_id
             )
-            tool = message.event.data.get("tool", "受控操作")
-            path = message.event.data.get("path")
-            projection = f"删除 {path}" if tool == "delete_path" and path else tool
             self.push_screen(
                 ApprovalScreen(
-                    projection,
+                    approval_projection(dict(message.event.data)),
                     message.event.data.get("rule_id", "approval.required"),
                     False,
                 ),

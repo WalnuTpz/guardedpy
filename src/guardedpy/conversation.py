@@ -113,6 +113,9 @@ _SESSION_CONTEXT = (
     "verification; do not use Markdown headings, tables, or repeat the tool log. Continue the "
     "same conversation across turns."
 )
+_MAX_RESTORED_TRANSCRIPT_ENTRIES = 24
+_MAX_RESTORED_TRANSCRIPT_CHARS = 12_000
+_MAX_RESTORED_TURNS = 16
 
 
 class ConversationModel(Protocol):
@@ -155,6 +158,26 @@ class VisibleTranscriptEntry(BaseModel):
 
     role: Literal["user", "assistant"]
     text: str
+
+
+def _recent_provider_transcript(
+    entries: tuple[VisibleTranscriptEntry, ...],
+) -> tuple[VisibleTranscriptEntry, ...]:
+    """Keep complete visible history on disk but restore only bounded recent dialogue to the model."""
+    retained: list[VisibleTranscriptEntry] = []
+    remaining = _MAX_RESTORED_TRANSCRIPT_CHARS
+    for entry in reversed(entries[-_MAX_RESTORED_TRANSCRIPT_ENTRIES:]):
+        if remaining <= 0:
+            break
+        text = entry.text[-remaining:]
+        retained.append(entry.model_copy(update={"text": text}))
+        remaining -= len(text)
+    return tuple(reversed(retained))
+
+
+def _recent_safe_turns(turns: tuple[SafeTurnSummary, ...]) -> tuple[SafeTurnSummary, ...]:
+    """Bound the deterministic facts restored into a provider request."""
+    return turns[-_MAX_RESTORED_TURNS:]
 
 
 def safe_event_message(event: SessionEvent) -> str | None:
@@ -249,8 +272,13 @@ def safe_event_message(event: SessionEvent) -> str | None:
             }.get(tool, "工具执行完成。")
         return "工具未成功执行。"
     if event.kind == "approval_requested":
+        tool = event.data.get("tool")
         path = event.data.get("path")
-        return f"需要批准：删除 {path}。" if path is not None else "需要精确审批：删除项目路径。"
+        if tool == "delete_path":
+            return f"需要批准：删除 {path}。" if path is not None else "需要精确审批：删除项目路径。"
+        if tool == "run_python":
+            return f"需要批准：运行 {path}。" if path is not None else "需要精确审批：运行 Python 程序。"
+        return "需要精确审批：受控项目操作。"
     if event.kind == "approval_resolved":
         return "审批已批准。" if event.data.get("accepted") == "true" else "审批已拒绝。"
     return {
@@ -372,18 +400,21 @@ class ConversationAgent:
             raise TurnNotActiveError("session is already active")
         messages = [ProviderMessage(role="system", content=_SESSION_CONTEXT)]
         if safe_summary is not None:
+            facts_only = safe_summary.model_copy(
+                update={"turns": _recent_safe_turns(safe_summary.turns), "transcript": ()}
+            )
             messages.append(
                 ProviderMessage(
                     role="system",
                     content=(
                         "Safe prior-session summary (not raw provider history):\n"
-                        f"{safe_summary.model_dump_json()}"
+                        f"{facts_only.model_dump_json()}"
                     ),
                 )
             )
             messages.extend(
                 ProviderMessage(role=entry.role, content=entry.text)
-                for entry in safe_summary.transcript
+                for entry in _recent_provider_transcript(safe_summary.transcript)
             )
         self._sessions[session_id] = Session(
             id=session_id,

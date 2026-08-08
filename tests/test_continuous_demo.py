@@ -9,7 +9,7 @@ def test_demo_scenarios_use_actual_continuous_events_and_safe_side_effects() -> 
     assert rejected.name == "delete_requires_approval"
     assert rejected.status == "completed"
     assert rejected.workspace_value == "present"
-    assert rejected.event_kinds[:2] == ("approval_requested", "approval_resolved")
+    assert rejected.event_kinds[:3] == ("tool_item_completed", "approval_requested", "approval_resolved")
     assert "tool_item_completed" in rejected.event_kinds
 
     assert repaired.name == "feedback_repair"
@@ -58,3 +58,16 @@ def test_delete_approval_demo_replays_the_user_decision_through_the_real_agent()
     assert len(approval_events) == 1
     assert approval_events[0].kind == "approval_requested"
     assert accepted.workspace_value == "<deleted>"
+
+
+def test_delete_demo_reads_the_target_before_requesting_approval() -> None:
+    observed = []
+
+    run_scenario("delete_requires_approval", on_event=observed.append)
+
+    read_completed = next(
+        index for index, event in enumerate(observed)
+        if event.kind == "tool_item_completed" and event.data.get("tool") == "read_file"
+    )
+    approval_requested = next(index for index, event in enumerate(observed) if event.kind == "approval_requested")
+    assert read_completed < approval_requested

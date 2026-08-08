@@ -209,6 +209,31 @@ def test_delete_rejection_preserves_target_and_approval_acceptance_continues_sam
     assert json.loads(model.received_messages[-1][-1].content)["feedback"]["kind"] == "passed"
 
 
+def test_running_a_project_python_program_requires_exact_approval(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    marker = tmp_path / "executed.txt"
+    (tmp_path / "src" / "hello.py").write_text(
+        "from pathlib import Path\nPath('executed.txt').write_text('yes')\n"
+    )
+    agent, _ = _governed_agent(tmp_path, [
+        _tool_response(("run", "run_python", {"path": "src/hello.py"})),
+        [TextDelta("程序已运行。"), ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "运行 src/hello.py")
+
+    paused = list(agent.run_turn(session_id, turn_id))
+    approval_event = next(event for event in paused if event.kind == "approval_requested")
+    assert approval_event.data["path"] == "src/hello.py"
+    assert approval_event.data["argv"] == "[]"
+    approval_id = UUID(approval_event.data["approval_id"])
+    assert not marker.exists()
+
+    completed = list(agent.resolve_approval(session_id, turn_id, approval_id, True))
+    assert marker.read_text() == "yes"
+    assert completed[-1].kind == "turn_completed"
+
+
 def test_stale_or_forged_approval_id_cannot_execute_delete(tmp_path: Path) -> None:
     _prepare_project(tmp_path)
     target = tmp_path / "src" / "obsolete.py"

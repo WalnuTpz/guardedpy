@@ -38,7 +38,10 @@ from guardedpy.workspace import Workspace
 
 
 _MAX_SUMMARY_TEXT = 1200
-_SENSITIVE_ASSIGNMENT = re.compile(r"(?i)\b(api[_-]?key|authorization)\s*([=:])\s*\S+")
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?im)(?P<prefix>\b(?:api[_-]?key|authorization|token|password|secret)\b[\"']?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^\r\n]*"
+)
+_BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _API_KEY_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]+\b")
 
 
@@ -131,7 +134,9 @@ class ConversationRuntime:
         return max((summary for summary in conversations if summary.id != current.id), key=lambda summary: summary.updated_at)
 
     def queue(self, session_id: UUID, text: str, mode: TurnMode = "normal") -> tuple[UUID, SessionEvent]:
-        return self._agent.queue(session_id, text, mode)
+        turn_id, event = self._agent.queue(session_id, text, mode)
+        self._append_visible_message(session_id, "user", text)
+        return turn_id, event
 
     def interrupt(self, session_id: UUID, turn_id: UUID) -> SessionEvent | None:
         event = self._agent.interrupt(session_id, turn_id)
@@ -141,7 +146,8 @@ class ConversationRuntime:
 
     def _capture(self, session_id: UUID, turn_id: UUID, events: object):
         for event in events:  # type: ignore[union-attr]
-            facts = self._facts.setdefault((session_id, turn_id), {
+            event_turn_id = event.turn_id
+            facts = self._facts.setdefault((session_id, event_turn_id), {
                 "changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none",
             })
             if event.kind == "tool_item_completed":
@@ -159,7 +165,7 @@ class ConversationRuntime:
                 if text:
                     self._append_visible_message(session_id, "assistant", text)
             if event.kind in {"turn_completed", "turn_interrupted", "turn_failed"}:
-                self._record_terminal(session_id, turn_id, event)
+                self._record_terminal(session_id, event_turn_id, event)
             yield event
 
     def _record_terminal(self, session_id: UUID, turn_id: UUID, event: SessionEvent) -> None:
@@ -216,7 +222,8 @@ def _safe_summary_text(status: str, facts: dict[str, object]) -> str:
 
 def _redact_visible_text(text: str) -> str:
     """Keep visible history useful without persisting credential-shaped values."""
-    text = _SENSITIVE_ASSIGNMENT.sub(r"\1\2[已隐藏]", text)
+    text = _SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group('prefix')}[已隐藏]", text)
+    text = _BEARER_TOKEN.sub("Bearer [已隐藏]", text)
     return _API_KEY_TOKEN.sub("[已隐藏]", text)
 
 

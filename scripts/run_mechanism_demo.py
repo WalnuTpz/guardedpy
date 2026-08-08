@@ -12,7 +12,7 @@ results = run_all_scenarios()
 approval, repaired, stale = results
 assert approval.name == "delete_requires_approval"
 assert approval.workspace_value == "present"
-assert approval.event_kinds[:2] == ("approval_requested", "approval_resolved")
+assert approval.event_kinds[:3] == ("tool_item_completed", "approval_requested", "approval_resolved")
 assert repaired.name == "feedback_repair"
 assert repaired.workspace_value == "fixed"
 assert repaired.event_kinds.index("assertion_failure") < repaired.event_kinds.index("patch_applied")

@@ -77,10 +77,7 @@ class ToolExecutor:
             ):
                 return self._failure(call, "invalid_tool_call")
             result = self._workspace.run_python(path, tuple(argv))
-            execution = self._result(call, result)
-            if result.ok:
-                turn.needs_full_verification = False
-            return execution
+            return self._result(call, result)
         if call.name == "git_diff":
             return self._result(call, self._workspace.git_diff())
         if call.name == "git_status":

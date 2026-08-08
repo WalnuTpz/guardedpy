@@ -100,7 +100,7 @@ def test_executor_runs_a_project_python_file_without_a_prior_read(tmp_path: Path
 
     assert result.code == "ok"
     assert result.provider_result["output"] == "hello world\n"
-    assert turn.needs_full_verification is False
+    assert turn.needs_full_verification is True
 
 
 def test_executor_rejects_non_python_program_targets(tmp_path: Path) -> None:

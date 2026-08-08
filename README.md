@@ -61,7 +61,7 @@ The interactive command set is:
 /help：打开完整帮助
 ```
 
-直接输入自然语言即可开始同一连续会话；不再对首条输入做 feature/bugfix/闲聊分类。启动时会自动载入最近保存的会话，首次启动才新建空会话。`/plan <request>` 与 `/review [path]` 是只读回合；`/goal <目标>` 仅约束下一回合；`/queue` 显式排队下一回合，`/stop` 请求中断当前回合。工具失败、pytest failure 和无效 patch 都会回灌给同一回合，而不是自动取消。Agent 可在不经过 shell 的前提下运行项目内单个 Python 程序；网络、安装、任意命令和 Git 写入仍不可由它执行。transcript 是自动换行、仅纵向滚动的只读文本；鼠标可以选择它，`Ctrl+Shift+C` 可复制当前安全记录。`/conversations` 会重放所选历史的可见用户/Agent 对话，并以它们作为后续模型上下文；`/delete` 删除当前会话后回到上一条，最后一条不能删除。
+直接输入自然语言即可开始同一连续会话；不再对首条输入做 feature/bugfix/闲聊分类。启动时会自动载入最近保存的会话，首次启动才新建空会话。`/plan <request>` 与 `/review [path]` 是只读回合；`/goal <目标>` 仅约束下一回合；`/queue` 显式排队下一回合，`/stop` 请求中断当前回合。工具失败、pytest failure 和无效 patch 都会回灌给同一回合，而不是自动取消。Agent 可请求在不经过 shell 的前提下运行项目内单个 Python 程序，但执行须由用户逐次批准；网络、安装、任意命令和 Git 写入仍不可由它执行。transcript 是自动换行、仅纵向滚动的只读文本；鼠标可以选择它，`Ctrl+Shift+C` 可复制当前安全记录。`/conversations` 会重放所选历史的可见用户/Agent 对话，并只将有界的最近对话和安全事实恢复为后续模型上下文；`/delete` 删除当前会话后回到上一条，最后一条不能删除。
 
 ## Credentials, model, and effort
 
@@ -95,17 +95,19 @@ Interactive `guardedpy demo` reuses the normal project bar, transcript, composer
 
 This is mechanism evidence, not a substitute for using a real provider on a target project.
 
-## Manual provider acceptance (not yet claimed complete)
+## Manual provider acceptance
 
-After configuring a DeepSeek key in the interactive `/credentials` dialog, use a disposable Python + pytest project and verify the real provider in this order:
+The Task 22 core paths were manually accepted with a real DeepSeek provider in a disposable Python + pytest project: normal conversation, inspection without mutation, a failing-test repair followed by pytest, source-directory program creation and execution, exact delete approval, and recovered-conversation follow-up. The key was entered through `/credentials` and was not read, logged, or committed. A final review then tightened program execution to require exact approval; that approval path is reserved for the separate final-acceptance worktree.
+
+The following checks remain useful when reproducing that acceptance:
 
 1. Send a normal greeting and a project question; both should receive a natural response without starting a form or a fixed task workflow.
 2. Send a repair request such as “找出并修复所有测试错误”; the transcript should stream the user message, assistant text, safe read/test/change status, and a final response.
 3. Ask “刚才改了什么，测试结果怎样？” in the same session; the reply should use the preceding tool facts.
-4. Ask to delete a previously read project file; verify that the approval dialog names that file, then reject it and confirm the file remains.
-5. Start a longer request, use `/stop`, and verify that the turn becomes interrupted only after its terminal event. Restart `guardedpy`, use `/conversations`, and confirm that visible user/Agent dialogue returns and can ground a follow-up, while source, raw diffs, tool arguments and hidden reasoning do not return.
+4. Ask to run a project Python program and to delete a previously read project file; each approval dialog must name the exact path (the program dialog also shows arguments). Approve the program only if the displayed call is expected; reject the delete and confirm the file remains.
+5. Start a longer request, use `/stop`, and verify that the turn becomes interrupted only after its terminal event. Restart `guardedpy`, use `/conversations`, and confirm that visible user/Agent dialogue returns and can ground a follow-up, while source, raw diffs, tool arguments and hidden reasoning do not return. This stop-path check is reserved for the separate post-Task-22 final-acceptance worktree.
 
-Do not paste API keys into chat, project files, command arguments, environment variables, or screenshots. Record this manual result only after performing it; it is intentionally not claimed by this repository yet.
+Do not paste API keys into chat, project files, command arguments, environment variables, or screenshots.
 
 ## Test, build, and local release artifact
 
