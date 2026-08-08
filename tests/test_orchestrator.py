@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path, PurePosixPath
+from threading import Event, Thread
 from uuid import uuid4
 
 import pytest
@@ -640,6 +641,60 @@ def test_once_approval_is_consumed_without_creating_a_persistent_rule(
     assert replayed is False
     assert task.status is TaskStatus.RUNNING
     assert CommandRuleStore(tmp_path).list_rules() == []
+
+
+def test_cancel_reaches_a_blocking_approved_command_before_the_command_is_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches approval dispatch holding the orchestrator state lock through a command."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    entered_command = Event()
+    release_command = Event()
+    task = _bugfix_task(tmp_path)
+    action = _action(
+        kind="run_command",
+        summary="install approved package once",
+        args=["python", "-m", "pip", "install", "ruff"],
+    )
+    orchestrator = TaskOrchestrator(tmp_path, ScriptedLLM([action]))
+
+    def blocked_command(_self: TaskOrchestrator, _action: RunCommandAction) -> ToolResult:
+        entered_command.set()
+        release_command.wait()
+        return ToolResult(True, "simulated command", {})
+
+    monkeypatch.setattr(TaskOrchestrator, "_run_command", blocked_command)
+    waiting = orchestrator.run(task)
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    action_hash = EventStore(tmp_path).events_for(task.id)[-1].action_hash
+    approval_done = Event()
+    cancel_done = Event()
+
+    def approve() -> None:
+        orchestrator.resolve_approval(task.id, action_hash or "", decision="once")
+        approval_done.set()
+
+    def cancel() -> None:
+        orchestrator.cancel(task.id)
+        cancel_done.set()
+
+    approval_thread = Thread(target=approve)
+    cancel_thread = Thread(target=cancel)
+    try:
+        approval_thread.start()
+        assert entered_command.wait(timeout=1)
+        cancel_thread.start()
+
+        assert cancel_done.wait(timeout=0.2)
+        assert task.status is TaskStatus.CANCELLED
+    finally:
+        release_command.set()
+        approval_thread.join(timeout=1)
+        cancel_thread.join(timeout=1)
+
+    assert approval_done.is_set()
+    assert approval_thread.is_alive() is False
+    assert cancel_thread.is_alive() is False
 
 
 @pytest.mark.parametrize("approval_decision", ("once", "always"))

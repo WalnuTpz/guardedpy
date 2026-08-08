@@ -1,382 +1,90 @@
-"""Offline contracts for the local GuardedPy terminal client."""
+"""Public contracts for GuardedPy's sole terminal entry point."""
 
 from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
-from uuid import UUID
 
-import pytest
-
-from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskIntent, TaskState, TaskStatus
-from guardedpy.events import StopReason, StoredRunEvent
+from guardedpy.domain import TaskIntent, TaskState, TaskStatus
 
 
-def _config() -> HarnessConfig:
-    return safe_config(Path.cwd())
-
-
-class FakeRuntime:
-    """A local-only runtime fake that exposes terminal boundary behavior."""
-
-    def __init__(
-        self,
-        *,
-        wait_for_approval: bool = False,
-        interrupt: bool = False,
-        consume_reject: bool = False,
-    ) -> None:
-        self.configured = False
-        self.project_root: Path | None = None
+class _Runtime:
+    def __init__(self) -> None:
         self.config: HarnessConfig | None = None
+        self.project_root: Path | None = None
         self.created: list[TaskState] = []
-        self.decisions: list[tuple[UUID, str, str]] = []
-        self.cancelled: list[UUID] = []
-        self.setups: list[ProjectProfile] = []
-        self._wait_for_approval = wait_for_approval
-        self._interrupt = interrupt
-        self._consume_reject = consume_reject
+        self.setup_profiles: list[ProjectProfile] = []
 
     def setup(self, profile: ProjectProfile, api_key: str | None) -> None:
         assert api_key is None
         self.project_root = profile.root
         self.config = HarnessConfig(profile=profile)
-        self.setups.append(profile)
+        self.setup_profiles.append(profile)
 
-    def credential_status(self) -> CredentialStatus:
-        return CredentialStatus(configured=self.configured)
-
-    def create_task(
-        self, description: str, intent: TaskIntent = TaskIntent.CODING
-    ) -> TaskState:
-        task = TaskState(
-            description=description,
-            intent=intent,
-            config=self.config or _config(),
-        )
+    def create_task(self, description: str, intent: TaskIntent, review_path: str | None = None) -> TaskState:
+        task = TaskState(description=description, intent=intent, config=self.config, review_path=review_path)
         self.created.append(task)
         return task
 
-    def run(self, task_id: UUID) -> TaskState:
-        task = self.task(task_id)
-        if self._interrupt:
-            raise KeyboardInterrupt
-        if self._wait_for_approval and not self.decisions:
-            task.status = TaskStatus.WAITING_APPROVAL
-        else:
-            task.status = TaskStatus.COMPLETED
+    def run(self, task_id: object) -> TaskState:
+        task = next(task for task in self.created if task.id == task_id)
+        task.status = TaskStatus.COMPLETED
         return task
 
-    def resolve_approval(self, task_id: UUID, action_hash: str, decision: str) -> bool:
-        self.decisions.append((task_id, action_hash, decision))
-        if self._consume_reject and decision == "reject":
-            self.task(task_id).status = TaskStatus.BLOCKED
-            return False
-        return True
-
-    def cancel(self, task_id: UUID) -> TaskState:
-        task = self.task(task_id)
-        task.status = TaskStatus.CANCELLED
-        self.cancelled.append(task_id)
-        return task
-
-    def task(self, task_id: UUID) -> TaskState:
-        return next(task for task in self.created if task.id == task_id)
-
-    def tasks(self) -> list[TaskState]:
-        return self.created
-
-    def events(self, task_id: UUID) -> list[StoredRunEvent]:
-        return [
-            StoredRunEvent(
-                task_id=task_id,
-                task_status=self.task(task_id).status,
-                action_hash="bound-approval-hash",
-                action_projection="删除项目内文件",
-                policy_verdict=PolicyVerdict.APPROVAL_REQUIRED,
-                feedback_kind=FeedbackKind.ASSERTION_FAILURE,
-                feedback_node_id="tests/test_value.py::test_value",
-                stop_reason=StopReason.COMPLETED,
-            )
-        ]
-
-    def memory_proposals(self) -> list[object]:
+    def events(self, task_id: object) -> list[object]:
+        del task_id
         return []
 
-    def memories(self) -> list[object]:
-        return []
-
-    def command_rules(self) -> list[object]:
-        return []
-
-    def update_credential(self, api_key: str) -> None:
-        self.configured = bool(api_key)
-
-    def clear_credential(self) -> None:
-        self.configured = False
+    def credential_status(self) -> CredentialStatus:
+        return CredentialStatus(configured=False)
 
 
-def test_repl_refuses_credential_update_secret_entry_from_non_tty_without_getpass(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Catches a piped credential update reading a secret through getpass fallback."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-    monkeypatch.setattr(
-        "guardedpy.cli.getpass", lambda _: pytest.fail("non-TTY update must not call getpass")
-    )
-
-    code = run_repl(runtime, StringIO("/credentials\nupdate\n/exit\n"), output, lambda: False)
-
-    assert code == 0
-    assert runtime.configured is False
-    assert output.getvalue().endswith("非交互终端不能录入凭据。\n")
-
-
-def test_one_shot_rejects_the_removed_manual_bugfix_mode() -> None:
-    """Catches the obsolete user-selected coding mode reappearing in the CLI."""
-    from guardedpy.cli import main
-
-    assert main(["--prompt", "repair", "--mode", "bugfix"], runtime_factory=FakeRuntime) == 2
-
-
-def test_main_discovers_and_binds_the_current_project_before_creating_a_task(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Catches the real CLI task path using absent or stale persisted project state."""
-    from guardedpy.cli import main
-
+def _project(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("VALUE = 1\n")
     (tmp_path / "tests").mkdir()
-    runtime = FakeRuntime()
-    monkeypatch.chdir(tmp_path)
 
-    code = main(["--prompt", "inspect"], runtime_factory=lambda: runtime)
+
+def test_help_exposes_only_the_cli_only_surface(capsys: object) -> None:
+    """Catches a help path reintroducing manual init, server, or shell modes."""
+    from guardedpy.cli import main
+
+    assert main(["--help"]) == 0
+    rendered = capsys.readouterr().out.lower()  # type: ignore[attr-defined]
+    assert "task" in rendered
+    assert "demo" in rendered
+    for retired in ("serve", "server", "webui", "api", "/init", "--prompt"):
+        assert retired not in rendered
+
+
+def test_direct_task_discovers_cwd_and_uses_safe_non_tty_lifecycle(tmp_path: Path, monkeypatch: object) -> None:
+    """Catches direct CLI work using stale project setup or a separate task runner."""
+    from guardedpy.cli import main
+
+    _project(tmp_path)
+    monkeypatch.chdir(tmp_path)  # type: ignore[attr-defined]
+    runtime = _Runtime()
+    output = StringIO()
+
+    code = main(["inspect project"], runtime_factory=lambda: runtime, stdin=StringIO(), stdout=output)
 
     assert code == 0
-    assert [profile.root for profile in runtime.setups] == [tmp_path.resolve()]
-    assert runtime.created[0].config.profile == runtime.setups[0]
+    assert runtime.setup_profiles[0].root == tmp_path.resolve()
+    assert runtime.created[0].description == "inspect project"
+    assert "completed" in output.getvalue()
 
 
-def test_main_fails_safely_without_composing_a_runtime_for_unsupported_cwd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Catches discovery failure falling through to a stale project or creating state."""
+def test_demo_non_tty_is_offline_and_never_composes_project_runtime(monkeypatch: object) -> None:
+    """Catches demo acquiring a provider, keyring, or caller-project runtime."""
     from guardedpy.cli import main
 
     output = StringIO()
-    composed: list[FakeRuntime] = []
-    monkeypatch.chdir(tmp_path)
-
-    code = main(
-        ["--prompt", "inspect"],
-        runtime_factory=lambda: composed.append(FakeRuntime()) or composed[-1],
-        stdout=output,
-    )
-
-    assert code == 1
-    assert composed == []
-    assert output.getvalue() == "无法识别 Python pytest 项目。\n"
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_one_shot_rejects_the_removed_manual_bugfix_target_before_composition() -> None:
-    """Catches the obsolete user-selected repair target reaching runtime composition."""
-    from guardedpy.cli import main
-
-    composed: list[FakeRuntime] = []
-
-    def runtime_factory() -> FakeRuntime:
-        runtime = FakeRuntime()
-        composed.append(runtime)
-        return runtime
-
-    assert (
-        main(
-            ["--prompt", "repair", "--mode", "bugfix", "--target", "   "],
-            runtime_factory=runtime_factory,
-        )
-        == 2
-    )
-    assert composed == []
-
-
-@pytest.mark.parametrize("decision", ("reject", "once", "always"))
-def test_one_shot_consumes_injected_approval_input_until_the_task_finishes(
-    decision: str,
-) -> None:
-    """Catches a waiting one-shot ignoring stdin and repeatedly reading an empty approval."""
-    from guardedpy.cli import main
-
-    class ApprovalOutput(StringIO):
-        def write(self, text: str) -> int:
-            if text == "审批输入无效。\n":
-                raise AssertionError("one-shot ignored its supplied approval input")
-            return super().write(text)
-
-    runtime = FakeRuntime(wait_for_approval=True)
-    output = ApprovalOutput()
-
-    code = main(
-        ["--prompt", "dangerous task"],
-        runtime_factory=lambda: runtime,
-        stdin=StringIO(f"{decision}\n"),
-        stdout=output,
-    )
-
-    assert code == 0
-    assert runtime.decisions == [(runtime.created[0].id, "bound-approval-hash", decision)]
-    assert runtime.created[0].status is TaskStatus.COMPLETED
-
-
-def test_repl_runs_ordinary_feature_text_and_renders_only_safe_progress() -> None:
-    """Catches a terminal task omitting its safe lifecycle projection or leaking raw details."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-
-    code = run_repl(runtime, StringIO("implement safely\n/exit\n"), output, lambda: False)
-
-    rendered = output.getvalue()
-    assert code == 0
-    assert runtime.created[0].description == "implement safely"
-    assert runtime.created[0].intent is TaskIntent.CODING
-    assert str(runtime.created[0].id) in rendered
-    assert "completed" in rendered
-    assert "删除项目内文件" in rendered
-    assert "approval_required" in rendered
-    assert "assertion_failure" in rendered
-    assert "tests/test_value.py::test_value" in rendered
-    assert "completed" in rendered
-    assert "bound-approval-hash" not in rendered
-    assert "\x1b[" not in rendered
-
-
-def test_repl_resolves_only_an_exact_approval_decision_before_continuing() -> None:
-    """Catches accepting an unrecognized approval value or losing the pending task state."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime(wait_for_approval=True)
-    output = StringIO()
-
-    code = run_repl(runtime, StringIO("dangerous task\nyes\nonce\n/exit\n"), output, lambda: False)
-
-    assert code == 0
-    assert runtime.decisions == [(runtime.created[0].id, "bound-approval-hash", "once")]
-    assert "审批输入无效。" in output.getvalue()
-    assert runtime.created[0].status is TaskStatus.COMPLETED
-
-
-def test_repl_renders_a_consumed_reject_approval_as_blocked_not_stale() -> None:
-    """Catches the terminal reporting a valid rejected approval as stale."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime(wait_for_approval=True, consume_reject=True)
-    output = StringIO()
-
-    code = run_repl(runtime, StringIO("dangerous task\nreject\n/exit\n"), output, lambda: False)
-
-    assert code == 0
-    assert runtime.created[0].status is TaskStatus.BLOCKED
-    assert "blocked" in output.getvalue()
-    assert "审批请求已失效。" not in output.getvalue()
-
-
-def test_repl_rejects_unknown_slash_commands_without_creating_a_task() -> None:
-    """Catches unsupported slash commands acquiring a runtime mutation path."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-
-    code = run_repl(runtime, StringIO("/shell rm -rf .\n/exit\n"), output, lambda: False)
-
-    assert code == 0
-    assert runtime.created == []
-    assert output.getvalue() == "未知命令。\n"
-
-
-def test_repl_cancels_the_active_task_after_ctrl_c() -> None:
-    """Catches Ctrl-C exiting while a live task remains active in LocalRuntime."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime(interrupt=True)
-    output = StringIO()
-
-    code = run_repl(runtime, StringIO("long task\n"), output, lambda: False)
-
-    assert code == 0
-    assert runtime.cancelled == [runtime.created[0].id]
-    assert "cancelled" in output.getvalue()
-
-
-def test_repl_cancels_the_waiting_task_when_ctrl_c_interrupts_the_approval_prompt() -> None:
-    """Catches Ctrl-C at an approval prompt leaving its active runtime task alive."""
-    from guardedpy.cli import run_repl
-
-    class InterruptAtApproval:
-        def __init__(self) -> None:
-            self._lines = iter(("dangerous task\n", KeyboardInterrupt(), "/exit\n"))
-
-        def readline(self) -> str:
-            value = next(self._lines)
-            if isinstance(value, KeyboardInterrupt):
-                raise value
-            return value
-
-    runtime = FakeRuntime(wait_for_approval=True)
-    output = StringIO()
-
-    code = run_repl(runtime, InterruptAtApproval(), output, lambda: False)
-
-    assert code == 0
-    assert runtime.cancelled == [runtime.created[0].id]
-    assert "cancelled" in output.getvalue()
-
-
-def test_task_command_creates_one_automatic_coding_task_without_mode_prompt() -> None:
-    """Catches `/task` restoring the retired manual feature/bugfix selection."""
-    from guardedpy.cli import run_repl
-
-    runtime = FakeRuntime()
-    output = StringIO()
-
-    code = run_repl(runtime, StringIO("/task\nrepair automatically\n/exit\n"), output, lambda: False)
-
-    assert code == 0
-    assert len(runtime.created) == 1
-    assert runtime.created[0].description == "repair automatically"
-    assert runtime.created[0].intent is TaskIntent.CODING
-    assert "feature/bugfix" not in output.getvalue()
-
-
-def test_repl_help_omits_retired_manual_init() -> None:
-    """Catches interactive help retaining the retired manual setup workflow."""
-    from guardedpy.cli import run_repl
-
-    output = StringIO()
-
-    assert run_repl(FakeRuntime(), StringIO("/help\n/exit\n"), output, lambda: False) == 0
-    assert "/init" not in output.getvalue()
-    assert "/task" in output.getvalue()
-
-
-def test_help_exposes_only_terminal_options_and_no_retired_surface(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Catches the sole CLI advertising a server, Web/API surface, or setup command."""
-    from guardedpy.cli import main
-
-    assert main(["--help"], runtime_factory=lambda: pytest.fail("help composed runtime")) == 0
-
-    help_text = capsys.readouterr().out.lower()
-    for retired in ("serve", "server", "webui", "api", "/init"):
-        assert retired not in help_text
+    assert main(["demo"], runtime_factory=lambda: (_ for _ in ()).throw(AssertionError()), stdin=StringIO(), stdout=output) == 0
+    assert output.getvalue().splitlines() == [
+        "dangerous_action_denied status=blocked",
+        "failure_feedback_corrects status=completed",
+        "tdd_source_patch_denied status=blocked",
+    ]

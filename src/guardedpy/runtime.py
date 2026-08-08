@@ -124,6 +124,7 @@ class LocalRuntime:
         self._tasks: dict[UUID, TaskState] = {}
         self._orchestrators: dict[UUID, OrchestratorPort] = {}
         self._task_roots: dict[UUID, Path] = {}
+        self._running_task_ids: set[UUID] = set()
         self._restore_local_state()
 
     @property
@@ -278,39 +279,56 @@ class LocalRuntime:
     def run(self, task_id: UUID) -> TaskState:
         """Advance one locally-owned task, releasing its lease when it becomes terminal."""
         with self._lifecycle_lock:
-            return self._run(task_id)
+            if task_id in self._running_task_ids:
+                raise RuntimeBusyError()
+            task, orchestrator = self._owned_task(task_id)
+            if not self._acquire_lease():
+                raise RuntimeBusyError()
+            self._running_task_ids.add(task_id)
+        return self._run(task_id, task, orchestrator)
 
-    def _run(self, task_id: UUID) -> TaskState:
-        task, orchestrator = self._owned_task(task_id)
-        if not self._acquire_lease():
-            raise RuntimeBusyError()
+    def _run(
+        self, task_id: UUID, task: TaskState, orchestrator: OrchestratorPort
+    ) -> TaskState:
         result = task
         try:
             result = orchestrator.run(task)
-            self._tasks[task_id] = result
-            return result
         finally:
-            if result.status in _TERMINAL_STATUSES:
-                self._release_lease()
+            with self._lifecycle_lock:
+                self._running_task_ids.discard(task_id)
+                current = self._tasks.get(task_id)
+                if current is not None and current.status in _TERMINAL_STATUSES:
+                    result = current
+                else:
+                    self._tasks[task_id] = result
+                if result.status in _TERMINAL_STATUSES:
+                    self._release_lease()
+        return result
 
     def resolve_approval(
         self, task_id: UUID, action_hash: str, decision: ApprovalDecision
     ) -> bool:
         """Resolve one exact pending approval through the owning orchestrator."""
         with self._lifecycle_lock:
-            return self._resolve_approval(task_id, action_hash, decision)
+            task, orchestrator = self._owned_task(task_id)
+            if not self._acquire_lease():
+                raise RuntimeBusyError()
+        return self._resolve_approval(task_id, task, orchestrator, action_hash, decision)
 
     def _resolve_approval(
-        self, task_id: UUID, action_hash: str, decision: ApprovalDecision
+        self,
+        task_id: UUID,
+        task: TaskState,
+        orchestrator: OrchestratorPort,
+        action_hash: str,
+        decision: ApprovalDecision,
     ) -> bool:
-        task, orchestrator = self._owned_task(task_id)
-        if not self._acquire_lease():
-            raise RuntimeBusyError()
         try:
             return orchestrator.resolve_approval(task_id, action_hash, decision=decision)
         finally:
-            if task.status in _TERMINAL_STATUSES:
-                self._release_lease()
+            with self._lifecycle_lock:
+                if task.status in _TERMINAL_STATUSES:
+                    self._release_lease()
 
     def cancel(self, task_id: UUID) -> TaskState:
         """Cancel one locally-owned task and release its terminal execution lease."""
