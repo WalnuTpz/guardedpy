@@ -1,53 +1,47 @@
-"""Safe project-scoped conversation index contracts."""
+"""Safe project-scoped session-summary storage contracts."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
 from uuid import uuid4
 
-import pytest
+from guardedpy.config import app_state_dir
+from guardedpy.conversation import ConversationSummary
+from guardedpy.conversations import ConversationStore
 
 
-def test_conversation_store_survives_restart_and_isolates_project_roots(
+def test_store_keeps_safe_session_summaries_without_retired_task_timeline_api(
     tmp_path: Path, monkeypatch: object
 ) -> None:
-    """Catches conversation references leaking between projects or storing mutable transcript text."""
-    from guardedpy.conversations import ConversationStore
-
+    """The store persists safe summaries, not the retired TaskState timeline."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
-    first_root = tmp_path / "first"
-    other_root = tmp_path / "other"
-    first_root.mkdir()
-    other_root.mkdir()
-    task_id = uuid4()
+    now = datetime.now(timezone.utc)
+    summary = ConversationSummary(
+        id=uuid4(), project_title="calculator", created_at=now, updated_at=now, turns=()
+    )
 
-    store = ConversationStore(first_root)
-    conversation = store.create()
-    store.attach_task(conversation.id, task_id)
+    project = tmp_path / "project"
+    legacy_database = app_state_dir(project) / "conversations.sqlite3"
+    legacy_database.parent.mkdir(parents=True)
+    with sqlite3.connect(legacy_database) as connection:
+        connection.execute("CREATE TABLE conversations (id TEXT PRIMARY KEY)")
+        connection.execute("CREATE TABLE conversation_tasks (id TEXT PRIMARY KEY)")
 
-    recovered = ConversationStore(first_root)
-    summaries = recovered.list()
-    assert len(summaries) == 1
-    assert summaries[0].id == conversation.id
-    assert summaries[0].task_ids == (task_id,)
-    assert recovered.tasks(conversation.id) == (task_id,)
-    assert ConversationStore(other_root).list() == ()
-    assert set(summaries[0].model_dump()) == {"id", "created_at", "updated_at", "task_ids"}
+    store = ConversationStore(project)
+    store.save_summary(summary)
 
-
-def test_conversation_store_rejects_unknown_conversation_without_orphan_reference(
-    tmp_path: Path, monkeypatch: object
-) -> None:
-    """Catches a failed attach leaving a task reference with no conversation owner."""
-    from guardedpy.conversations import ConversationStore
-
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
-    store = ConversationStore(tmp_path / "project")
-    unknown_id = uuid4()
-    task_id = uuid4()
-
-    with pytest.raises(ValueError, match="conversation does not exist"):
-        store.attach_task(unknown_id, task_id)
-
-    assert store.list() == ()
-    assert store.tasks(unknown_id) == ()
+    recovered = ConversationStore(tmp_path / "project")
+    assert recovered.load_summary(summary.id) == summary
+    assert recovered.summaries() == (summary,)
+    for retired_api in ("create", "attach_task", "list", "tasks"):
+        assert not hasattr(recovered, retired_api)
+    with sqlite3.connect(recovered.database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert {"conversation_summaries", "conversations", "conversation_tasks"} <= tables

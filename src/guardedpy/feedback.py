@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 import re
-
-from guardedpy.domain import FeedbackKind
-
 
 _MAX_EXCERPT_CHARS = 800
 # Pytest output is untrusted; keep repair state and model context bounded.
@@ -22,6 +20,15 @@ _USEFUL_OUTPUT = re.compile(
 )
 _ASSERTION_EVIDENCE = re.compile(r"^E\s+(?:AssertionError\b|assert\b)", re.MULTILINE)
 _ASSERTION_SUMMARY = re.compile(r"(?:AssertionError\b|\bassert(?:ion failed)?\b)", re.IGNORECASE)
+_ZERO_COLLECTED = re.compile(r"(?:collected 0 items|no tests ran)", re.IGNORECASE)
+
+
+class FeedbackKind(StrEnum):
+    PASSED = "passed"
+    ASSERTION_FAILURE = "assertion_failure"
+    COLLECTION_ERROR = "collection_error"
+    EXECUTION_ERROR = "execution_error"
+    TIMEOUT = "timeout"
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,15 @@ class PytestFeedback:
     excerpt: str
 
 
+@dataclass(frozen=True)
+class FeedbackProjection:
+    """Bounded pytest facts included in a provider tool result."""
+
+    kind: str
+    node_ids: tuple[str, ...]
+    excerpt: str
+
+
 class FeedbackCollector:
     """Classify pytest output without returning the full, untrusted report."""
 
@@ -50,10 +66,14 @@ class FeedbackCollector:
         output = "\n".join(part for part in (run.stdout, run.stderr) if part)
         if run.timed_out:
             return PytestFeedback(FeedbackKind.TIMEOUT, (), self._excerpt(output))
-        if run.exit_code == 0:
+        if run.exit_code == 0 and not _ZERO_COLLECTED.search(output):
             return PytestFeedback(FeedbackKind.PASSED, (), "")
+        if run.exit_code == 0:
+            return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), self._excerpt(output))
 
         collection_nodes = self._node_ids(_COLLECTION_NODE, output)
+        if run.exit_code == 2:
+            return PytestFeedback(FeedbackKind.COLLECTION_ERROR, collection_nodes, self._excerpt(output))
         if collection_nodes:
             return PytestFeedback(
                 FeedbackKind.COLLECTION_ERROR, collection_nodes, self._excerpt(output)

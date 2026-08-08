@@ -2,32 +2,83 @@
 
 from __future__ import annotations
 
-from io import StringIO
-from threading import Thread
+import json
+from dataclasses import dataclass, field
+import re
+from threading import Event as ThreadEvent, Thread
+from time import sleep
 from typing import Any, Literal
 from uuid import UUID
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.timer import Timer
-from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
+from textual.widgets import Button, Input, ListItem, ListView, Static, TextArea
 
-from guardedpy.domain import TaskIntent, TaskState, TaskStatus
-from guardedpy.conversations import ConversationStore
+from guardedpy.conversation import SessionEvent, TurnNotActiveError, safe_event_message
 from guardedpy.credentials import CredentialBackendUnavailableError
-from guardedpy.mechanism_demo import ScenarioName, run_scenario
-from guardedpy.terminal import COMMANDS, render_help, run_plain_session, task_message_flow
+from guardedpy.mechanism_demo import ScenarioName, ScenarioResult, run_scenario, scenario_request
+
+
+COMMANDS = (
+    "/conversations", "/new", "/delete", "/exit", "/plan", "/review",
+    "/tests", "/diff", "/permissions", "/credentials", "/model", "/effort",
+    "/doctor", "/goal", "/help", "/stop", "/queue",
+)
+
+_HELP_LINES = (
+    "GuardedPy 使用指南",
+    "直接输入：与 Agent 对话，或描述要检查、修复、实现的项目任务。",
+    "/new：新建会话。",
+    "/conversations：选择并恢复历史对话。",
+    "/delete：删除当前对话并回到上一条；最后一条不能删除。",
+    "/exit：退出 GuardedPy。",
+    "/plan <任务>：只读制定计划；提交后自动回到普通模式。",
+    "/review <路径>：只读审查；提交后自动回到普通模式。",
+    "/goal <目标>：只约束下一回合；/goal clear 取消。",
+    "/stop：中断当前回合并取消排队任务。",
+    "/queue <任务>：把下一项工作排到当前回合之后。",
+    "/tests：运行配置的 pytest。",
+    "/diff：查看当前 Git diff。",
+    "/doctor：查看本地项目状态。",
+    "/permissions：查看可自动执行与需审批的操作。",
+    "/credentials：安全录入、更新或清除 API Key。",
+    "/model：选择后续回合模型。",
+    "/effort：选择后续回合思考强度。",
+    "/help：打开本帮助面板。",
+    "输入：Enter 提交；Shift+Enter 或 Ctrl+J 换行；输入 / 或点击 ＋ 打开命令选择；选择命令后再按 Enter 执行；Ctrl+Shift+C 复制安全对话记录。",
+    "安全：读取、补丁、pytest 和只读 Git 在项目边界内自动执行；删除始终逐次请求批准；非交互终端会安全停止，不会代替你批准。",
+)
 
 
 _NO_ARGUMENT_COMMANDS = frozenset(
     {
-        "/new", "/clear", "/history", "/conversations", "/exit", "/tests", "/diff",
-        "/credentials", "/doctor", "/help", "/model", "/effort",
+        "/new", "/delete", "/conversations", "/exit", "/credentials",
+        "/help", "/model", "/effort", "/stop", "/tests", "/diff", "/permissions",
+        "/doctor",
     }
 )
+
+
+def approval_projection(data: dict[str, str]) -> str:
+    """Render the exact, schema-validated action that needs a human decision."""
+    tool = data.get("tool")
+    path = data.get("path")
+    if tool == "delete_path" and path:
+        return f"删除 {path}"
+    if tool == "run_python" and path:
+        try:
+            argv = json.loads(data.get("argv", "[]"))
+        except json.JSONDecodeError:
+            argv = []
+        if isinstance(argv, list) and all(isinstance(argument, str) for argument in argv):
+            return f"运行 {path}（参数：{json.dumps(argv, ensure_ascii=False)}）"
+        return f"运行 {path}"
+    return tool or "受控项目操作"
 
 
 class ComposerSubmitted(Message):
@@ -38,12 +89,128 @@ class ComposerSubmitted(Message):
         super().__init__()
 
 
-class TranscriptLog(Log):
-    """Selectable log that preserves one fixed safe UI projection per line."""
+@dataclass(frozen=True)
+class TranscriptUpdate:
+    """One safe, renderer-agnostic transcript change."""
+
+    item_id: UUID | None
+    text: str
+    replace: bool = False
+
+
+@dataclass
+class TranscriptPresenter:
+    """Project continuous-session events to text safe for a transcript."""
+
+    _assistant_text: dict[UUID, str] = field(default_factory=dict)
+    _read_batch_item_id: UUID | None = None
+    _read_paths: list[str] = field(default_factory=list)
+
+    def present(self, event: SessionEvent) -> TranscriptUpdate | None:
+        """Return the visible update for one event without exposing tool payloads."""
+        if event.kind == "user_message":
+            self._finish_read_batch()
+            return TranscriptUpdate(event.item_id, f"› {event.text}")
+        if event.kind == "assistant_text_delta":
+            self._finish_read_batch()
+            if event.item_id is None:
+                return None
+            text = self._assistant_text.get(event.item_id, "") + event.text
+            self._assistant_text[event.item_id] = text
+            return TranscriptUpdate(event.item_id, text, replace=True)
+        if event.kind == "assistant_item_completed":
+            self._finish_read_batch()
+            if event.item_id is None:
+                return None
+            text = self._assistant_text.get(event.item_id)
+            return None if text is None else TranscriptUpdate(
+                event.item_id, _display_assistant_text(text), replace=True
+            )
+        if event.data.get("tool") == "read_file":
+            return self._present_read(event)
+        self._finish_read_batch()
+        status = safe_event_message(event)
+        if status is None:
+            return None
+        return TranscriptUpdate(event.item_id, status)
+
+    def _present_read(self, event: SessionEvent) -> TranscriptUpdate | None:
+        if event.kind == "tool_item_started":
+            if self._read_batch_item_id is None:
+                self._read_batch_item_id = event.item_id
+                return TranscriptUpdate(event.item_id, "正在查看项目文件…")
+            return None
+        if event.kind != "tool_item_completed" or event.data.get("code") != "ok":
+            self._finish_read_batch()
+            status = safe_event_message(event)
+            return None if status is None else TranscriptUpdate(event.item_id, status)
+        path = event.data.get("path")
+        if isinstance(path, str) and path not in self._read_paths:
+            self._read_paths.append(path)
+        batch_id = self._read_batch_item_id or event.item_id
+        count = len(self._read_paths)
+        preview = "、".join(self._read_paths[:3])
+        if count > 3:
+            preview += " 等"
+        return TranscriptUpdate(batch_id, f"已查看 {count} 个文件：{preview}。", replace=True)
+
+    def _finish_read_batch(self) -> None:
+        self._read_batch_item_id = None
+        self._read_paths.clear()
+
+
+def _display_assistant_text(text: str) -> str:
+    """Keep completed assistant prose compact without rendering provider Markdown."""
+    text = text.replace("\r\n", "\n")
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+class TranscriptLog(TextArea):
+    """Read-only, soft-wrapping transcript with native mouse selection."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(
+            "", *args, **kwargs, language=None, soft_wrap=True, read_only=True,
+            show_cursor=False, show_line_numbers=False, highlight_cursor_line=False,
+        )
+        self._continuous_entries: list[tuple[UUID | None, str]] = []
+
+    @property
+    def text_entries(self) -> tuple[str, ...]:
+        """Safe source text used by the transcript copy shortcut and UI tests."""
+        return tuple(text for _item_id, text in self._continuous_entries)
 
     def write(self, data: str, scroll_end: bool | None = None) -> "TranscriptLog":
-        super().write(f"{data}\n", scroll_end=scroll_end)
+        self._continuous_entries.append((None, str(data).rstrip("\n")))
+        self._render_entries()
         return self
+
+    def apply_update(self, update: TranscriptUpdate) -> None:
+        """Replace streamed text in place while preserving event order."""
+        if update.replace:
+            for index, (item_id, _text) in enumerate(self._continuous_entries):
+                if item_id == update.item_id:
+                    self._continuous_entries[index] = (item_id, update.text)
+                    break
+            else:
+                self._continuous_entries.append((update.item_id, update.text))
+        else:
+            if update.text.startswith("› ") and self._continuous_entries and self._continuous_entries[-1][1]:
+                self._continuous_entries.append((None, ""))
+            self._continuous_entries.append((update.item_id, update.text))
+        self._render_entries()
+
+    def _render_entries(self) -> None:
+        self.load_text("\n".join(text for _item_id, text in self._continuous_entries))
+        self.scroll_end(animate=False)
+
+    def reset_continuous(self) -> None:
+        """Discard the current session's rendered event projection."""
+        self._continuous_entries.clear()
+        self.load_text("")
 
 
 class Composer(TextArea):
@@ -71,21 +238,37 @@ class Composer(TextArea):
             event.stop()
 
 
+class DemoRequest(Static):
+    """An intentionally non-editable request that owns demo shortcuts."""
+
+    can_focus = True
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key in {"up", "down", "j", "k", "enter", "escape"}:
+            event.prevent_default()
+            event.stop()
+            self.app._demo_key(event.key)
+
+
 class SettingsScreen(ModalScreen[str | None]):
     """Choose a validated future-task setting with keyboard or mouse."""
 
     def __init__(
-        self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
+        self,
+        field: Literal["model", "reasoning_effort"],
+        values: tuple[str, ...],
+        current: str,
     ) -> None:
         super().__init__()
         self._field = field
         self._values = values
+        self._current = current
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static("选择模型" if self._field == "model" else "选择推理强度"),
+            Static("选择模型" if self._field.endswith("model") else "选择推理强度"),
             ListView(
-                *(ListItem(Static(value), id=f"setting-{value}") for value in self._values),
+                *(ListItem(Static(value), id=f"setting-{value.lower().replace(' ', '-')}") for value in self._values),
                 id="settings-picker",
             ),
             id="settings-modal",
@@ -93,46 +276,22 @@ class SettingsScreen(ModalScreen[str | None]):
 
     def on_mount(self) -> None:
         picker = self.query_one("#settings-picker", ListView)
-        picker.index = 0
+        picker.index = self._values.index(self._current)
         picker.focus()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(str(event.item.query_one(Static).render()))
 
 
-class ModePickerScreen(ModalScreen[Literal["plan", "review", "goal"] | None]):
-    """Select the next in-composer task mode without attachment semantics."""
-
-    _options = (("plan", "计划"), ("review", "审查"), ("goal", "目标"))
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            ListView(
-                *(ListItem(Static(label), id=f"mode-{mode}") for mode, label in self._options),
-                id="mode-picker-list",
-            ),
-            id="mode-picker-modal",
-        )
-
-    def on_mount(self) -> None:
-        picker = self.query_one("#mode-picker-list", ListView)
-        picker.index = 0
-        picker.focus()
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        self.dismiss((event.item.id or "").removeprefix("mode-") or None)
-
-
 class HelpScreen(ModalScreen[None]):
     """Scrollable safe help, kept outside the task transcript."""
 
     def compose(self) -> ComposeResult:
-        yield Vertical(Log(id="help-content", highlight=False), Button("关闭", id="help-close"), id="help-modal")
-
-    def on_mount(self) -> None:
-        content = self.query_one("#help-content", Log)
-        for line in render_help():
-            content.write(line)
+        yield Vertical(
+            Static("\n\n".join(_HELP_LINES), id="help-content"),
+            Button("关闭", id="help-close"),
+            id="help-modal",
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None)
@@ -270,79 +429,65 @@ class ExitScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "exit-confirm-button")
 
 
-class TaskRunFinished(Message):
-    """Deliver one background runtime result to the Textual event loop."""
+class SessionEventReceived(Message):
+    """Deliver one continuous-session event to the Textual event loop."""
 
-    def __init__(self, task_id: UUID, result: TaskState | None) -> None:
-        self.task_id = task_id
-        self.result = result
-        super().__init__()
-
-
-class ApprovalResolutionFinished(Message):
-    """Deliver one approval resolution and any resumed run result to the event loop."""
-
-    def __init__(self, task_id: UUID, result: TaskState | None, accepted: bool) -> None:
-        self.task_id = task_id
-        self.result = result
-        self.accepted = accepted
-        super().__init__()
-
-
-class SessionCommandFinished(Message):
-    """Deliver fixed safe terminal-command output back to the Textual event loop."""
-
-    def __init__(self, command: str, lines: tuple[str, ...]) -> None:
-        self.command = command
-        self.lines = lines
+    def __init__(self, event: SessionEvent) -> None:
+        self.event = event
         super().__init__()
 
 
 class GuardedPyApp(App[None]):
     """The single-project interactive terminal session."""
 
+    BINDINGS = [("ctrl+shift+c", "copy_transcript", "复制会话")]
+
     CSS = """
     #status { height: 1; padding: 0 1; background: $panel; }
     #transcript-shell { height: 1fr; border: round $primary; }
-    #transcript { height: 1fr; }
-    #live-task-status { height: 1; padding: 0 1; color: $text-muted; }
-    #composer-shell { height: 6; layers: composer controls; }
-    #composer { height: 6; border: round $accent; padding: 0 35 2 0; layer: composer; }
-    #composer-controls { height: 2; layer: controls; dock: bottom; align: right middle; }
-    #mode-picker, #mode-chip, #composer-model, #composer-effort, #send { height: 1; color: $text-muted; }
-    #mode-picker { width: 3; }
+    #transcript { height: 1fr; overflow-x: hidden; overflow-y: scroll; }
+    #composer-shell { height: 7; border: round $accent; }
+    #composer { height: 1fr; border: none; padding: 0 1; }
+    #composer-controls { height: 1; align: left middle; }
+    #mode-picker, #mode-chip, #composer-model, #composer-effort, #send { height: 1; min-height: 1; color: $text-muted; }
+    #mode-picker, #send { background: transparent; border: none; padding: 0 1; }
+    #composer-model, #composer-effort { background: transparent; border: none; padding: 0 2; }
+    #mode-picker { width: 7; min-width: 7; }
     #mode-chip { width: auto; }
-    #composer-model, #composer-effort { width: auto; }
-    #send { width: 8; }
+    #composer-controls-spacer { width: 1fr; }
+    #composer-model, #composer-effort { width: auto; min-width: 0; }
+    #send { width: 12; min-width: 12; }
     #command-palette { display: none; height: auto; max-height: 12; border: round $secondary; }
+    #help-modal { width: 88; max-height: 1fr; }
+    #help-content { height: 1fr; overflow-y: auto; padding: 1 2; }
     """
 
-    def __init__(self, runtime: Any, profile: Any, initial_task: str | None = None) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        profile: Any,
+        initial_task: str | None = None,
+        conversation: Any | None = None,
+    ) -> None:
         super().__init__()
         self.runtime = runtime
         self.profile = profile
         self.initial_task = initial_task
-        self._pending_approval: tuple[TaskState, str] | None = None
-        self._active_task: TaskState | None = None
-        self._cancelled_task_ids: set[UUID] = set()
-        self._run_threads: dict[UUID, Thread] = {}
-        self._session_command_workers: dict[str, Thread] = {}
         self._palette_index = -1
         self._suppress_palette_once = False
-        self._pending_credential_request: tuple[str, TaskIntent, str | None, str | None] | None = None
-        self._conversation_store: ConversationStore | None = None
-        self._conversation_id: UUID | None = None
-        self._live_event_cursors: dict[UUID, int] = {}
-        self._live_finalized_task_ids: set[UUID] = set()
-        self._live_task_timer: Timer | None = None
         self._session_goal: str | None = None
-        self._mode: Literal["coding", "plan", "review", "goal"] = "coding"
+        self._conversation_runtime = conversation
+        self._continuous_session_id: UUID | None = None
+        self._continuous_turn_id: UUID | None = None
+        self._continuous_pending_approval: tuple[UUID, UUID, UUID] | None = None
+        self._pending_submission: tuple[str, Literal["normal", "plan", "review"]] | None = None
+        self._transcript_presenter = TranscriptPresenter()
+        self._seen_events: set[tuple[UUID, UUID, int]] = set()
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text(), id="status")
         yield Vertical(
-            TranscriptLog(id="transcript", highlight=False),
-            Static("", id="live-task-status"),
+            TranscriptLog(id="transcript"),
             id="transcript-shell",
         )
         yield ListView(
@@ -352,27 +497,35 @@ class GuardedPyApp(App[None]):
         yield Vertical(
             Composer(id="composer"),
             Horizontal(
-                Button("＋", id="mode-picker"),
+                Button(Text("[+]", no_wrap=True), id="mode-picker"),
                 Static("", id="mode-chip"),
+                Static("", id="composer-controls-spacer"),
                 Button(self.runtime.config.model, id="composer-model"),
                 Button(self.runtime.config.reasoning_effort, id="composer-effort"),
-                Button("发送", id="send", disabled=True),
+                Button(Text("[发送]", no_wrap=True), id="send", disabled=True),
                 id="composer-controls",
             ),
             id="composer-shell",
         )
 
     def on_mount(self) -> None:
-        self._clear_live_task_status()
         self._refresh_composer_controls()
         if self.initial_task:
             self.call_after_refresh(self.submit, self.initial_task)
+            return
+        store = getattr(self._conversation_runtime, "store", None)
+        if store is None:
+            return
+        summaries = store.summaries()
+        if summaries:
+            self.call_after_refresh(self._conversation_selected, summaries[-1].id)
+        else:
+            self.call_after_refresh(self._new_conversation)
 
     def on_unmount(self) -> None:
-        """Request cancellation before the app relinquishes a daemon worker's runtime lease."""
-        self._stop_live_task(clear_status=False)
+        """Interrupt an active continuous turn before releasing the runtime lease."""
         self._session_goal = None
-        self._cancel_active_task(render=False)
+        self._interrupt_continuous()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id == "composer":
@@ -386,13 +539,15 @@ class GuardedPyApp(App[None]):
                 command = str(item.query_one(Static).render())
                 item.display = command.startswith(prefix)
             self._palette_index = -1
+            palette.index = None
+            palette.scroll_home(animate=False)
             self.query_one("#send", Button).disabled = not bool(event.text_area.text.strip())
 
     def on_key(self, event: Any) -> None:
-        if event.key == "ctrl+c" and self._active_task is not None:
+        if event.key == "ctrl+c" and self._continuous_turn_id is not None:
             event.prevent_default()
             event.stop()
-            self._cancel_active_task()
+            self._interrupt_continuous()
 
     def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         """Make the custom composer message the sole interactive submit path."""
@@ -442,82 +597,164 @@ class GuardedPyApp(App[None]):
         if request.startswith("/"):
             self._submit_command(request)
             return
-        mode = self._mode
-        if mode == "goal":
-            self._set_session_goal(request)
-            return
-        self._mode = "coding"
-        self._refresh_composer_controls()
-        if mode == "plan":
-            self._require_credential_then_submit(request, TaskIntent.PLAN, session_goal=self._session_goal)
-            return
-        if mode == "review":
-            self._require_credential_then_submit(
-                "Review project", TaskIntent.REVIEW, request, session_goal=self._session_goal
+        self._submit_continuous(request, "normal")
+
+    def _submit_continuous(self, text: str, mode: Literal["normal", "plan", "review"]) -> None:
+        """Start or steer one continuous session without the legacy task renderer."""
+        try:
+            if not self.runtime.credential_status().configured:
+                self._pending_submission = (text, mode)
+                self.push_screen(CredentialScreen(False), self._credential_resolved)
+                return
+            if self._continuous_session_id is None:
+                self._continuous_session_id = self._conversation_runtime.create_session(str(self.profile.root))
+            if self._continuous_turn_id is not None:
+                event = self._conversation_runtime.steer(
+                    self._continuous_session_id, self._continuous_turn_id, text
+                )
+                self._present_session_event(event)
+                return
+            goal = self._session_goal
+            turn_id, event = self._conversation_runtime.begin_turn(
+                self._continuous_session_id, text, mode, **({"goal": goal} if goal else {})
             )
+            self._session_goal = None
+            self._refresh_composer_controls()
+        except CredentialBackendUnavailableError:
+            self.push_screen(CredentialBackendUnavailableScreen())
             return
-        self._require_credential_then_submit(request, TaskIntent.CODING, session_goal=self._session_goal)
-
-    def request_approval(
-        self,
-        task: TaskState,
-        *,
-        action_projection: str,
-        rule_id: str,
-        raw_action_hash: str,
-        permanent_eligible: bool = False,
-    ) -> None:
-        """Open a modal while retaining the hash privately for exact resolution."""
-        self._pending_approval = (task, raw_action_hash)
-        self.push_screen(
-            ApprovalScreen(action_projection, rule_id, permanent_eligible),
-            self._approval_resolved,
-        )
-
-    def _approval_resolved(self, decision: str | None) -> None:
-        if decision is None or self._pending_approval is None:
+        except Exception:
+            self._write("无法启动会话。")
             return
-        task, action_hash = self._pending_approval
-        self._pending_approval = None
-        worker = Thread(
-            target=self._resolve_approval_in_thread,
-            args=(task, action_hash, decision),
+        self._continuous_turn_id = turn_id
+        self._present_session_event(event)
+        Thread(
+            target=self._run_continuous_turn,
+            args=(self._continuous_session_id, turn_id),
             daemon=True,
-        )
-        self._run_threads[task.id] = worker
-        worker.start()
+        ).start()
 
-    def _resolve_approval_in_thread(
-        self, task: TaskState, action_hash: str, decision: str
+    def _run_continuous_turn(self, session_id: UUID, turn_id: UUID) -> None:
+        try:
+            for event in self._conversation_runtime.run_turn(session_id, turn_id):
+                self.post_message(SessionEventReceived(event))
+        except Exception:
+            self.post_message(SessionEventReceived(
+                SessionEvent(session_id, turn_id, 0, "turn_failed", data={"code": "surface_failure"})
+            ))
+
+    def on_session_event_received(self, message: SessionEventReceived) -> None:
+        event_key = (
+            message.event.session_id,
+            message.event.turn_id,
+            message.event.sequence,
+        )
+        if event_key in self._seen_events:
+            return
+        self._seen_events.add(event_key)
+        self._present_session_event(message.event)
+        if message.event.kind == "turn_started":
+            self._continuous_turn_id = message.event.turn_id
+        if message.event.kind == "approval_requested":
+            approval_id = UUID(message.event.data["approval_id"])
+            self._continuous_pending_approval = (
+                message.event.session_id, message.event.turn_id, approval_id
+            )
+            self.push_screen(
+                ApprovalScreen(
+                    approval_projection(dict(message.event.data)),
+                    message.event.data.get("rule_id", "approval.required"),
+                    False,
+                ),
+                self._continuous_approval_resolved,
+            )
+        if message.event.kind in {"turn_completed", "turn_interrupted", "turn_failed"} and message.event.turn_id == self._continuous_turn_id:
+            self._continuous_turn_id = None
+
+    def _continuous_approval_resolved(self, decision: str | None) -> None:
+        pending = self._continuous_pending_approval
+        if decision is None or pending is None:
+            return
+        self._continuous_pending_approval = None
+        Thread(
+            target=self._resolve_continuous_approval,
+            args=(*pending, decision != "reject"),
+            daemon=True,
+        ).start()
+
+    def _resolve_continuous_approval(
+        self, session_id: UUID, turn_id: UUID, approval_id: UUID, accepted: bool
     ) -> None:
         try:
-            accepted = self.runtime.resolve_approval(task.id, action_hash, decision)
-            result = self.runtime.run(task.id) if accepted else task
+            for event in self._conversation_runtime.resolve_approval(
+                session_id, turn_id, approval_id, accepted
+            ):
+                self.post_message(SessionEventReceived(event))
         except Exception:
-            self.post_message(ApprovalResolutionFinished(task.id, None, False))
+            self.post_message(SessionEventReceived(
+                SessionEvent(session_id, turn_id, 0, "turn_failed", data={"code": "surface_failure"})
+            ))
+
+    def _interrupt_continuous(self) -> None:
+        if self._continuous_session_id is None or self._continuous_turn_id is None:
             return
-        self.post_message(ApprovalResolutionFinished(task.id, result, accepted))
+        try:
+            event = self._conversation_runtime.interrupt(
+                self._continuous_session_id, self._continuous_turn_id
+            )
+        except TurnNotActiveError:
+            self._continuous_turn_id = None
+            return
+        if event is not None:
+            self._present_session_event(event)
+            self._continuous_turn_id = None
+
+    def _present_session_event(self, event: SessionEvent) -> None:
+        update = self._transcript_presenter.present(event)
+        if update is not None:
+            try:
+                self.query_one("#transcript", TranscriptLog).apply_update(update)
+            except NoMatches:
+                return
 
     def _submit_command(self, command: str) -> None:
         name, _, argument = command.partition(" ")
         if name not in COMMANDS or (name in _NO_ARGUMENT_COMMANDS and argument):
             self._write("未知命令。")
             return
-        if name == "/clear":
-            self.query_one("#transcript", Log).clear()
+        if name == "/delete":
+            if self._continuous_session_id is None:
+                self._write("没有可删除的会话。")
+            elif self._continuous_turn_id is not None:
+                self._write("请先停止当前会话后再删除。")
+            else:
+                replacement = self._conversation_runtime.delete_session(self._continuous_session_id)
+                if replacement is None:
+                    self._write("至少保留一条会话，无法删除。")
+                else:
+                    self._conversation_selected(replacement.id)
             return
         if name == "/new":
-            if self._active_task is None:
+            if self._continuous_turn_id is None:
                 self._new_conversation()
             else:
                 self.push_screen(NewConversationScreen(), self._new_conversation_resolved)
             return
         if name == "/conversations":
-            conversations = self._conversation_store_for_session().list()
+            conversations = self._conversation_runtime.store.summaries()
             if conversations:
                 self.push_screen(ConversationScreen(conversations), self._conversation_selected)
             else:
                 self._write("会话：0")
+            return
+        if name == "/permissions":
+            self._write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。")
+            return
+        if name in {"/tests", "/diff", "/doctor"}:
+            try:
+                self._write(self.runtime.local_check(name.removeprefix("/")))
+            except Exception:
+                self._write("本地检查不可用。")
             return
         if name == "/help":
             self.push_screen(HelpScreen())
@@ -542,41 +779,53 @@ class GuardedPyApp(App[None]):
         if name == "/goal":
             if argument == "clear":
                 self._session_goal = None
-                self._mode = "coding"
                 self._refresh_composer_controls()
             elif argument:
                 self._set_session_goal(argument)
             else:
                 self._write("目标不能为空。")
             return
+        if name == "/stop":
+            self._interrupt_continuous()
+            return
+        if name == "/queue":
+            if not argument or self._continuous_session_id is None or self._continuous_turn_id is None:
+                self._write("没有可排队的活跃会话。")
+                return
+            try:
+                _, event = self._conversation_runtime.queue(
+                    self._continuous_session_id, argument, "normal"
+                )
+            except Exception:
+                self._write("无法排队下一轮。")
+                return
+            self._present_session_event(event)
+            return
         if name == "/plan":
-            self._require_credential_then_submit(argument, TaskIntent.PLAN, session_goal=self._session_goal)
+            if not argument:
+                self._write("计划任务不能为空。")
+                return
+            self._submit_continuous(argument, "plan")
             return
         if name == "/review":
-            self._require_credential_then_submit(
-                "Review project", TaskIntent.REVIEW, argument or None, session_goal=self._session_goal
-            )
+            self._submit_continuous(argument or "Review project", "review")
             return
         if name == "/exit":
-            if self._active_task is None:
+            if self._continuous_turn_id is None:
                 self._session_goal = None
                 self.exit()
             else:
                 self.push_screen(ExitScreen(), self._exit_resolved)
             return
-        if name in {"/tests", "/diff"}:
-            self._start_session_command(name)
-            return
-        if name in {"/permissions", "/memory", "/history", "/doctor"}:
-            output = StringIO()
-            run_plain_session(self.runtime, StringIO(f"{command}\n"), output)
-            for line in output.getvalue().splitlines():
-                self._write(line)
 
     def _open_settings(
         self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
     ) -> None:
-        self.push_screen(SettingsScreen(field, values), lambda value: self._setting_resolved(field, value))
+        current = getattr(self.runtime.config, field)
+        self.push_screen(
+            SettingsScreen(field, values, current),
+            lambda value: self._setting_resolved(field, value),
+        )
 
     def _setting_resolved(
         self, field: Literal["model", "reasoning_effort"], value: str | None
@@ -596,27 +845,8 @@ class GuardedPyApp(App[None]):
         self.query_one("#status", Static).update(self._status_text())
         self._refresh_composer_controls()
 
-    def _start_session_command(self, command: str) -> None:
-        if command in self._session_command_workers:
-            self._write("命令正在运行。")
-            return
-        worker = Thread(target=self._run_session_command_in_thread, args=(command,), daemon=True)
-        self._session_command_workers[command] = worker
-        worker.start()
-
-    def _run_session_command_in_thread(self, command: str) -> None:
-        output = StringIO()
-        try:
-            run_plain_session(self.runtime, StringIO(f"{command}\n"), output)
-        except Exception:
-            output.write("命令执行失败。\n")
-        self.post_message(SessionCommandFinished(command, tuple(output.getvalue().splitlines())))
-
     def _credential_resolved(self, result: tuple[str, str | None] | None) -> None:
         if result is None:
-            if self._pending_credential_request is not None:
-                self._pending_credential_request = None
-                self._write("未配置凭据，任务未开始。")
             return
         operation, value = result
         try:
@@ -626,38 +856,14 @@ class GuardedPyApp(App[None]):
                     return
                 self.runtime.update_credential(value)
                 self._write("凭据已更新。")
-                self._resume_pending_credential_request()
+                pending = self._pending_submission
+                self._pending_submission = None
+                if pending is not None:
+                    self._submit_continuous(*pending)
             elif operation == "clear_requested":
                 self.push_screen(ClearCredentialScreen(), self._clear_credential_resolved)
         except Exception:
             self._write("凭据操作失败。")
-
-    def _require_credential_then_submit(
-        self, text: str, intent: TaskIntent, review_path: str | None = None,
-        session_goal: str | None = None,
-    ) -> None:
-        if not text.strip():
-            self._write("任务描述不能为空。")
-            return
-        try:
-            configured = self.runtime.credential_status().configured
-        except CredentialBackendUnavailableError:
-            self.push_screen(CredentialBackendUnavailableScreen())
-            return
-        except Exception:
-            self._write("凭据状态不可用。")
-            return
-        if configured:
-            self._start_task(text, intent, review_path, session_goal)
-            return
-        self._pending_credential_request = (text, intent, review_path, session_goal)
-        self.push_screen(CredentialScreen(False), self._credential_resolved)
-
-    def _resume_pending_credential_request(self) -> None:
-        pending = self._pending_credential_request
-        self._pending_credential_request = None
-        if pending is not None:
-            self._start_task(*pending)
 
     def _clear_credential_resolved(self, confirmed: bool) -> None:
         if not confirmed:
@@ -671,203 +877,75 @@ class GuardedPyApp(App[None]):
     def _exit_resolved(self, confirmed: bool) -> None:
         if not confirmed:
             return
-        self._cancel_active_task()
+        self._interrupt_continuous()
         self._session_goal = None
         self.exit()
 
-    def _start_task(
-        self, description: str, intent: TaskIntent, review_path: str | None = None,
-        session_goal: str | None = None,
-    ) -> None:
-        if not description.strip():
-            self._write("任务描述不能为空。")
-            return
-        try:
-            task = self.runtime.create_task(
-                description, intent, review_path=review_path, session_goal=session_goal
-            )
-            store = self._conversation_store_for_session()
-            if self._conversation_id is None:
-                self._conversation_id = store.create().id
-            store.attach_task(self._conversation_id, task.id)
-            self._active_task = task
-            self._write(task_message_flow(task, ()).user_message)
-            self._start_live_task(task)
-            worker = Thread(target=self._run_task_in_thread, args=(task,), daemon=True)
-            self._run_threads[task.id] = worker
-            worker.start()
-        except Exception:
-            self._write("无法启动任务。")
-
     def _new_conversation_resolved(self, confirmed: bool) -> None:
         if confirmed:
-            self._cancel_active_task()
+            self._interrupt_continuous()
             self._new_conversation()
 
     def _new_conversation(self) -> None:
-        self._conversation_id = None
+        self._continuous_session_id = self._conversation_runtime.create_session(str(self.profile.root))
+        self._continuous_turn_id = None
+        self._transcript_presenter = TranscriptPresenter()
+        self._seen_events.clear()
         self._session_goal = None
-        self._mode = "coding"
         self._refresh_composer_controls()
-        self._stop_live_task()
-        self.query_one("#transcript", Log).clear()
+        self.query_one("#transcript", TranscriptLog).reset_continuous()
         composer = self.query_one("#composer", Composer)
         composer.focus()
         composer.cursor_location = composer.document.end
 
-    def _conversation_store_for_session(self) -> ConversationStore:
-        if self._conversation_store is None:
-            self._conversation_store = ConversationStore(self.profile.root)
-        return self._conversation_store
-
-    def _conversation_selected(self, conversation_id: UUID | None) -> None:
-        if conversation_id is None:
+    def _conversation_selected(self, summary_id: UUID | None) -> None:
+        if summary_id is None:
             return
-        transcript = self.query_one("#transcript", Log)
-        self._stop_live_task()
-        transcript.clear()
-        for task_id in self._conversation_store_for_session().tasks(conversation_id):
-            task = self.runtime.task(task_id)
-            try:
-                events = tuple(self.runtime.events(task.id))
-            except Exception:
-                events = ()
-            flow = task_message_flow(task, events)
-            for line in (flow.user_message, *flow.event_messages, *([flow.final_message] if flow.final_message else [])):
-                self._write(line)
-        self._conversation_id = conversation_id
+        self._continuous_session_id = self._conversation_runtime.create_session(
+            str(self.profile.root), summary_id
+        )
+        summary = self._conversation_runtime.summary(self._continuous_session_id)
+        self._continuous_turn_id = None
+        self._transcript_presenter = TranscriptPresenter()
+        self._seen_events.clear()
+        self.query_one("#transcript", TranscriptLog).reset_continuous()
+        self._render_summary(summary)
         composer = self.query_one("#composer", Composer)
         composer.focus()
         composer.cursor_location = composer.document.end
 
-    def _run_task_in_thread(self, task: TaskState) -> None:
-        """Advance one runtime task off-loop and post only a typed completion message."""
-        try:
-            result = self.runtime.run(task.id)
-        except Exception:
-            self.post_message(TaskRunFinished(task.id, None))
+    def _render_summary(self, summary: Any) -> None:
+        if summary.transcript:
+            transcript = self.query_one("#transcript", TranscriptLog)
+            for index, entry in enumerate(summary.transcript, start=1):
+                text = f"› {entry.text}" if entry.role == "user" else _display_assistant_text(entry.text)
+                transcript.apply_update(TranscriptUpdate(UUID(int=index), text))
             return
-        self.post_message(TaskRunFinished(task.id, result))
-
-    def on_task_run_finished(self, event: TaskRunFinished) -> None:
-        self._run_threads.pop(event.task_id, None)
-        if event.result is None:
-            self._task_run_failed(event.task_id)
-            return
-        self._task_run_finished(event.result)
-
-    def on_approval_resolution_finished(self, event: ApprovalResolutionFinished) -> None:
-        self._run_threads.pop(event.task_id, None)
-        if event.result is None:
-            self._write("审批请求已失效。")
-            return
-        if not event.accepted and event.result.status not in {
-            TaskStatus.BLOCKED,
-            TaskStatus.CANCELLED,
-            TaskStatus.INTERRUPTED,
-        }:
-            self._write("审批请求已失效。")
-            return
-        self._task_run_finished(event.result)
-
-    def on_session_command_finished(self, event: SessionCommandFinished) -> None:
-        self._session_command_workers.pop(event.command, None)
-        for line in event.lines:
-            self._write(line)
-
-    def _task_run_failed(self, task_id: UUID) -> None:
-        if task_id in self._cancelled_task_ids:
-            self._cancelled_task_ids.remove(task_id)
-            return
-        self._stop_live_task(task_id)
-        if self._active_task is not None and self._active_task.id == task_id:
-            self._active_task = None
-        self._write("无法启动任务。")
-
-    def _task_run_finished(self, task: TaskState) -> None:
-        if task.id in self._cancelled_task_ids:
-            self._cancelled_task_ids.remove(task.id)
-            return
-        self._render_task(task)
-
-    def _cancel_active_task(self, *, render: bool = True) -> None:
-        task = self._active_task
-        if task is None:
-            return
-        self._cancelled_task_ids.add(task.id)
-        try:
-            cancelled = self.runtime.cancel(task.id)
-        except Exception:
-            if render:
-                self._write("取消任务失败。")
-            return
-        self._active_task = None
-        if render:
-            self._render_task(cancelled)
-
-    def _render_task(self, task: TaskState) -> None:
-        self._active_task = task if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL} else None
-        self._render_live_task(task)
-        if task.status is TaskStatus.WAITING_APPROVAL:
-            for event in reversed(self.runtime.events(task.id)):
-                if event.action_projection and event.policy_rule_id and event.action_hash:
-                    self.request_approval(
-                        task,
-                        action_projection=event.action_projection,
-                        rule_id=event.policy_rule_id,
-                        raw_action_hash=event.action_hash,
-                        permanent_eligible=bool(event.permanent_eligible),
-                    )
-                    return
+        for index, turn in enumerate(summary.turns, start=1):
+            if turn.final_text:
+                self.query_one("#transcript", TranscriptLog).apply_update(
+                    TranscriptUpdate(UUID(int=index), turn.final_text)
+                )
+            terminal = {
+                "completed": "turn_completed",
+                "interrupted": "turn_interrupted",
+                "failed": "turn_failed",
+            }.get(turn.terminal_status)
+            if terminal is not None:
+                self._present_session_event(SessionEvent(summary.id, UUID(int=0), 0, terminal))
 
     def _write(self, value: object) -> None:
-        self.query_one("#transcript", Log).write(str(value))
+        self.query_one("#transcript", TranscriptLog).write(str(value))
 
-    def _start_live_task(self, task: TaskState) -> None:
-        self._stop_live_task()
-        self._live_event_cursors[task.id] = 0
-        self._render_live_task(task)
-        self._live_task_timer = self.set_interval(0.1, lambda: self._render_live_task(task))
-
-    def _render_live_task(self, task: TaskState) -> None:
-        """Append only unseen safe audit messages and maintain one transient live row."""
-        try:
-            events = tuple(self.runtime.events(task.id))
-        except Exception:
-            events = ()
-        cursor = self._live_event_cursors.get(task.id, 0)
-        for event in events[cursor:]:
-            for line in task_message_flow(task, (event,)).event_messages:
-                self._write(line)
-        self._live_event_cursors[task.id] = len(events)
-        flow = task_message_flow(task, events)
-        if flow.live_status is not None:
-            live_status = self.query_one("#live-task-status", Static)
-            live_status.update(flow.live_status)
-            live_status.display = True
-            return
-        if task.id not in self._live_finalized_task_ids and flow.final_message is not None:
-            self._write(flow.final_message)
-            self._live_finalized_task_ids.add(task.id)
-        self._stop_live_task(task.id)
-
-    def _clear_live_task_status(self) -> None:
-        live_status = self.query_one("#live-task-status", Static)
-        live_status.update("")
-        live_status.display = False
-
-    def _stop_live_task(self, task_id: UUID | None = None, *, clear_status: bool = True) -> None:
-        if self._live_task_timer is not None:
-            self._live_task_timer.stop()
-            self._live_task_timer = None
-        if task_id is not None:
-            self._live_event_cursors.pop(task_id, None)
-        if clear_status:
-            self._clear_live_task_status()
+    def action_copy_transcript(self) -> None:
+        transcript = self.query_one("#transcript", TranscriptLog)
+        self.copy_to_clipboard("\n".join(transcript.text_entries))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "mode-picker":
-            self.push_screen(ModePickerScreen(), self._mode_resolved)
+            composer = self.query_one("#composer", Composer)
+            composer.text = "/"
+            composer.focus()
         elif event.button.id == "composer-model":
             self._open_settings("model", ("deepseek-v4-flash", "deepseek-v4-pro"))
         elif event.button.id == "composer-effort":
@@ -875,41 +953,25 @@ class GuardedPyApp(App[None]):
         elif event.button.id == "send":
             self.submit(self.query_one("#composer", Composer).text)
 
-    def _mode_resolved(self, mode: Literal["plan", "review", "goal"] | None) -> None:
-        if mode is None:
-            return
-        self._mode = mode
-        self._refresh_composer_controls()
-        composer = self.query_one("#composer", Composer)
-        composer.focus()
-
     def _set_session_goal(self, value: str) -> None:
         goal = value.strip()
         if not goal:
             self._write("目标不能为空。")
             return
         self._session_goal = goal
-        self._mode = "coding"
         self._refresh_composer_controls()
 
     def _refresh_composer_controls(self) -> None:
         composer = self.query_one("#composer", Composer)
         chip = self.query_one("#mode-chip", Static)
-        labels = {"plan": "[计划]", "review": "[审查]", "goal": "[目标]"}
-        label = labels.get(self._mode) or ("[目标]" if self._session_goal else "")
+        label = "[目标]" if self._session_goal else ""
         chip.update(label)
         chip.display = bool(label)
-        composer.placeholder = {
-            "coding": "输入任务",
-            "plan": "输入规划任务",
-            "review": "输入项目根内相对审查路径",
-            "goal": "输入会话目标",
-        }[self._mode]
+        composer.placeholder = "输入任务"
         self.query_one("#composer-model", Button).label = self.runtime.config.model
         self.query_one("#composer-effort", Button).label = self.runtime.config.reasoning_effort
 
-    def _status_text(self, task: TaskState | None = None) -> str:
-        del task
+    def _status_text(self) -> str:
         return f"项目：{self.profile.root}"
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
@@ -918,33 +980,208 @@ class GuardedPyApp(App[None]):
         self._accept_palette_item(event.item)
 
 
+class DemoEventReceived(Message):
+    """Deliver an event from the offline scenario worker to the demo surface."""
+
+    def __init__(self, event: SessionEvent) -> None:
+        self.event = event
+        super().__init__()
+
+
+class DemoFinished(Message):
+    """Finish a visual replay after its actual mock scenario returns."""
+
+    def __init__(self, result: ScenarioResult | None) -> None:
+        self.result = result
+        super().__init__()
+
+
+@dataclass
+class DemoApprovalRequest:
+    """Carry one visual approval decision back to the paused mock turn."""
+
+    event: SessionEvent
+    resolved: ThreadEvent = field(default_factory=ThreadEvent)
+    accepted: bool = False
+
+
+class DemoApprovalRequested(Message):
+    """Ask the demo surface for a decision on its actual pending approval."""
+
+    def __init__(self, request: DemoApprovalRequest) -> None:
+        self.request = request
+        super().__init__()
+
+
 class DemoApp(App[None]):
-    """Offline, fixed-scenario Textual mechanism demonstration."""
+    """Offline, fixed-scenario replay in the normal GuardedPy TUI shell."""
+
+    CSS = GuardedPyApp.CSS + """
+    #demo-statusbar { height: 1; background: $panel; }
+    #demo-statusbar #status { width: 1fr; background: transparent; }
+    #demo-hint { width: auto; min-width: 0; height: 1; color: $text-muted; padding: 0 1; }
+    #send { width: 12; min-width: 12; }
+    #composer-model, #composer-effort { padding: 0 1; }
+    """
 
     _scenarios: tuple[ScenarioName, ...] = (
-        "dangerous_action_denied",
-        "failure_feedback_corrects",
-        "tdd_source_patch_denied",
+        "delete_requires_approval",
+        "feedback_repair",
+        "stale_approval_denied",
     )
-    _requests = {
-        "dangerous_action_denied": "Attempt a prohibited privileged action.",
-        "failure_feedback_corrects": "Correct the selected assertion failure.",
-        "tdd_source_patch_denied": "Attempt a source patch before observing red.",
-    }
+    _event_presentation_delay_seconds = 0.12
 
     def __init__(self) -> None:
         super().__init__()
         self._index = 0
+        self._scenario_running = False
+        self._presenter = TranscriptPresenter()
+        self._model = "Mock LLM1"
+        self._effort = "high"
 
     def compose(self) -> ComposeResult:
-        yield Static("选择机制演示，按 Enter 运行。", id="demo-title")
-        yield Static(self._requests[self._scenarios[self._index]], id="demo-request")
-        yield RichLog(id="demo-transcript", wrap=True, highlight=False, markup=False)
+        yield Horizontal(
+            Static(self._status_text(), id="status"),
+            Static("按↑↓来切换场景", id="demo-hint"),
+            id="demo-statusbar",
+        )
+        yield Vertical(TranscriptLog(id="transcript"), id="transcript-shell")
+        yield ListView(
+            *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}") for command in COMMANDS),
+            id="command-palette",
+        )
+        yield Vertical(
+            DemoRequest(scenario_request(self._selected()), id="composer"),
+            Horizontal(
+                Button(Text("[+]", no_wrap=True), id="mode-picker"),
+                Static("", id="composer-controls-spacer"),
+                Button(self._model, id="composer-model"),
+                Button(self._effort, id="composer-effort"),
+                Button(Text("[发送]", no_wrap=True), id="send"),
+                id="composer-controls",
+            ),
+            id="composer-shell",
+        )
 
-    def on_key(self, event: Any) -> None:
-        if event.key in {"down", "j"}:
+    def on_mount(self) -> None:
+        self.query_one("#composer", DemoRequest).focus()
+        self._refresh_request()
+
+    def _selected(self) -> ScenarioName:
+        return self._scenarios[self._index]
+
+    def _demo_key(self, key: str) -> None:
+        if key == "escape":
+            self.exit()
+            return
+        if self._scenario_running:
+            return
+        if key in {"down", "j"}:
             self._index = (self._index + 1) % len(self._scenarios)
-            self.query_one("#demo-request", Static).update(self._requests[self._scenarios[self._index]])
-        elif event.key == "enter":
-            result = run_scenario(self._scenarios[self._index])
-            self.query_one("#demo-transcript", RichLog).write(f"{result.name} status={result.status}")
+            self._refresh_request()
+        elif key in {"up", "k"}:
+            self._index = (self._index - 1) % len(self._scenarios)
+            self._refresh_request()
+        elif key == "enter":
+            self._start_scenario()
+
+    def _refresh_request(self) -> None:
+        scenario = self._selected()
+        self.query_one("#composer", DemoRequest).update(scenario_request(scenario))
+
+    def _open_command_palette(self) -> None:
+        palette = self.query_one("#command-palette", ListView)
+        palette.display = True
+        palette.index = 0
+        palette.focus()
+
+    def _start_scenario(self) -> None:
+        self._scenario_running = True
+        self._presenter = TranscriptPresenter()
+        self.query_one("#transcript", TranscriptLog).reset_continuous()
+        self.query_one("#status", Static).update(self._status_text())
+        scenario = self._selected()
+        Thread(target=self._run_scenario, args=(scenario,), daemon=True).start()
+
+    def _run_scenario(self, scenario: ScenarioName) -> None:
+        try:
+            result = run_scenario(
+                scenario, on_event=self._post_demo_event, approval_resolver=self._request_demo_approval
+            )
+        except Exception:
+            self.post_message(DemoFinished(None))
+        else:
+            self.post_message(DemoFinished(result))
+
+    def _post_demo_event(self, event: SessionEvent) -> None:
+        """Pace the visual replay without changing the mock core's event order."""
+        self.post_message(DemoEventReceived(event))
+        sleep(self._event_presentation_delay_seconds)
+
+    def _request_demo_approval(self, event: SessionEvent) -> bool:
+        request = DemoApprovalRequest(event)
+        self.post_message(DemoApprovalRequested(request))
+        request.resolved.wait()
+        return request.accepted
+
+    def on_demo_event_received(self, message: DemoEventReceived) -> None:
+        update = self._presenter.present(message.event)
+        if update is not None:
+            self.query_one("#transcript", TranscriptLog).apply_update(update)
+
+    def on_demo_approval_requested(self, message: DemoApprovalRequested) -> None:
+        event = message.request.event
+        path = event.data.get("path", "项目路径")
+        self.push_screen(
+            ApprovalScreen(f"删除 {path}", "demo.delete.approval", False),
+            lambda decision: self._resolve_demo_approval(message.request, decision),
+        )
+
+    def _resolve_demo_approval(
+        self, request: DemoApprovalRequest, decision: str | None
+    ) -> None:
+        request.accepted = decision == "once"
+        request.resolved.set()
+
+    def on_demo_finished(self, message: DemoFinished) -> None:
+        self._scenario_running = False
+        if message.result is None:
+            self.query_one("#transcript", TranscriptLog).write("演示未完成。")
+            return
+        self.query_one("#status", Static).update(self._status_text())
+
+    def _status_text(self) -> str:
+        return "项目：机制演示临时项目"
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "mode-picker":
+            self._open_command_palette()
+        elif event.button.id == "composer-model":
+            self._open_demo_settings("model", ("Mock LLM1", "Mock LLM2"))
+        elif event.button.id == "composer-effort":
+            self._open_demo_settings("effort", ("high", "max"))
+        elif event.button.id == "send":
+            self._start_scenario()
+
+    def _open_demo_settings(self, field: Literal["model", "effort"], values: tuple[str, ...]) -> None:
+        current = self._model if field == "model" else self._effort
+        self.push_screen(
+            SettingsScreen(f"demo_{field}", values, current),
+            lambda value: self._demo_setting_resolved(field, value),
+        )
+
+    def _demo_setting_resolved(self, field: Literal["model", "effort"], value: str | None) -> None:
+        if value is None:
+            return
+        if field == "model":
+            self._model = value
+        else:
+            self._effort = value
+        self.query_one(f"#composer-{field}", Button).label = value
+        self.query_one("#composer", DemoRequest).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "command-palette":
+            return
+        event.list_view.display = False
+        self.query_one("#composer", DemoRequest).focus()

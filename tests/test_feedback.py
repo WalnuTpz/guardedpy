@@ -10,9 +10,12 @@ import pytest
 from conftest import safe_config
 from guardedpy.config import HarnessConfig
 from guardedpy.discovery import ProjectProfile
-from guardedpy.domain import FeedbackKind
-from guardedpy.feedback import FeedbackCollector, PytestFeedback, PytestRun
+from guardedpy.feedback import FeedbackCollector, FeedbackKind, PytestFeedback, PytestRun
 from guardedpy.workspace import Workspace
+
+
+def test_feedback_kind_is_owned_by_continuous_feedback_boundary() -> None:
+    assert FeedbackKind.__module__ == "guardedpy.feedback"
 
 
 def test_collector_extracts_assertion_failure_node_and_bounded_excerpt() -> None:
@@ -62,6 +65,18 @@ def test_collector_treats_noncollection_error_as_execution_error_before_assertio
 
     assert result.kind is FeedbackKind.EXECUTION_ERROR
     assert result.node_ids == ()
+
+
+def test_collector_maps_exit_two_to_collection_error_without_provider_text() -> None:
+    result = FeedbackCollector().collect(PytestRun(2, "", "", False))
+
+    assert result.kind is FeedbackKind.COLLECTION_ERROR
+
+
+def test_collector_treats_zero_collected_success_as_execution_error() -> None:
+    result = FeedbackCollector().collect(PytestRun(0, "collected 0 items\n", "", False))
+
+    assert result.kind is FeedbackKind.EXECUTION_ERROR
 
 
 def test_collector_does_not_treat_source_assert_in_a_runtime_traceback_as_assertion_evidence() -> None:
