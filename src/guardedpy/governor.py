@@ -47,6 +47,11 @@ class _PytestArgs(_Args):
     nodes: tuple[str, ...] = Field(default=(), max_length=20)
 
 
+class _RunPythonArgs(_Args):
+    path: str
+    argv: tuple[str, ...] = Field(default=(), max_length=20)
+
+
 class _NoArgs(_Args):
     pass
 
@@ -57,14 +62,39 @@ class _DeleteArgs(_Args):
 
 _MODELS: dict[str, type[_Args]] = {
     "list_files": _ListArgs, "read_file": _ReadArgs, "apply_patch": _PatchArgs,
-    "run_pytest": _PytestArgs, "git_diff": _NoArgs, "git_status": _NoArgs,
+    "run_pytest": _PytestArgs, "run_python": _RunPythonArgs,
+    "git_diff": _NoArgs, "git_status": _NoArgs,
     "delete_path": _DeleteArgs,
 }
 
 
-def governed_tool_definitions() -> tuple[ToolDefinition, ...]:
+def governed_tool_definitions(config: HarnessConfig) -> tuple[ToolDefinition, ...]:
+    """Describe the fixed tools, including the discovered write boundary."""
+    allowed_directories = ", ".join(
+        path.as_posix() for path in (*config.source_dirs, *config.test_dirs)
+    )
+    descriptions = {
+        "list_files": "List files under one project directory.",
+        "read_file": "Read one existing project text file before modifying it.",
+        "apply_patch": (
+            "Apply a supported unified diff only inside discovered source or test directories: "
+            f"{allowed_directories}. Existing files must be fully read earlier in this turn. "
+            "To create a new file, do not read the nonexistent target; use "
+            "--- /dev/null followed by +++ b/<allowed-directory>/file and an "
+            "@@ -0,0 +1 @@ hunk. If no sensible allowed location is clear, ask the user."
+        ),
+        "run_pytest": "Run configured pytest, optionally for test nodes.",
+        "run_python": (
+            "Run one existing .py file inside the project without a shell. Use this to "
+            "verify a requested program directly; no prior read is required. path must name "
+            "a regular project Python file and argv is a short list of ordinary arguments."
+        ),
+        "git_diff": "Read the current Git diff without changing the project.",
+        "git_status": "Read the current Git status without changing the project.",
+        "delete_path": "Request deletion of one project path; explicit approval is required.",
+    }
     return tuple(
-        ToolDefinition(name, f"Governed {name} tool.", model.model_json_schema())
+        ToolDefinition(name, descriptions[name], model.model_json_schema())
         for name, model in _MODELS.items()
     )
 
@@ -86,6 +116,11 @@ def parse_tool_call(call: ToolCall) -> _Args:
             _validate_path(path_text)
             if node.startswith("-"):
                 raise ValueError("invalid_tool_call")
+    if isinstance(parsed, _RunPythonArgs) and any(
+        not argument or "\x00" in argument or len(argument) > 200
+        for argument in parsed.argv
+    ):
+        raise ValueError("invalid_tool_call")
     return parsed
 
 

@@ -156,6 +156,21 @@ def test_patch_can_create_a_file_from_an_empty_hunk(tmp_path: Path) -> None:
     assert (tmp_path / "src" / "new.py").read_text() == "created\n"
 
 
+def test_patch_uses_actual_hunk_lines_when_the_declared_counts_are_wrong(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "value.py"
+    target.write_text("VALUE = 'broken'\n")
+    workspace = Workspace(tmp_path, safe_config(tmp_path))
+
+    result = workspace.apply_patch(
+        "--- a/src/value.py\n+++ b/src/value.py\n@@ -1,9 +1,9 @@\n"
+        "-VALUE = 'broken'\n+VALUE = 'fixed'\n"
+    )
+
+    assert result.ok is True
+    assert target.read_text() == "VALUE = 'fixed'\n"
+
+
 def test_patch_rejects_out_of_range_zero_line_hunk_without_writing(tmp_path: Path) -> None:
     """Catches a zero-line hunk silently appending at a different location."""
     (tmp_path / "src").mkdir()

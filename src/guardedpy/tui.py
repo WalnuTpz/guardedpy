@@ -3,44 +3,62 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from threading import Thread
+import re
+from threading import Event as ThreadEvent, Thread
+from time import sleep
 from typing import Any, Literal
 from uuid import UUID
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
+from textual.widgets import Button, Input, ListItem, ListView, Static, TextArea
 
 from guardedpy.conversation import SessionEvent, TurnNotActiveError, safe_event_message
 from guardedpy.credentials import CredentialBackendUnavailableError
-from guardedpy.mechanism_demo import ScenarioName, run_scenario
+from guardedpy.mechanism_demo import ScenarioName, ScenarioResult, run_scenario, scenario_request
 
 
 COMMANDS = (
-    "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
-    "/tests", "/diff", "/permissions", "/credentials", "/memory", "/model", "/effort",
+    "/conversations", "/new", "/delete", "/exit", "/plan", "/review",
+    "/tests", "/diff", "/permissions", "/credentials", "/model", "/effort",
     "/doctor", "/goal", "/help", "/stop", "/queue",
 )
 
 _HELP_LINES = (
-    "会话：/new 新建；/conversations 选择历史；/history 查看当前摘要；/clear 清屏；/exit 退出。",
-    "工作：直接输入即可对话或编码；/plan <任务> 只读计划；/review <路径> 只读审查；/stop 中断；/queue <任务> 排队。",
-    "检查：/tests 运行 pytest；/diff 查看 Git diff；/doctor 查看本地状态；/permissions 说明工具权限。",
-    "设置：/credentials 安全录入、查看或清除 Key；/model 与 /effort 设置后续回合；/goal <目标> 仅作用下一回合，/goal clear 取消。",
-    "记忆：/memory 查看当前会话的安全摘要。交互：Enter 提交；Shift+Enter 或 Ctrl+J 换行；Ctrl+Shift+C 复制安全 transcript。",
-    "危险操作：删除始终逐次要求批准；非交互终端不会自动批准。",
+    "GuardedPy 使用指南",
+    "直接输入：与 Agent 对话，或描述要检查、修复、实现的项目任务。",
+    "/new：新建会话。",
+    "/conversations：选择并恢复历史对话。",
+    "/delete：删除当前对话并回到上一条；最后一条不能删除。",
+    "/exit：退出 GuardedPy。",
+    "/plan <任务>：只读制定计划；提交后自动回到普通模式。",
+    "/review <路径>：只读审查；提交后自动回到普通模式。",
+    "/goal <目标>：只约束下一回合；/goal clear 取消。",
+    "/stop：中断当前回合并取消排队任务。",
+    "/queue <任务>：把下一项工作排到当前回合之后。",
+    "/tests：运行配置的 pytest。",
+    "/diff：查看当前 Git diff。",
+    "/doctor：查看本地项目状态。",
+    "/permissions：查看可自动执行与需审批的操作。",
+    "/credentials：安全录入、更新或清除 API Key。",
+    "/model：选择后续回合模型。",
+    "/effort：选择后续回合思考强度。",
+    "/help：打开本帮助面板。",
+    "输入：Enter 提交；Shift+Enter 或 Ctrl+J 换行；输入 / 或点击 ＋ 打开命令选择；选择命令后再按 Enter 执行；Ctrl+Shift+C 复制安全对话记录。",
+    "安全：读取、补丁、pytest 和只读 Git 在项目边界内自动执行；删除始终逐次请求批准；非交互终端会安全停止，不会代替你批准。",
 )
 
 
 _NO_ARGUMENT_COMMANDS = frozenset(
     {
-        "/new", "/clear", "/history", "/conversations", "/exit", "/credentials",
+        "/new", "/delete", "/conversations", "/exit", "/credentials",
         "/help", "/model", "/effort", "/stop", "/tests", "/diff", "/permissions",
-        "/memory", "/doctor",
+        "/doctor",
     }
 )
 
@@ -67,32 +85,89 @@ class TranscriptPresenter:
     """Project continuous-session events to text safe for a transcript."""
 
     _assistant_text: dict[UUID, str] = field(default_factory=dict)
+    _read_batch_item_id: UUID | None = None
+    _read_paths: list[str] = field(default_factory=list)
 
     def present(self, event: SessionEvent) -> TranscriptUpdate | None:
         """Return the visible update for one event without exposing tool payloads."""
         if event.kind == "user_message":
+            self._finish_read_batch()
             return TranscriptUpdate(event.item_id, f"› {event.text}")
         if event.kind == "assistant_text_delta":
+            self._finish_read_batch()
             if event.item_id is None:
                 return None
             text = self._assistant_text.get(event.item_id, "") + event.text
             self._assistant_text[event.item_id] = text
             return TranscriptUpdate(event.item_id, text, replace=True)
+        if event.kind == "assistant_item_completed":
+            self._finish_read_batch()
+            if event.item_id is None:
+                return None
+            text = self._assistant_text.get(event.item_id)
+            return None if text is None else TranscriptUpdate(
+                event.item_id, _display_assistant_text(text), replace=True
+            )
+        if event.data.get("tool") == "read_file":
+            return self._present_read(event)
+        self._finish_read_batch()
         status = safe_event_message(event)
         if status is None:
             return None
         return TranscriptUpdate(event.item_id, status)
 
+    def _present_read(self, event: SessionEvent) -> TranscriptUpdate | None:
+        if event.kind == "tool_item_started":
+            if self._read_batch_item_id is None:
+                self._read_batch_item_id = event.item_id
+                return TranscriptUpdate(event.item_id, "正在查看项目文件…")
+            return None
+        if event.kind != "tool_item_completed" or event.data.get("code") != "ok":
+            self._finish_read_batch()
+            status = safe_event_message(event)
+            return None if status is None else TranscriptUpdate(event.item_id, status)
+        path = event.data.get("path")
+        if isinstance(path, str) and path not in self._read_paths:
+            self._read_paths.append(path)
+        batch_id = self._read_batch_item_id or event.item_id
+        count = len(self._read_paths)
+        preview = "、".join(self._read_paths[:3])
+        if count > 3:
+            preview += " 等"
+        return TranscriptUpdate(batch_id, f"已查看 {count} 个文件：{preview}。", replace=True)
 
-class TranscriptLog(Log):
-    """Selectable log that preserves one fixed safe UI projection per line."""
+    def _finish_read_batch(self) -> None:
+        self._read_batch_item_id = None
+        self._read_paths.clear()
+
+
+def _display_assistant_text(text: str) -> str:
+    """Keep completed assistant prose compact without rendering provider Markdown."""
+    text = text.replace("\r\n", "\n")
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+class TranscriptLog(TextArea):
+    """Read-only, soft-wrapping transcript with native mouse selection."""
 
     def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            "", *args, **kwargs, language=None, soft_wrap=True, read_only=True,
+            show_cursor=False, show_line_numbers=False, highlight_cursor_line=False,
+        )
         self._continuous_entries: list[tuple[UUID | None, str]] = []
 
+    @property
+    def text_entries(self) -> tuple[str, ...]:
+        """Safe source text used by the transcript copy shortcut and UI tests."""
+        return tuple(text for _item_id, text in self._continuous_entries)
+
     def write(self, data: str, scroll_end: bool | None = None) -> "TranscriptLog":
-        super().write(f"{data}\n", scroll_end=scroll_end)
+        self._continuous_entries.append((None, str(data).rstrip("\n")))
+        self._render_entries()
         return self
 
     def apply_update(self, update: TranscriptUpdate) -> None:
@@ -105,15 +180,19 @@ class TranscriptLog(Log):
             else:
                 self._continuous_entries.append((update.item_id, update.text))
         else:
+            if update.text.startswith("› ") and self._continuous_entries and self._continuous_entries[-1][1]:
+                self._continuous_entries.append((None, ""))
             self._continuous_entries.append((update.item_id, update.text))
-        self.clear()
-        for _item_id, text in self._continuous_entries:
-            self.write(text)
+        self._render_entries()
+
+    def _render_entries(self) -> None:
+        self.load_text("\n".join(text for _item_id, text in self._continuous_entries))
+        self.scroll_end(animate=False)
 
     def reset_continuous(self) -> None:
         """Discard the current session's rendered event projection."""
         self._continuous_entries.clear()
-        self.clear()
+        self.load_text("")
 
 
 class Composer(TextArea):
@@ -141,6 +220,18 @@ class Composer(TextArea):
             event.stop()
 
 
+class DemoRequest(Static):
+    """An intentionally non-editable request that owns demo shortcuts."""
+
+    can_focus = True
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key in {"up", "down", "j", "k", "enter", "escape"}:
+            event.prevent_default()
+            event.stop()
+            self.app._demo_key(event.key)
+
+
 class SettingsScreen(ModalScreen[str | None]):
     """Choose a validated future-task setting with keyboard or mouse."""
 
@@ -157,9 +248,9 @@ class SettingsScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static("选择模型" if self._field == "model" else "选择推理强度"),
+            Static("选择模型" if self._field.endswith("model") else "选择推理强度"),
             ListView(
-                *(ListItem(Static(value), id=f"setting-{value}") for value in self._values),
+                *(ListItem(Static(value), id=f"setting-{value.lower().replace(' ', '-')}") for value in self._values),
                 id="settings-picker",
             ),
             id="settings-modal",
@@ -178,12 +269,11 @@ class HelpScreen(ModalScreen[None]):
     """Scrollable safe help, kept outside the task transcript."""
 
     def compose(self) -> ComposeResult:
-        yield Vertical(Log(id="help-content", highlight=False), Button("关闭", id="help-close"), id="help-modal")
-
-    def on_mount(self) -> None:
-        content = self.query_one("#help-content", Log)
-        for line in _HELP_LINES:
-            content.write(line)
+        yield Vertical(
+            Static("\n\n".join(_HELP_LINES), id="help-content"),
+            Button("关闭", id="help-close"),
+            id="help-modal",
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None)
@@ -337,16 +427,21 @@ class GuardedPyApp(App[None]):
     CSS = """
     #status { height: 1; padding: 0 1; background: $panel; }
     #transcript-shell { height: 1fr; border: round $primary; }
-    #transcript { height: 1fr; }
-    #composer-shell { height: 6; layers: composer controls; }
-    #composer { height: 6; border: round $accent; padding: 0 35 2 0; layer: composer; }
-    #composer-controls { height: 2; layer: controls; dock: bottom; align: right middle; }
-    #mode-picker, #mode-chip, #composer-model, #composer-effort, #send { height: 1; color: $text-muted; }
-    #mode-picker { width: 3; }
+    #transcript { height: 1fr; overflow-x: hidden; overflow-y: scroll; }
+    #composer-shell { height: 7; border: round $accent; }
+    #composer { height: 1fr; border: none; padding: 0 1; }
+    #composer-controls { height: 1; align: left middle; }
+    #mode-picker, #mode-chip, #composer-model, #composer-effort, #send { height: 1; min-height: 1; color: $text-muted; }
+    #mode-picker, #send { background: transparent; border: none; padding: 0 1; }
+    #composer-model, #composer-effort { background: transparent; border: none; padding: 0 2; }
+    #mode-picker { width: 7; min-width: 7; }
     #mode-chip { width: auto; }
-    #composer-model, #composer-effort { width: auto; }
-    #send { width: 8; }
+    #composer-controls-spacer { width: 1fr; }
+    #composer-model, #composer-effort { width: auto; min-width: 0; }
+    #send { width: 12; min-width: 12; }
     #command-palette { display: none; height: auto; max-height: 12; border: round $secondary; }
+    #help-modal { width: 88; max-height: 1fr; }
+    #help-content { height: 1fr; overflow-y: auto; padding: 1 2; }
     """
 
     def __init__(
@@ -374,7 +469,7 @@ class GuardedPyApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Static(self._status_text(), id="status")
         yield Vertical(
-            TranscriptLog(id="transcript", highlight=False),
+            TranscriptLog(id="transcript"),
             id="transcript-shell",
         )
         yield ListView(
@@ -384,11 +479,12 @@ class GuardedPyApp(App[None]):
         yield Vertical(
             Composer(id="composer"),
             Horizontal(
-                Button("＋", id="mode-picker"),
+                Button(Text("[+]", no_wrap=True), id="mode-picker"),
                 Static("", id="mode-chip"),
+                Static("", id="composer-controls-spacer"),
                 Button(self.runtime.config.model, id="composer-model"),
                 Button(self.runtime.config.reasoning_effort, id="composer-effort"),
-                Button("发送", id="send", disabled=True),
+                Button(Text("[发送]", no_wrap=True), id="send", disabled=True),
                 id="composer-controls",
             ),
             id="composer-shell",
@@ -398,6 +494,15 @@ class GuardedPyApp(App[None]):
         self._refresh_composer_controls()
         if self.initial_task:
             self.call_after_refresh(self.submit, self.initial_task)
+            return
+        store = getattr(self._conversation_runtime, "store", None)
+        if store is None:
+            return
+        summaries = store.summaries()
+        if summaries:
+            self.call_after_refresh(self._conversation_selected, summaries[-1].id)
+        else:
+            self.call_after_refresh(self._new_conversation)
 
     def on_unmount(self) -> None:
         """Interrupt an active continuous turn before releasing the runtime lease."""
@@ -602,8 +707,17 @@ class GuardedPyApp(App[None]):
         if name not in COMMANDS or (name in _NO_ARGUMENT_COMMANDS and argument):
             self._write("未知命令。")
             return
-        if name == "/clear":
-            self.query_one("#transcript", TranscriptLog).reset_continuous()
+        if name == "/delete":
+            if self._continuous_session_id is None:
+                self._write("没有可删除的会话。")
+            elif self._continuous_turn_id is not None:
+                self._write("请先停止当前会话后再删除。")
+            else:
+                replacement = self._conversation_runtime.delete_session(self._continuous_session_id)
+                if replacement is None:
+                    self._write("至少保留一条会话，无法删除。")
+                else:
+                    self._conversation_selected(replacement.id)
             return
         if name == "/new":
             if self._continuous_turn_id is None:
@@ -617,22 +731,6 @@ class GuardedPyApp(App[None]):
                 self.push_screen(ConversationScreen(conversations), self._conversation_selected)
             else:
                 self._write("会话：0")
-            return
-        if name == "/history":
-            if self._continuous_session_id is None:
-                self._write("会话：0")
-            else:
-                self._render_summary(self._conversation_runtime.summary(self._continuous_session_id))
-            return
-        if name == "/memory":
-            if self._continuous_session_id is None:
-                self._write("暂无安全摘要")
-            else:
-                summary = self._conversation_runtime.summary(self._continuous_session_id)
-                if summary.turns:
-                    self._render_summary(summary)
-                else:
-                    self._write("暂无安全摘要")
             return
         if name == "/permissions":
             self._write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。")
@@ -802,6 +900,12 @@ class GuardedPyApp(App[None]):
         composer.cursor_location = composer.document.end
 
     def _render_summary(self, summary: Any) -> None:
+        if summary.transcript:
+            transcript = self.query_one("#transcript", TranscriptLog)
+            for index, entry in enumerate(summary.transcript, start=1):
+                text = f"› {entry.text}" if entry.role == "user" else _display_assistant_text(entry.text)
+                transcript.apply_update(TranscriptUpdate(UUID(int=index), text))
+            return
         for index, turn in enumerate(summary.turns, start=1):
             if turn.final_text:
                 self.query_one("#transcript", TranscriptLog).apply_update(
@@ -816,11 +920,11 @@ class GuardedPyApp(App[None]):
                 self._present_session_event(SessionEvent(summary.id, UUID(int=0), 0, terminal))
 
     def _write(self, value: object) -> None:
-        self.query_one("#transcript", Log).write(str(value))
+        self.query_one("#transcript", TranscriptLog).write(str(value))
 
     def action_copy_transcript(self) -> None:
         transcript = self.query_one("#transcript", TranscriptLog)
-        self.copy_to_clipboard("\n".join(transcript.lines).rstrip("\n"))
+        self.copy_to_clipboard("\n".join(transcript.text_entries))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "mode-picker":
@@ -861,33 +965,208 @@ class GuardedPyApp(App[None]):
         self._accept_palette_item(event.item)
 
 
+class DemoEventReceived(Message):
+    """Deliver an event from the offline scenario worker to the demo surface."""
+
+    def __init__(self, event: SessionEvent) -> None:
+        self.event = event
+        super().__init__()
+
+
+class DemoFinished(Message):
+    """Finish a visual replay after its actual mock scenario returns."""
+
+    def __init__(self, result: ScenarioResult | None) -> None:
+        self.result = result
+        super().__init__()
+
+
+@dataclass
+class DemoApprovalRequest:
+    """Carry one visual approval decision back to the paused mock turn."""
+
+    event: SessionEvent
+    resolved: ThreadEvent = field(default_factory=ThreadEvent)
+    accepted: bool = False
+
+
+class DemoApprovalRequested(Message):
+    """Ask the demo surface for a decision on its actual pending approval."""
+
+    def __init__(self, request: DemoApprovalRequest) -> None:
+        self.request = request
+        super().__init__()
+
+
 class DemoApp(App[None]):
-    """Offline, fixed-scenario Textual mechanism demonstration."""
+    """Offline, fixed-scenario replay in the normal GuardedPy TUI shell."""
+
+    CSS = GuardedPyApp.CSS + """
+    #demo-statusbar { height: 1; background: $panel; }
+    #demo-statusbar #status { width: 1fr; background: transparent; }
+    #demo-hint { width: auto; min-width: 0; height: 1; color: $text-muted; padding: 0 1; }
+    #send { width: 12; min-width: 12; }
+    #composer-model, #composer-effort { padding: 0 1; }
+    """
 
     _scenarios: tuple[ScenarioName, ...] = (
-        "delete_approval_rejected",
+        "delete_requires_approval",
         "feedback_repair",
         "stale_approval_denied",
     )
-    _requests = {
-        "delete_approval_rejected": "Reject an exact deletion approval.",
-        "feedback_repair": "Correct the selected assertion failure.",
-        "stale_approval_denied": "Reject a forged or stale approval identifier.",
-    }
+    _event_presentation_delay_seconds = 0.12
 
     def __init__(self) -> None:
         super().__init__()
         self._index = 0
+        self._scenario_running = False
+        self._presenter = TranscriptPresenter()
+        self._model = "Mock LLM1"
+        self._effort = "high"
 
     def compose(self) -> ComposeResult:
-        yield Static("选择机制演示，按 Enter 运行。", id="demo-title")
-        yield Static(self._requests[self._scenarios[self._index]], id="demo-request")
-        yield RichLog(id="demo-transcript", wrap=True, highlight=False, markup=False)
+        yield Horizontal(
+            Static(self._status_text(), id="status"),
+            Static("按↑↓来切换场景", id="demo-hint"),
+            id="demo-statusbar",
+        )
+        yield Vertical(TranscriptLog(id="transcript"), id="transcript-shell")
+        yield ListView(
+            *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}") for command in COMMANDS),
+            id="command-palette",
+        )
+        yield Vertical(
+            DemoRequest(scenario_request(self._selected()), id="composer"),
+            Horizontal(
+                Button(Text("[+]", no_wrap=True), id="mode-picker"),
+                Static("", id="composer-controls-spacer"),
+                Button(self._model, id="composer-model"),
+                Button(self._effort, id="composer-effort"),
+                Button(Text("[发送]", no_wrap=True), id="send"),
+                id="composer-controls",
+            ),
+            id="composer-shell",
+        )
 
-    def on_key(self, event: Any) -> None:
-        if event.key in {"down", "j"}:
+    def on_mount(self) -> None:
+        self.query_one("#composer", DemoRequest).focus()
+        self._refresh_request()
+
+    def _selected(self) -> ScenarioName:
+        return self._scenarios[self._index]
+
+    def _demo_key(self, key: str) -> None:
+        if key == "escape":
+            self.exit()
+            return
+        if self._scenario_running:
+            return
+        if key in {"down", "j"}:
             self._index = (self._index + 1) % len(self._scenarios)
-            self.query_one("#demo-request", Static).update(self._requests[self._scenarios[self._index]])
-        elif event.key == "enter":
-            result = run_scenario(self._scenarios[self._index])
-            self.query_one("#demo-transcript", RichLog).write(f"{result.name} status={result.status}")
+            self._refresh_request()
+        elif key in {"up", "k"}:
+            self._index = (self._index - 1) % len(self._scenarios)
+            self._refresh_request()
+        elif key == "enter":
+            self._start_scenario()
+
+    def _refresh_request(self) -> None:
+        scenario = self._selected()
+        self.query_one("#composer", DemoRequest).update(scenario_request(scenario))
+
+    def _open_command_palette(self) -> None:
+        palette = self.query_one("#command-palette", ListView)
+        palette.display = True
+        palette.index = 0
+        palette.focus()
+
+    def _start_scenario(self) -> None:
+        self._scenario_running = True
+        self._presenter = TranscriptPresenter()
+        self.query_one("#transcript", TranscriptLog).reset_continuous()
+        self.query_one("#status", Static).update(self._status_text())
+        scenario = self._selected()
+        Thread(target=self._run_scenario, args=(scenario,), daemon=True).start()
+
+    def _run_scenario(self, scenario: ScenarioName) -> None:
+        try:
+            result = run_scenario(
+                scenario, on_event=self._post_demo_event, approval_resolver=self._request_demo_approval
+            )
+        except Exception:
+            self.post_message(DemoFinished(None))
+        else:
+            self.post_message(DemoFinished(result))
+
+    def _post_demo_event(self, event: SessionEvent) -> None:
+        """Pace the visual replay without changing the mock core's event order."""
+        self.post_message(DemoEventReceived(event))
+        sleep(self._event_presentation_delay_seconds)
+
+    def _request_demo_approval(self, event: SessionEvent) -> bool:
+        request = DemoApprovalRequest(event)
+        self.post_message(DemoApprovalRequested(request))
+        request.resolved.wait()
+        return request.accepted
+
+    def on_demo_event_received(self, message: DemoEventReceived) -> None:
+        update = self._presenter.present(message.event)
+        if update is not None:
+            self.query_one("#transcript", TranscriptLog).apply_update(update)
+
+    def on_demo_approval_requested(self, message: DemoApprovalRequested) -> None:
+        event = message.request.event
+        path = event.data.get("path", "项目路径")
+        self.push_screen(
+            ApprovalScreen(f"删除 {path}", "demo.delete.approval", False),
+            lambda decision: self._resolve_demo_approval(message.request, decision),
+        )
+
+    def _resolve_demo_approval(
+        self, request: DemoApprovalRequest, decision: str | None
+    ) -> None:
+        request.accepted = decision == "once"
+        request.resolved.set()
+
+    def on_demo_finished(self, message: DemoFinished) -> None:
+        self._scenario_running = False
+        if message.result is None:
+            self.query_one("#transcript", TranscriptLog).write("演示未完成。")
+            return
+        self.query_one("#status", Static).update(self._status_text())
+
+    def _status_text(self) -> str:
+        return "项目：机制演示临时项目"
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "mode-picker":
+            self._open_command_palette()
+        elif event.button.id == "composer-model":
+            self._open_demo_settings("model", ("Mock LLM1", "Mock LLM2"))
+        elif event.button.id == "composer-effort":
+            self._open_demo_settings("effort", ("high", "max"))
+        elif event.button.id == "send":
+            self._start_scenario()
+
+    def _open_demo_settings(self, field: Literal["model", "effort"], values: tuple[str, ...]) -> None:
+        current = self._model if field == "model" else self._effort
+        self.push_screen(
+            SettingsScreen(f"demo_{field}", values, current),
+            lambda value: self._demo_setting_resolved(field, value),
+        )
+
+    def _demo_setting_resolved(self, field: Literal["model", "effort"], value: str | None) -> None:
+        if value is None:
+            return
+        if field == "model":
+            self._model = value
+        else:
+            self._effort = value
+        self.query_one(f"#composer-{field}", Button).label = value
+        self.query_one("#composer", DemoRequest).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "command-palette":
+            return
+        event.list_view.display = False
+        self.query_one("#composer", DemoRequest).focus()

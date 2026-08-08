@@ -9,18 +9,32 @@ from guardedpy.credentials import CredentialBackendUnavailableError
 
 
 COMMANDS = (
-    "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
-    "/tests", "/diff", "/permissions", "/credentials", "/memory", "/model", "/effort",
+    "/conversations", "/new", "/delete", "/exit", "/plan", "/review",
+    "/tests", "/diff", "/permissions", "/credentials", "/model", "/effort",
     "/doctor", "/goal", "/help", "/stop", "/queue",
 )
 
 
 def render_help() -> tuple[str, ...]:
     return (
-        "会话与对话：/history /conversations /new /clear /exit",
-        "任务：直接输入任务；/plan <任务>；/review <路径>；/stop；/queue <任务>",
-        "检查与安全：/tests /diff /permissions /memory /doctor /credentials",
-        "设置：/model /effort /goal",
+        "直接输入：与 Agent 对话，或描述要检查、修复、实现的项目任务。",
+        "/new：新建会话。",
+        "/conversations：列出已保存会话。",
+        "/delete：仅交互终端支持删除当前会话。",
+        "/exit：退出 GuardedPy。",
+        "/plan <任务>：只读制定计划。",
+        "/review <路径>：只读审查。",
+        "/goal <目标>：仅交互终端支持的一回合目标。",
+        "/stop：非交互终端没有可中断的活跃回合。",
+        "/queue <任务>：非交互终端不支持排队。",
+        "/tests：运行配置的 pytest。",
+        "/diff：查看当前 Git diff。",
+        "/doctor：查看本地项目状态。",
+        "/permissions：查看自动允许与须审批的操作。",
+        "/credentials：查看凭据状态；非交互终端不能录入凭据。",
+        "/model：设置后续回合模型。",
+        "/effort：设置后续回合思考强度。",
+        "/help：显示本帮助。",
         "非交互模式不能录入凭据或批准危险操作。",
     )
 
@@ -86,11 +100,8 @@ def _local_command(
     if name == "/new" and not argument:
         output.write("已新建会话。\n")
         return True, runtime.create_session(project_title), 0
-    if name == "/clear" and not argument:
-        output.write("已清屏。\n")
-        return True, session_id, 0
-    if name == "/history" and not argument:
-        _render_summary(runtime.summary(session_id), output)
+    if name == "/delete" and not argument:
+        output.write("删除会话仅支持交互终端。\n")
         return True, session_id, 0
     if name == "/conversations" and not argument:
         summaries = runtime.store.summaries()
@@ -100,13 +111,6 @@ def _local_command(
         return True, session_id, 0
     if name == "/permissions" and not argument:
         output.write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。\n")
-        return True, session_id, 0
-    if name == "/memory" and not argument:
-        summary = runtime.summary(session_id)
-        if not summary.turns:
-            output.write("暂无安全摘要\n")
-        else:
-            _render_summary(summary, output)
         return True, session_id, 0
     if name in {"/stop", "/queue"}:
         output.write("非交互模式没有可控制的活跃回合。\n")
@@ -149,11 +153,7 @@ def _render_summary(summary: Any, output: TextIO) -> None:
     for turn in summary.turns:
         if turn.final_text:
             output.write(f"{turn.final_text}\n")
-        status = {
-            "completed": "本轮回复已完成。",
-            "interrupted": "本轮回复已中断。",
-            "failed": "本轮回复未完成。",
-        }.get(turn.terminal_status)
+        status = {"interrupted": "本轮回复已中断。"}.get(turn.terminal_status)
         if status is not None:
             output.write(f"{status}\n")
 

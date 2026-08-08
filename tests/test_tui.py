@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from textual.css.query import NoMatches
-from textual.widgets import Button, Input, Log, Static
+from textual.widgets import Button, Input, Static, TextArea
 
 from guardedpy.config import HarnessConfig
 from guardedpy.credentials import CredentialStatus
@@ -50,8 +50,14 @@ def _profile(tmp_path: Path) -> ProjectProfile:
     return discover_project(tmp_path)
 
 
+def _transcript_lines(app: object) -> tuple[str, ...]:
+    from guardedpy.tui import TranscriptLog
+
+    return app.query_one("#transcript", TranscriptLog).text_entries  # type: ignore[attr-defined]
+
+
 def test_composer_keeps_enter_submit_multiline_and_command_palette(tmp_path: Path) -> None:
-    from guardedpy.tui import COMMANDS, Composer, GuardedPyApp
+    from guardedpy.tui import COMMANDS, Composer, GuardedPyApp, _HELP_LINES
 
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
@@ -61,7 +67,8 @@ def test_composer_keeps_enter_submit_multiline_and_command_palette(tmp_path: Pat
             composer = app.query_one("#composer", Composer)
             await pilot.click("#composer")
             await pilot.press(*"/help", "enter")
-            assert "会话：/new" in "\n".join(app.screen.query_one("#help-content", Log).lines)
+            help_content = app.screen.query_one("#help-content", Static)
+            assert str(help_content.render()) == "\n\n".join(_HELP_LINES)
             await pilot.click("#help-close")
             await pilot.click("#composer")
             await pilot.press("shift+enter")
@@ -75,17 +82,37 @@ def test_composer_keeps_enter_submit_multiline_and_command_palette(tmp_path: Pat
                 item.query_one(Static).render()
                 for item in app.query("#command-palette ListItem")
                 if item.display
-            ] == ["/history", "/help"]
-            await pilot.click("#command-history")
-            assert composer.text == "/history"
+            ] == ["/help"]
+            await pilot.click("#command-help")
+            assert composer.text == "/help"
             await pilot.click("#mode-picker")
             assert composer.text == "/"
             assert app.query_one("#command-palette").display is True
+            assert str(app.query_one("#mode-picker", Button).label) == "[+]"
+            assert str(app.query_one("#send", Button).label) == "[发送]"
             assert tuple(COMMANDS) == (
-                "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
-                "/tests", "/diff", "/permissions", "/credentials", "/memory", "/model", "/effort",
+                "/conversations", "/new", "/delete", "/exit", "/plan", "/review",
+                "/tests", "/diff", "/permissions", "/credentials", "/model", "/effort",
                 "/doctor", "/goal", "/help", "/stop", "/queue",
             )
+
+    asyncio.run(check())
+
+
+def test_composer_layout_keeps_status_left_and_reserves_no_right_input_gutter(tmp_path: Path) -> None:
+    from guardedpy.tui import Composer, GuardedPyApp
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test(size=(120, 24)) as pilot:
+            composer = app.query_one("#composer", Composer)
+            plus = app.query_one("#mode-picker", Button)
+            model = app.query_one("#composer-model", Button)
+            await pilot.pause()
+            assert plus.region.x < app.size.width // 2 < model.region.x
+            assert composer.styles.padding.right == 1
 
     asyncio.run(check())
 
@@ -178,7 +205,7 @@ def test_first_request_resumes_after_masked_credential_entry(tmp_path: Path) -> 
             await pilot.pause()
             await app.workers.wait_for_complete()
             assert runtime.configured is True
-            assert "› hello" in app.query_one("#transcript", Log).lines
+            assert "› hello" in _transcript_lines(app)
 
     asyncio.run(check())
 
@@ -201,7 +228,7 @@ def test_first_request_explains_an_unavailable_keyring_without_starting_a_turn(t
             assert "安全系统密钥环" in str(
                 app.screen.query_one("#credential-backend-unavailable").render()
             )
-            assert "无法启动会话。" not in app.query_one("#transcript", Log).lines
+            assert "无法启动会话。" not in _transcript_lines(app)
 
     asyncio.run(check())
 
@@ -254,7 +281,7 @@ def test_transcript_presenter_projects_a_governed_tool_target_without_tool_paylo
 
     update = presenter.present(event)
 
-    assert update is not None and update.text == "正在读取 src/calc.py。"
+    assert update is not None and update.text == "正在查看项目文件…"
 
 
 def test_transcript_presenter_explains_safe_tool_completion_and_denial() -> None:
@@ -271,9 +298,130 @@ def test_transcript_presenter_explains_safe_tool_completion_and_denial() -> None
         session_id, turn_id, 2, "tool_item_completed", uuid4(),
         data={"tool": "apply_patch", "code": "read_required", "verdict": "deny"},
     ))
+    missing = presenter.present(SessionEvent(
+        session_id, turn_id, 3, "tool_item_completed", uuid4(),
+        data={"tool": "apply_patch", "code": "read_required", "missing_paths": '["src/calc.py"]'},
+    ))
+    program = presenter.present(SessionEvent(
+        session_id, turn_id, 4, "tool_item_completed", uuid4(),
+        data={"tool": "run_python", "code": "ok", "program_output": "hello world\n"},
+    ))
+    failed = presenter.present(SessionEvent(session_id, turn_id, 5, "turn_failed"))
 
-    assert read is not None and read.text == "已读取 src/calc.py。"
+    assert read is not None and read.text == "已查看 1 个文件：src/calc.py。"
     assert denied is not None and denied.text == "无法修改：需先完整读取目标文件。"
+    assert missing is not None and missing.text == "无法修改：需先完整读取 src/calc.py。"
+    assert program is not None and program.text == "程序输出：\nhello world"
+    assert failed is None
+
+
+def test_transcript_presenter_groups_reads_flattens_finished_markdown_and_hides_success_terminal() -> None:
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import TranscriptPresenter
+
+    presenter = TranscriptPresenter()
+    session_id, turn_id = uuid4(), uuid4()
+    first_read, second_read, assistant = uuid4(), uuid4(), uuid4()
+
+    start = presenter.present(SessionEvent(
+        session_id, turn_id, 1, "tool_item_started", first_read, data={"tool": "read_file", "path": "src/a.py"},
+    ))
+    first_done = presenter.present(SessionEvent(
+        session_id, turn_id, 2, "tool_item_completed", first_read, data={"tool": "read_file", "path": "src/a.py", "code": "ok"},
+    ))
+    presenter.present(SessionEvent(
+        session_id, turn_id, 3, "tool_item_started", second_read, data={"tool": "read_file", "path": "src/b.py"},
+    ))
+    second_done = presenter.present(SessionEvent(
+        session_id, turn_id, 4, "tool_item_completed", second_read, data={"tool": "read_file", "path": "src/b.py", "code": "ok"},
+    ))
+    presenter.present(SessionEvent(session_id, turn_id, 5, "assistant_text_delta", assistant, "## 结果\\n**已修复**"))
+    formatted = presenter.present(SessionEvent(session_id, turn_id, 6, "assistant_item_completed", assistant))
+    completed = presenter.present(SessionEvent(session_id, turn_id, 7, "turn_completed"))
+
+    assert start is not None and start.text == "正在查看项目文件…"
+    assert first_done is not None and first_done.replace is True
+    assert first_done.text == "已查看 1 个文件：src/a.py。"
+    assert second_done is not None and second_done.replace is True
+    assert second_done.text == "已查看 2 个文件：src/a.py、src/b.py。"
+    assert formatted is not None and formatted.replace is True and formatted.text == "结果\\n已修复"
+    assert completed is None
+
+
+def test_transcript_inserts_one_blank_line_before_a_later_user_turn(tmp_path: Path) -> None:
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import GuardedPyApp
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+    session_id, turn_id = uuid4(), uuid4()
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app._present_session_event(SessionEvent(session_id, turn_id, 1, "assistant_text_delta", uuid4(), "已修复。"))
+            app._present_session_event(SessionEvent(session_id, uuid4(), 1, "user_message", uuid4(), "继续扩展"))
+            await pilot.pause()
+            assert _transcript_lines(app) == ("已修复。", "", "› 继续扩展")
+
+    asyncio.run(check())
+
+
+def test_transcript_is_read_only_selectable_text(tmp_path: Path) -> None:
+    from guardedpy.tui import GuardedPyApp, TranscriptLog
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            transcript = app.query_one("#transcript", TranscriptLog)
+            transcript.write("Agent 的安全回复。")
+            await pilot.pause()
+            assert transcript.read_only is True
+            assert transcript.soft_wrap is True
+            transcript.select_all()
+            assert transcript.selected_text == "Agent 的安全回复。"
+
+    asyncio.run(check())
+
+
+def test_tui_reopens_the_most_recent_saved_conversation_on_startup(tmp_path: Path) -> None:
+    from guardedpy.conversation import ConversationSummary, VisibleTranscriptEntry
+    from guardedpy.tui import GuardedPyApp
+
+    profile = _profile(tmp_path)
+    session_id = uuid4()
+    now = datetime.now(timezone.utc)
+    summary = ConversationSummary(
+        id=session_id, project_title=str(profile.root), created_at=now, updated_at=now,
+        transcript=(VisibleTranscriptEntry(role="user", text="上次的问题"),), turns=(),
+    )
+
+    class Store:
+        def summaries(self) -> tuple[object, ...]:
+            return (summary,)
+
+    class Conversation:
+        store = Store()
+
+        def create_session(self, title: str, selected: UUID | None = None) -> UUID:
+            assert title == str(profile.root)
+            assert selected == session_id
+            return session_id
+
+        def summary(self, received: UUID) -> object:
+            assert received == session_id
+            return summary
+
+    app = GuardedPyApp(_Runtime(profile), profile, conversation=Conversation())
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._continuous_session_id == session_id
+            assert _transcript_lines(app) == ("› 上次的问题",)
+
+    asyncio.run(check())
 
 
 def test_tui_can_copy_the_safe_transcript_with_a_shortcut(tmp_path: Path) -> None:
@@ -287,6 +435,70 @@ def test_tui_can_copy_the_safe_transcript_with_a_shortcut(tmp_path: Path) -> Non
             app._write("可复制的安全记录")
             await pilot.press("ctrl+shift+c")
             assert app.clipboard == "可复制的安全记录"
+
+    asyncio.run(check())
+
+
+def test_demo_surface_offers_only_a_read_only_fixed_mock_request() -> None:
+    from guardedpy.mechanism_demo import scenario_request
+    from guardedpy.tui import DemoApp, DemoRequest
+
+    app = DemoApp()
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            request = app.query_one("#composer", DemoRequest)
+            assert str(request.render()) == scenario_request("delete_requires_approval")
+            assert str(app.query_one("#mode-picker", Button).label) == "[+]"
+            assert str(app.query_one("#send", Button).label) == "[发送]"
+            assert str(app.query_one("#demo-hint", Static).render()) == "按↑↓来切换场景"
+            assert str(app.query_one("#status", Static).render()) == "项目：机制演示临时项目"
+            assert str(app.query_one("#composer-model", Button).label) == "Mock LLM1"
+            assert str(app.query_one("#composer-effort", Button).label) == "high"
+            await pilot.click("#composer-model")
+            await pilot.click("#setting-mock-llm2")
+            assert str(app.query_one("#composer-model", Button).label) == "Mock LLM2"
+            await pilot.click("#composer-effort")
+            await pilot.click("#setting-max")
+            assert str(app.query_one("#composer-effort", Button).label) == "max"
+            await pilot.click("#mode-picker")
+            assert app.query_one("#command-palette").display is True
+            await pilot.click("#command-conversations")
+            await pilot.pause()
+            assert app.query_one("#command-palette").display is False
+            assert str(request.render()) == scenario_request("delete_requires_approval")
+            await pilot.press("down")
+            assert str(request.render()) == scenario_request("feedback_repair")
+
+    asyncio.run(check())
+
+
+def test_demo_surface_replays_the_governed_mock_scenario_after_enter() -> None:
+    from guardedpy.tui import ApprovalScreen, DemoApp, TranscriptLog
+
+    app = DemoApp()
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.1)
+                if isinstance(app.screen, ApprovalScreen):
+                    break
+            assert isinstance(app.screen, ApprovalScreen)
+            await pilot.pause()
+            await pilot.click("#approval-once")
+            for _ in range(20):
+                await pilot.pause(0.1)
+                if not app._scenario_running:
+                    break
+            assert app._scenario_running is False
+            lines = app.query_one("#transcript", TranscriptLog).text_entries
+            assert lines[0] == "› 删除 src/value.py。"
+            assert "需要批准：删除 src/value.py。" in lines
+            assert "审批已批准。" in lines
+            assert "已删除 src/value.py。" in lines
+            assert "已根据你的审批决定完成处理。" in lines
 
     asyncio.run(check())
 
@@ -347,12 +559,10 @@ def test_tui_renders_continuous_turns_immediately_and_streams_updates(tmp_path: 
     async def check() -> None:
         async with app.run_test() as pilot:
             app.submit("hello")
-            assert app.query_one("#transcript", Log).lines[0] == "› hello"
+            assert _transcript_lines(app)[0] == "› hello"
             await pilot.pause()
             await app.workers.wait_for_complete()
-            assert app.query_one("#transcript", Log).lines[:-1] == [
-                "› hello", "hello there", "本轮回复已完成。"
-            ]
+            assert _transcript_lines(app) == ("› hello", "hello there")
 
     asyncio.run(check())
 
@@ -454,7 +664,7 @@ def test_tui_projects_a_replayed_session_event_once(tmp_path: Path) -> None:
             app.on_session_event_received(SessionEventReceived(event))
             app.on_session_event_received(SessionEventReceived(event))
             await pilot.pause()
-            assert app.query_one("#transcript", Log).lines[:-1] == ["› hello"]
+            assert _transcript_lines(app) == ("› hello",)
 
     asyncio.run(check())
 
@@ -469,19 +679,22 @@ def test_tui_explains_that_plan_needs_a_request(tmp_path: Path) -> None:
         async with app.run_test() as pilot:
             app.submit("/plan")
             await pilot.pause()
-            assert "计划任务不能为空。" in app.query_one("#transcript", Log).lines
+            assert "计划任务不能为空。" in _transcript_lines(app)
 
     asyncio.run(check())
 
 
-def test_conversation_picker_restores_only_safe_continuous_summary(tmp_path: Path) -> None:
-    from guardedpy.conversation import ConversationSummary, SafeTurnSummary
+def test_conversation_picker_replays_the_selected_visible_transcript(tmp_path: Path) -> None:
+    from guardedpy.conversation import ConversationSummary, SafeTurnSummary, VisibleTranscriptEntry
     from guardedpy.tui import GuardedPyApp
 
     summary_id, session_id = uuid4(), uuid4()
     summary = ConversationSummary(
         id=summary_id, project_title="project", created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc), turns=(SafeTurnSummary(
+        updated_at=datetime.now(timezone.utc), transcript=(
+            VisibleTranscriptEntry(role="user", text="之前的问题"),
+            VisibleTranscriptEntry(role="assistant", text="之前的回答"),
+        ), turns=(SafeTurnSummary(
             terminal_status="completed", changed_paths=("src/private.py",), pytest_outcome="passed",
             approval_outcome="none", final_text="已完成安全摘要",
         ),),
@@ -511,9 +724,57 @@ def test_conversation_picker_restores_only_safe_continuous_summary(tmp_path: Pat
             app.submit("/conversations")
             await pilot.press("enter")
             await pilot.pause()
-            rendered = "\n".join(app.query_one("#transcript", Log).lines)
-            assert "已完成安全摘要" in rendered
-            assert "本轮回复已完成。" in rendered
-            assert "src/private.py" not in rendered
+            rendered = "\n".join(_transcript_lines(app))
+            assert "› 之前的问题" in rendered
+            assert "之前的回答" in rendered
+            assert "已完成安全摘要" not in rendered
+
+    asyncio.run(check())
+
+
+def test_delete_reopens_the_previous_conversation_and_keeps_the_last_one(tmp_path: Path) -> None:
+    from guardedpy.conversation import ConversationSummary, VisibleTranscriptEntry
+    from guardedpy.tui import GuardedPyApp
+
+    previous_id, current_id = uuid4(), uuid4()
+    now = datetime.now(timezone.utc)
+    previous = ConversationSummary(
+        id=previous_id, project_title="project", created_at=now, updated_at=now,
+        transcript=(
+            VisibleTranscriptEntry(role="user", text="previous"),
+            VisibleTranscriptEntry(role="assistant", text="answer"),
+        ), turns=(),
+    )
+
+    class Store:
+        def summaries(self) -> tuple[object, ...]:
+            return (previous,)
+
+    class Conversation:
+        store = Store()
+
+        def delete_session(self, received: UUID) -> object | None:
+            assert received == current_id
+            return previous
+
+        def create_session(self, title: str, selected: UUID | None = None) -> UUID:
+            assert title == str(profile.root)
+            assert selected == previous_id
+            return previous_id
+
+        def summary(self, received: UUID) -> object:
+            assert received == previous_id
+            return previous
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(_Runtime(profile), profile, conversation=Conversation())
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app._continuous_session_id = current_id
+            app.submit("/delete")
+            await pilot.pause()
+            assert app._continuous_session_id == previous_id
+            assert _transcript_lines(app) == ("› previous", "answer")
 
     asyncio.run(check())

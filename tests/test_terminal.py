@@ -79,35 +79,9 @@ def test_plain_conversation_keeps_help_and_settings_local() -> None:
         local_runtime=local,
     ) == 0
     rendered = output.getvalue()
-    assert "会话与对话" in rendered
+    assert "/conversations：列出已保存会话。" in rendered
     assert "凭据：未配置" in rendered
     assert local.changes == {"model": "deepseek-v4-pro"}
-
-
-def test_plain_history_uses_only_safe_summary() -> None:
-    from dataclasses import dataclass
-    from guardedpy.terminal import run_plain_conversation
-
-    @dataclass(frozen=True)
-    class Turn:
-        terminal_status: str = "completed"
-        final_text: str = "已修复。"
-
-    @dataclass(frozen=True)
-    class Summary:
-        turns: tuple[Turn, ...] = (Turn(),)
-
-    class Runtime:
-        def create_session(self, title: str) -> object:
-            return "session"
-
-        def summary(self, session: object) -> Summary:
-            assert session == "session"
-            return Summary()
-
-    output = StringIO()
-    assert run_plain_conversation(Runtime(), "project", StringIO("/history\n/exit\n"), output) == 0
-    assert output.getvalue().splitlines() == ["已修复。", "本轮回复已完成。"]
 
 
 def test_plain_local_controls_are_deterministic_and_do_not_reach_the_model() -> None:
@@ -129,11 +103,11 @@ def test_plain_local_controls_are_deterministic_and_do_not_reach_the_model() -> 
 
     output = StringIO()
     assert run_plain_conversation(
-        Runtime(), "project", StringIO("/tests\n/diff\n/permissions\n/memory\n/doctor\n/exit\n"), output,
+        Runtime(), "project", StringIO("/tests\n/diff\n/permissions\n/doctor\n/exit\n"), output,
         local_runtime=LocalRuntime(),
     ) == 0
     assert output.getvalue().splitlines() == [
         "pytest：passed", "Git diff：无变更",
         "权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。",
-        "暂无安全摘要", "诊断：凭据已配置",
+        "诊断：凭据已配置",
     ]

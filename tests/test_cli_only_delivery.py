@@ -38,7 +38,7 @@ def test_headless_mechanism_demo_has_no_web_or_provider_dependency() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.splitlines() == [
-        "delete_approval_rejected status=completed",
+        "delete_requires_approval status=completed",
         "feedback_repair status=completed",
         "stale_approval_denied status=completed",
     ]

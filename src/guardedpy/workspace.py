@@ -8,6 +8,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import sys
 import tempfile
 from typing import Any
 
@@ -18,6 +19,7 @@ from guardedpy.feedback import PytestRun
 _MAX_READ_LINES = 200
 _MAX_LISTED_FILES = 200
 _MAX_OUTPUT_CHARS = 32 * 1024
+_MAX_PROGRAM_OUTPUT_CHARS = 2_000
 _HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
 )
@@ -120,11 +122,24 @@ class Workspace:
             target = self._inside_root(file_patch.path)
             if target is None:
                 return self._outside_root()
+            if file_patch.create and not self._inside_discovered_write_directory(file_patch.path):
+                allowed = tuple(
+                    directory.as_posix()
+                    for directory in (*self.config.source_dirs, *self.config.test_dirs)
+                )
+                return ToolResult(
+                    False,
+                    "New files must be created inside discovered source or test directories: "
+                    + ", ".join(allowed),
+                    {"reason": "new_file_path_not_allowed", "allowed_directories": allowed},
+                )
             if not self._patch_target_allowed(file_patch.path, target, file_patch.create):
                 return ToolResult(False, "Patch target is not permitted", {"reason": "patch_invalid"})
             if file_patch.create:
-                if target.exists() or not target.parent.is_dir():
-                    return ToolResult(False, "Patch target cannot be created", {"reason": "invalid_patch"})
+                if target.exists():
+                    return ToolResult(False, "New file target already exists; read it before modifying", {"reason": "new_file_target_exists"})
+                if not target.parent.is_dir():
+                    return ToolResult(False, "New file parent directory does not exist", {"reason": "new_file_parent_missing"})
                 original = ""
             else:
                 if not target.is_file():
@@ -184,6 +199,55 @@ class Workspace:
             )
         return PytestRun(completed.returncode, completed.stdout, completed.stderr, False)
 
+    def run_python(self, path: PurePosixPath, argv: tuple[str, ...]) -> ToolResult:
+        """Run one contained Python program through the interpreter, never a shell."""
+        target = self._inside_root(path)
+        if target is None:
+            return self._outside_root()
+        if (
+            target.suffix != ".py"
+            or not target.is_file()
+            or target.is_symlink()
+            or self._contains_symlink(path)
+            or any(part.startswith(".") for part in path.parts)
+        ):
+            reason = "not_python_file" if target.suffix != ".py" else "not_a_file"
+            return ToolResult(False, "Program target must be a regular project Python file", {"reason": reason})
+        try:
+            completed = subprocess.run(
+                (sys.executable, str(target), *argv),
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_seconds,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            return ToolResult(
+                False,
+                "Python program timed out",
+                {
+                    "reason": "program_timeout",
+                    "output": self._program_output(error.stdout, error.stderr),
+                },
+            )
+        output = self._program_output(completed.stdout, completed.stderr)
+        if completed.returncode:
+            return ToolResult(
+                False,
+                f"Python program exited with code {completed.returncode}",
+                {"reason": "program_failed", "exit_code": completed.returncode, "output": output},
+            )
+        return ToolResult(
+            True,
+            "Python program completed",
+            {
+                "path": target.relative_to(self.root).as_posix(),
+                "output": output,
+            },
+        )
+
     def git_diff(self) -> ToolResult:
         return self._git("diff", "--")
 
@@ -225,6 +289,12 @@ class Workspace:
             return target.parent.is_dir()
         return target.is_file()
 
+    def _inside_discovered_write_directory(self, path: PurePosixPath) -> bool:
+        return any(
+            path.is_relative_to(directory)
+            for directory in (*self.config.source_dirs, *self.config.test_dirs)
+        )
+
     def _contains_symlink(self, path: PurePosixPath) -> bool:
         current = self.root
         for part in path.parts:
@@ -238,6 +308,13 @@ class Workspace:
         limited_lines = output.splitlines(keepends=True)[:200]
         result = "".join(limited_lines)
         return result.encode()[:_MAX_OUTPUT_CHARS].decode(errors="ignore")
+
+    @staticmethod
+    def _program_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+        output = "".join(
+            part for part in (Workspace._output_text(stdout), Workspace._output_text(stderr)) if part
+        )
+        return output[:_MAX_PROGRAM_OUTPUT_CHARS]
 
     @staticmethod
     def _atomic_replace(prepared: dict[Path, str]) -> bool:
@@ -328,7 +405,7 @@ class Workspace:
                 match = _HUNK_HEADER.match(lines[index].rstrip("\n"))
                 if match is None:
                     return None
-                old_start, old_count, _new_start, new_count = match.groups()
+                old_start, _old_count, _new_start, _new_count = match.groups()
                 index += 1
                 hunk_lines: list[str] = []
                 while index < len(lines):
@@ -340,13 +417,9 @@ class Workspace:
                     index += 1
                 if not hunk_lines:
                     return None
-                parsed_old_count = int(old_count) if old_count is not None else 1
-                parsed_new_count = int(new_count) if new_count is not None else 1
-                if sum(line[0] in " -" for line in hunk_lines) != parsed_old_count:
-                    return None
-                if sum(line[0] in " +" for line in hunk_lines) != parsed_new_count:
-                    return None
-                hunks.append(_Hunk(int(old_start), parsed_old_count, parsed_new_count, tuple(hunk_lines)))
+                actual_old_count = sum(line[0] in " -" for line in hunk_lines)
+                actual_new_count = sum(line[0] in " +" for line in hunk_lines)
+                hunks.append(_Hunk(int(old_start), actual_old_count, actual_new_count, tuple(hunk_lines)))
             if not hunks:
                 return None
             patches.append(_FilePatch(PurePosixPath(patch_path), create, tuple(hunks)))

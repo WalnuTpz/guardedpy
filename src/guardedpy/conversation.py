@@ -106,7 +106,12 @@ _SESSION_CONTEXT = (
     "You are GuardedPy, an interactive coding agent working in one local project. "
     "Answer ordinary conversation naturally. For coding requests, inspect the project, "
     "use the provided governed tools when evidence is needed, and report only results "
-    "actually returned by those tools. Continue the same conversation across turns."
+    "actually returned by those tools. For a new program, follow the apply_patch tool's "
+    "discovered-directory and unified-diff instructions; if no sensible allowed location is "
+    "clear, ask a concise clarification. The interface already shows governed tool progress, "
+    "so keep any final response concise plain text: state the outcome, material changes, and "
+    "verification; do not use Markdown headings, tables, or repeat the tool log. Continue the "
+    "same conversation across turns."
 )
 
 
@@ -143,6 +148,15 @@ class SafeTurnSummary(BaseModel):
     final_text: str
 
 
+class VisibleTranscriptEntry(BaseModel):
+    """One user-visible dialogue message retained for conversation resume."""
+
+    model_config = ConfigDict(frozen=True)
+
+    role: Literal["user", "assistant"]
+    text: str
+
+
 def safe_event_message(event: SessionEvent) -> str | None:
     """Project only deterministic tool facts; never render raw tool output."""
     if event.kind == "tool_output":
@@ -153,12 +167,14 @@ def safe_event_message(event: SessionEvent) -> str | None:
             "list_files": "正在列举",
             "read_file": "正在读取",
             "delete_path": "正在准备删除",
+            "run_python": "正在运行",
         }.get(event.data.get("tool"))
         if path is not None and verb is not None:
             return f"{verb} {path}。"
         return {
             "list_files": "正在列举项目文件。", "read_file": "正在读取项目文件。",
             "apply_patch": "正在应用代码补丁。", "run_pytest": "正在运行 pytest。",
+            "run_python": "正在运行 Python 程序。",
             "git_diff": "正在检查 Git diff。", "git_status": "正在检查 Git 状态。",
             "delete_path": "正在准备删除项目路径。",
         }.get(event.data.get("tool"), "正在使用受控工具。")
@@ -173,6 +189,14 @@ def safe_event_message(event: SessionEvent) -> str | None:
                 if event.data.get("tool") == "delete_path":
                     return f"已删除 {', '.join(paths)}。"
                 return f"已修改 {', '.join(paths)}。"
+        pytest_nodes = event.data.get("pytest_nodes")
+        if event.data.get("pytest_outcome") == "execution_error" and pytest_nodes:
+            try:
+                count = len(json.loads(pytest_nodes))
+            except (TypeError, json.JSONDecodeError):
+                count = 0
+            if count:
+                return f"pytest：发现 {count} 个测试失败。"
         outcome = {
             "passed": "pytest：通过。", "assertion_failure": "pytest：发现断言失败。",
             "collection_error": "pytest：收集失败。", "execution_error": "pytest：执行失败。",
@@ -181,6 +205,14 @@ def safe_event_message(event: SessionEvent) -> str | None:
         if outcome is not None:
             return outcome
         code = event.data.get("code")
+        if code == "read_required":
+            missing_paths = event.data.get("missing_paths")
+            try:
+                paths = json.loads(missing_paths) if missing_paths is not None else []
+            except (TypeError, json.JSONDecodeError):
+                paths = []
+            if isinstance(paths, list) and all(isinstance(path, str) for path in paths) and paths:
+                return f"无法修改：需先完整读取 {'、'.join(paths)}。"
         failure = {
             "patch_invalid": "补丁格式无效，未改动文件。",
             "patch_not_applied": "补丁未应用，未改动文件。",
@@ -188,33 +220,43 @@ def safe_event_message(event: SessionEvent) -> str | None:
             "stale_read": "修改未执行：目标文件已变化，请重新读取。",
             "not_a_file": "工具未执行：目标不是文件。",
             "not_a_directory": "工具未执行：目标不是目录。",
+            "new_file_path_not_allowed": "无法新建文件：请选择已发现的源码或测试目录。",
+            "new_file_target_exists": "无法新建文件：目标已存在，请先读取后再修改。",
+            "new_file_parent_missing": "无法新建文件：目标目录不存在。",
             "protected_path": "工具未执行：目标受保护。",
             "mode_read_only": "当前模式只允许读取和检查。",
             "approval_rejected": "删除已拒绝，未改动项目文件。",
             "not_executed_after_approval": "后续操作未执行。",
+            "not_python_file": "无法运行：目标不是项目内的 Python 文件。",
+            "program_timeout": "程序运行超时。",
+            "program_failed": "程序运行失败。",
         }.get(code)
         if failure is not None:
-            return failure
+            output = event.data.get("program_output")
+            return failure if not output else f"{failure}\n输出：{output.rstrip()}"
         if code == "ok":
             tool = event.data.get("tool")
             path = event.data.get("path")
             if tool == "read_file" and path is not None:
                 return f"已读取 {path}。"
+            if tool == "run_python":
+                output = event.data.get("program_output", "").rstrip()
+                return "程序已运行。" if not output else f"程序输出：\n{output}"
             return {
                 "list_files": "已列出项目文件。", "run_pytest": "pytest 已完成。",
                 "git_diff": "已检查 Git diff。", "git_status": "已检查 Git 状态。",
                 "delete_path": "已删除项目路径。",
             }.get(tool, "工具执行完成。")
-        return "工具未完成。"
+        return "工具未成功执行。"
     if event.kind == "approval_requested":
         path = event.data.get("path")
         return f"需要批准：删除 {path}。" if path is not None else "需要精确审批：删除项目路径。"
     if event.kind == "approval_resolved":
         return "审批已批准。" if event.data.get("accepted") == "true" else "审批已拒绝。"
     return {
-        "turn_completed": "本轮回复已完成。",
+        "turn_completed": None,
         "turn_interrupted": "本轮回复已中断。",
-        "turn_failed": "本轮回复未完成。",
+        "turn_failed": None,
     }.get(event.kind)
 
 
@@ -226,6 +268,7 @@ class ConversationSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     turns: tuple[SafeTurnSummary, ...]
+    transcript: tuple[VisibleTranscriptEntry, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -288,14 +331,15 @@ class ScriptedConversationModel:
     def __init__(self, responses: list[list[ModelChunk] | Exception]) -> None:
         self._responses = deque(responses)
         self.received_messages: list[tuple[ProviderMessage, ...]] = []
+        self.received_tools: list[tuple[ToolDefinition, ...]] = []
 
     def stream(
         self,
         messages: tuple[ProviderMessage, ...],
         tools: tuple[ToolDefinition, ...],
     ) -> Iterator[ModelChunk]:
-        del tools
         self.received_messages.append(messages)
+        self.received_tools.append(tools)
         if not self._responses:
             raise RuntimeError("script exhausted")
         response = self._responses.popleft()
@@ -321,9 +365,11 @@ class ConversationAgent:
         self._sessions: dict[UUID, Session] = {}
 
     def create_session(
-        self, safe_summary: ConversationSummary | None = None
+        self, safe_summary: ConversationSummary | None = None, *, session_id: UUID | None = None
     ) -> UUID:
-        session_id = uuid4()
+        session_id = uuid4() if session_id is None else session_id
+        if session_id in self._sessions:
+            raise TurnNotActiveError("session is already active")
         messages = [ProviderMessage(role="system", content=_SESSION_CONTEXT)]
         if safe_summary is not None:
             messages.append(
@@ -335,12 +381,27 @@ class ConversationAgent:
                     ),
                 )
             )
+            messages.extend(
+                ProviderMessage(role=entry.role, content=entry.text)
+                for entry in safe_summary.transcript
+            )
         self._sessions[session_id] = Session(
             id=session_id,
             provider_messages=messages,
             safe_summary=safe_summary,
         )
         return session_id
+
+    def has_session(self, session_id: UUID) -> bool:
+        """Return whether this process already owns the restored session."""
+        return session_id in self._sessions
+
+    def discard_session(self, session_id: UUID) -> None:
+        """Forget an inactive in-memory session after its persisted record is deleted."""
+        session = self._session(session_id)
+        if session.active_turn_id is not None:
+            raise TurnNotActiveError("active session cannot be discarded")
+        del self._sessions[session_id]
 
     def begin_turn(
         self, session_id: UUID, text: str, mode: TurnMode = "normal", *, goal: str | None = None
@@ -591,8 +652,15 @@ class ConversationAgent:
         }
         if execution.changed_paths:
             data["changed_paths"] = json.dumps(execution.changed_paths)
+        missing_paths = execution.provider_result.get("missing_paths")
+        if isinstance(missing_paths, list) and all(isinstance(path, str) for path in missing_paths):
+            data["missing_paths"] = json.dumps(missing_paths)
+        program_output = execution.provider_result.get("output")
+        if call.name == "run_python" and isinstance(program_output, str):
+            data["program_output"] = program_output
         if execution.feedback is not None:
             data["pytest_outcome"] = execution.feedback.kind.value
+            data["pytest_nodes"] = json.dumps(execution.feedback.node_ids)
         yield self._event(turn, "tool_item_completed", item_id=item_id, data=data)
 
     def steer(

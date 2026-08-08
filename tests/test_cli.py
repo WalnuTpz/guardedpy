@@ -77,7 +77,7 @@ def test_direct_task_discovers_cwd_and_uses_safe_non_tty_lifecycle(tmp_path: Pat
 
     assert code == 0
     assert runtime.setup_profiles[0].root == tmp_path.resolve()
-    assert output.getvalue().splitlines() == ["› inspect project", "本轮回复已完成。"]
+    assert output.getvalue().splitlines() == ["› inspect project"]
 
 
 def test_direct_task_stops_before_creation_without_a_credential(tmp_path: Path, monkeypatch: object) -> None:
@@ -101,7 +101,7 @@ def test_demo_non_tty_is_offline_and_never_composes_project_runtime(monkeypatch:
     output = StringIO()
     assert main(["demo"], runtime_factory=lambda: (_ for _ in ()).throw(AssertionError()), stdin=StringIO(), stdout=output) == 0
     assert output.getvalue().splitlines() == [
-        "delete_approval_rejected status=completed",
+        "delete_requires_approval status=completed",
         "feedback_repair status=completed",
         "stale_approval_denied status=completed",
     ]

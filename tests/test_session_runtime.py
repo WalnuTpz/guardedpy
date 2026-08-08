@@ -12,6 +12,7 @@ from guardedpy.conversation import (
     ScriptedConversationModel,
     TextDelta,
     ToolCallDelta,
+    VisibleTranscriptEntry,
 )
 from guardedpy.conversations import ConversationStore
 from guardedpy.runtime import ConversationRuntime
@@ -34,22 +35,62 @@ def test_summary_store_round_trips_only_the_safe_summary(tmp_path: Path, monkeyp
     assert ConversationStore(tmp_path / "project").load_summary(summary.id) == summary
 
 
-def test_runtime_persists_only_a_deterministic_terminal_summary(tmp_path: Path, monkeypatch: object) -> None:
+def test_runtime_persists_visible_transcript_and_resumes_the_selected_session(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
-    model = ScriptedConversationModel([[TextDelta("API_KEY=secret"), ResponseFinished("stop")]])
+    model = ScriptedConversationModel([[TextDelta("可见答复"), ResponseFinished("stop")]])
     runtime = ConversationRuntime(ConversationAgent(model), ConversationStore(tmp_path))
     session_id = runtime.create_session("demo")
-    turn_id, immediate = runtime.begin_turn(session_id, "private user text")
+    turn_id, immediate = runtime.begin_turn(session_id, "private user text API_KEY=secret")
 
     events = tuple(runtime.run_turn(session_id, turn_id))
     summary = runtime.summary(session_id)
+    restored = ConversationRuntime(ConversationAgent(ScriptedConversationModel([])), ConversationStore(tmp_path))
 
     assert immediate.kind == "user_message"
     assert events[-1].kind == "turn_completed"
     assert summary.turns[0].terminal_status == "completed"
     assert summary.turns[0].final_text == "本轮已完成。"
-    assert "private user text" not in runtime.store.database_path.read_text(errors="ignore")
+    assert summary.transcript == (
+        VisibleTranscriptEntry(role="user", text="private user text API_KEY=[已隐藏]"),
+        VisibleTranscriptEntry(role="assistant", text="可见答复"),
+    )
+    assert restored.create_session("demo", session_id) == session_id
+    assert restored.summary(session_id).transcript == summary.transcript
+    assert any(
+        message.role == "user" and message.content == "private user text API_KEY=[已隐藏]"
+        for message in restored._agent._sessions[session_id].provider_messages
+    )
+    assert "private user text" in runtime.store.database_path.read_text(errors="ignore")
     assert "API_KEY=secret" not in runtime.store.database_path.read_text(errors="ignore")
+
+
+def test_runtime_deletes_current_conversation_only_when_an_older_one_remains(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
+    runtime = ConversationRuntime(ConversationAgent(ScriptedConversationModel([])), ConversationStore(tmp_path))
+    first = runtime.create_session("demo")
+    second = runtime.create_session("demo")
+
+    replacement = runtime.delete_session(second)
+
+    assert replacement is not None and replacement.id == first
+    assert tuple(summary.id for summary in runtime.store.summaries()) == (first,)
+    assert runtime.delete_session(first) is None
+
+
+def test_runtime_reuses_a_previously_loaded_history_when_returning_after_delete(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
+    runtime = ConversationRuntime(ConversationAgent(ScriptedConversationModel([])), ConversationStore(tmp_path))
+    first = runtime.create_session("demo")
+    second = runtime.create_session("demo")
+
+    replacement = runtime.delete_session(second)
+
+    assert replacement is not None and replacement.id == first
+    assert runtime.create_session("demo", replacement.id) == first
 
 
 def test_runtime_forwards_a_one_turn_goal_to_the_agent(tmp_path: Path, monkeypatch: object) -> None:
@@ -79,7 +120,7 @@ def test_runtime_summary_maps_safe_tool_facts_from_actual_events(tmp_path: Path,
         [TextDelta("done"), ResponseFinished("stop")],
     ])
     runtime = ConversationRuntime(
-        ConversationAgent(model, governed_tool_definitions(), ToolGovernor(config), ToolExecutor(tmp_path, config)),
+        ConversationAgent(model, governed_tool_definitions(config), ToolGovernor(config), ToolExecutor(tmp_path, config)),
         ConversationStore(tmp_path),
     )
     session_id = runtime.create_session("demo")

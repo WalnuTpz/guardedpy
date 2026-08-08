@@ -48,7 +48,7 @@ def continuous_runtime(runtime: LocalRuntime, profile: Any) -> ConversationRunti
     return ConversationRuntime(
         ConversationAgent(
             model,
-            governed_tool_definitions(),
+            governed_tool_definitions(config),
             ToolGovernor(config),
             ToolExecutor(profile.root, config),
         ),

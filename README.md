@@ -1,6 +1,6 @@
 # GuardedPy
 
-GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its self-owned continuous loop keeps one session and one active turn, streams model text and governed tool status, feeds concise pytest results back to the same turn, and preserves only safe summaries across restarts. It is a CLI-only Python package: start it from the project you want to inspect or change.
+GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its self-owned continuous loop keeps one session and one active turn, streams model text and governed tool status, feeds concise pytest results back to the same turn, and restores visible user/Agent conversation plus safe tool facts across restarts. It is a CLI-only Python package: start it from the project you want to inspect or change.
 
 ## Installation
 
@@ -42,14 +42,26 @@ When stdin or stdout is redirected, GuardedPy uses a safe plain-text session. It
 The interactive command set is:
 
 ```text
-会话与对话：/history /conversations /new /clear /exit
-回合控制：/plan <任务> /review <路径> /goal <目标> /queue <任务> /stop
-本地检查与安全：/tests /diff /permissions /memory /doctor /credentials
-设置：/model /effort
-帮助：/help
+/conversations：选择并恢复历史对话
+/new：新建会话
+/delete：删除当前会话并回到上一条
+/exit：退出 GuardedPy
+/plan <任务>：只读制定计划
+/review <路径>：只读审查
+/goal <目标>：只约束下一回合
+/queue <任务>：将下一项工作排队
+/stop：中断当前回合
+/tests：运行配置的 pytest
+/diff：查看当前 Git diff
+/permissions：查看自动允许与须审批的操作
+/doctor：查看本地项目状态
+/credentials：管理 API Key
+/model：选择后续回合模型
+/effort：选择后续回合思考强度
+/help：打开完整帮助
 ```
 
-直接输入自然语言即可开始同一连续会话；不再对首条输入做 feature/bugfix/闲聊分类。`/plan <request>` 与 `/review [path]` 是只读回合；`/goal <目标>` 仅约束下一回合；`/queue` 显式排队下一回合，`/stop` 请求中断当前回合。工具失败、pytest failure 和无效 patch 都会回灌给同一回合，而不是自动取消。鼠标可以选择 transcript，`Ctrl+Shift+C` 可复制当前安全 transcript。
+直接输入自然语言即可开始同一连续会话；不再对首条输入做 feature/bugfix/闲聊分类。启动时会自动载入最近保存的会话，首次启动才新建空会话。`/plan <request>` 与 `/review [path]` 是只读回合；`/goal <目标>` 仅约束下一回合；`/queue` 显式排队下一回合，`/stop` 请求中断当前回合。工具失败、pytest failure 和无效 patch 都会回灌给同一回合，而不是自动取消。Agent 可在不经过 shell 的前提下运行项目内单个 Python 程序；网络、安装、任意命令和 Git 写入仍不可由它执行。transcript 是自动换行、仅纵向滚动的只读文本；鼠标可以选择它，`Ctrl+Shift+C` 可复制当前安全记录。`/conversations` 会重放所选历史的可见用户/Agent 对话，并以它们作为后续模型上下文；`/delete` 删除当前会话后回到上一条，最后一条不能删除。
 
 ## Credentials, model, and effort
 
@@ -75,9 +87,9 @@ guardedpy demo
 make demo
 ```
 
-Interactive `guardedpy demo` lets you select one fixed request and press Enter. `make demo` runs all three deterministic mock-LLM scenarios without interaction:
+Interactive `guardedpy demo` reuses the normal project bar, transcript, composer frame, `[+]` selector, and approval dialog. Its header shows `项目：机制演示临时项目` plus the right-aligned hint `按↑↓来切换场景`; the composer provides visual-only selectors for `Mock LLM1/2`, `high/max`, and `[发送]`. Those selectors never change the fixed scenario or mock event sequence. ↑/↓ switches the fixed request. `[+]` opens the normal command palette, whose choices intentionally have no effect in this locked demonstration. Press Enter or `[发送]` to run the selected fixed request. The request then drives the actual `ConversationAgent` event loop; the transcript displays its governed tool, approval, feedback, and final-reply events rather than a prewritten chat record. `make demo` runs all three deterministic mock-LLM scenarios without interaction and asserts their mechanism facts:
 
-1. 已读取项目文件后的删除请求暂停审批；拒绝后目标文件保留；
+1. 已读取项目文件后的删除请求暂停并显示审批；交互演示中可允许或拒绝，`make demo` 固定拒绝并验证目标文件保留；
 2. assertion feedback 回灌后 mock 返回修复补丁，随后 pytest 通过；
 3. 伪造或过期 approval ID 被确定性拒绝。
 
@@ -91,7 +103,7 @@ After configuring a DeepSeek key in the interactive `/credentials` dialog, use a
 2. Send a repair request such as “找出并修复所有测试错误”; the transcript should stream the user message, assistant text, safe read/test/change status, and a final response.
 3. Ask “刚才改了什么，测试结果怎样？” in the same session; the reply should use the preceding tool facts.
 4. Ask to delete a previously read project file; verify that the approval dialog names that file, then reject it and confirm the file remains.
-5. Start a longer request, use `/stop`, and verify that the turn becomes interrupted only after its terminal event. Restart `guardedpy`, use `/conversations`, and confirm that only the safe summary—not raw chat or source—returns.
+5. Start a longer request, use `/stop`, and verify that the turn becomes interrupted only after its terminal event. Restart `guardedpy`, use `/conversations`, and confirm that visible user/Agent dialogue returns and can ground a follow-up, while source, raw diffs, tool arguments and hidden reasoning do not return.
 
 Do not paste API keys into chat, project files, command arguments, environment variables, or screenshots. Record this manual result only after performing it; it is intentionally not claimed by this repository yet.
 

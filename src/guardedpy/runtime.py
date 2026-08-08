@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from threading import RLock
 from typing import Protocol
 from uuid import UUID
@@ -27,6 +28,7 @@ from guardedpy.conversation import (
     SafeTurnSummary,
     SessionEvent,
     TurnMode,
+    VisibleTranscriptEntry,
 )
 from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialStatus
@@ -36,6 +38,8 @@ from guardedpy.workspace import Workspace
 
 
 _MAX_SUMMARY_TEXT = 1200
+_SENSITIVE_ASSIGNMENT = re.compile(r"(?i)\b(api[_-]?key|authorization)\s*([=:])\s*\S+")
+_API_KEY_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]+\b")
 
 
 class CredentialPort(Protocol):
@@ -74,7 +78,13 @@ class ConversationRuntime:
 
     def create_session(self, project_title: str, summary_id: UUID | None = None) -> UUID:
         prior = None if summary_id is None else self.store.load_summary(summary_id)
-        session_id = self._agent.create_session(prior)
+        if summary_id is not None and self._agent.has_session(summary_id):
+            self._summaries[summary_id] = prior
+            return summary_id
+        session_id = self._agent.create_session(prior, session_id=summary_id)
+        if prior is not None:
+            self._summaries[session_id] = prior
+            return session_id
         now = datetime.now(timezone.utc)
         self._summaries[session_id] = ConversationSummary(
             id=session_id, project_title=project_title, created_at=now, updated_at=now,
@@ -94,7 +104,9 @@ class ConversationRuntime:
     def begin_turn(
         self, session_id: UUID, text: str, mode: TurnMode = "normal", *, goal: str | None = None
     ) -> tuple[UUID, SessionEvent]:
-        return self._agent.begin_turn(session_id, text, mode, goal=goal)
+        turn_id, event = self._agent.begin_turn(session_id, text, mode, goal=goal)
+        self._append_visible_message(session_id, "user", text)
+        return turn_id, event
 
     def run_turn(self, session_id: UUID, turn_id: UUID):
         return self._capture(session_id, turn_id, self._agent.run_turn(session_id, turn_id))
@@ -103,7 +115,20 @@ class ConversationRuntime:
         return self._capture(session_id, turn_id, self._agent.resolve_approval(session_id, turn_id, approval_id, accepted))
 
     def steer(self, session_id: UUID, turn_id: UUID, text: str) -> SessionEvent:
-        return self._agent.steer(session_id, turn_id, text)
+        event = self._agent.steer(session_id, turn_id, text)
+        self._append_visible_message(session_id, "user", text)
+        return event
+
+    def delete_session(self, session_id: UUID) -> ConversationSummary | None:
+        """Delete the current persisted conversation and return its immediate predecessor."""
+        current = self.summary(session_id)
+        conversations = self.store.summaries()
+        if len(conversations) <= 1:
+            return None
+        self.store.delete_summary(current.id)
+        self._summaries.pop(session_id, None)
+        self._agent.discard_session(session_id)
+        return max((summary for summary in conversations if summary.id != current.id), key=lambda summary: summary.updated_at)
 
     def queue(self, session_id: UUID, text: str, mode: TurnMode = "normal") -> tuple[UUID, SessionEvent]:
         return self._agent.queue(session_id, text, mode)
@@ -127,6 +152,12 @@ class ConversationRuntime:
                     facts["pytest_outcome"] = event.data["pytest_outcome"]
             if event.kind == "approval_resolved":
                 facts["approval_outcome"] = "approved" if event.data["accepted"] == "true" else "rejected"
+            if event.kind == "assistant_text_delta":
+                self._texts.setdefault((session_id, event.item_id), []).append(event.text)  # type: ignore[arg-type]
+            if event.kind == "assistant_item_completed" and event.item_id is not None:
+                text = "".join(self._texts.pop((session_id, event.item_id), []))
+                if text:
+                    self._append_visible_message(session_id, "assistant", text)
             if event.kind in {"turn_completed", "turn_interrupted", "turn_failed"}:
                 self._record_terminal(session_id, turn_id, event)
             yield event
@@ -143,6 +174,16 @@ class ConversationRuntime:
             final_text=_bounded_safe_summary(_safe_summary_text(status, facts)),
         )
         updated = summary.model_copy(update={"updated_at": datetime.now(timezone.utc), "turns": (*summary.turns, turn)})
+        self._summaries[session_id] = updated
+        self.store.save_summary(updated)
+
+    def _append_visible_message(self, session_id: UUID, role: str, text: str) -> None:
+        summary = self.summary(session_id)
+        entry = VisibleTranscriptEntry(role=role, text=_redact_visible_text(text))
+        updated = summary.model_copy(update={
+            "updated_at": datetime.now(timezone.utc),
+            "transcript": (*summary.transcript, entry),
+        })
         self._summaries[session_id] = updated
         self.store.save_summary(updated)
 
@@ -171,6 +212,12 @@ def _safe_summary_text(status: str, facts: dict[str, object]) -> str:
     elif approval_outcome == "rejected":
         text += "危险操作已拒绝。"
     return text
+
+
+def _redact_visible_text(text: str) -> str:
+    """Keep visible history useful without persisting credential-shaped values."""
+    text = _SENSITIVE_ASSIGNMENT.sub(r"\1\2[已隐藏]", text)
+    return _API_KEY_TOKEN.sub("[已隐藏]", text)
 
 
 def _bounded_safe_summary(text: str) -> str:

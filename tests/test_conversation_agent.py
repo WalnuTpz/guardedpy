@@ -40,7 +40,7 @@ def _governed_agent(tmp_path: Path, responses: list[list[object]]) -> tuple[Conv
     return (
         ConversationAgent(
             model,
-            governed_tool_definitions(),
+            governed_tool_definitions(config),
             ToolGovernor(config),
             ToolExecutor(tmp_path, config),
         ),
@@ -169,6 +169,13 @@ def test_unread_or_stale_file_patch_is_denied_without_write(tmp_path: Path, stal
 
     result = json.loads(model.received_messages[-1][-1].content)
     assert result["code"] == ("stale_read" if stale else "read_required")
+    if not stale:
+        assert result["missing_paths"] == ["src/calc.py"]
+        patch_event = next(
+            event for event in events
+            if event.kind == "tool_item_completed" and event.data.get("tool") == "apply_patch"
+        )
+        assert json.loads(patch_event.data["missing_paths"]) == ["src/calc.py"]
     assert target.read_text() == ("VALUE = 9\n" if stale else "VALUE = 1\n")
     assert events[-1].kind == "turn_completed"
 
@@ -652,3 +659,51 @@ def test_next_turn_goal_is_visible_to_the_model_once_without_becoming_history() 
         role="system", content="Current turn goal: Keep the repair minimal"
     ) in model.received_messages[0]
     assert all(message.content != "Current turn goal: Keep the repair minimal" for message in model.received_messages[1])
+
+
+def test_new_source_file_needs_no_read_and_its_contract_names_discovered_directories(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    (tmp_path / "tests" / "test_hello.py").write_text(
+        "from src.hello import message\n\ndef test_message(): assert message() == 'hello world'\n"
+    )
+    patch = (
+        "--- /dev/null\n+++ b/src/hello.py\n@@ -0,0 +1,2 @@\n"
+        "+def message() -> str:\n+    return 'hello world'\n"
+    )
+    agent, model = _governed_agent(tmp_path, [
+        _tool_response(("create", "apply_patch", {"unified_diff": patch})),
+        _tool_response(("verify", "run_pytest", {})),
+        [TextDelta("Created and verified."), ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Create a hello world program")
+
+    events = list(agent.run_turn(session_id, turn_id))
+
+    assert (tmp_path / "src" / "hello.py").read_text() == "def message() -> str:\n    return 'hello world'\n"
+    assert not any(event.data.get("tool") == "read_file" for event in events)
+    patch_tool = next(tool for tool in model.received_tools[0] if tool.name == "apply_patch")
+    assert "src, tests" in patch_tool.description
+    assert "--- /dev/null" in patch_tool.description
+    assert "do not read" in patch_tool.description
+    assert "ask a concise clarification" in model.received_messages[0][0].content
+    assert events[-1].kind == "turn_completed"
+
+
+def test_new_file_outside_discovered_directories_returns_actionable_feedback(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    patch = "--- /dev/null\n+++ b/hello.py\n@@ -0,0 +1 @@\n+print('hello world')\n"
+    agent, model = _governed_agent(tmp_path, [
+        _tool_response(("create", "apply_patch", {"unified_diff": patch})),
+        [TextDelta("I will choose an allowed source path."), ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "Create a program")
+
+    events = list(agent.run_turn(session_id, turn_id))
+
+    result = json.loads(model.received_messages[1][-1].content)
+    assert result["code"] == "new_file_path_not_allowed"
+    assert result["allowed_directories"] == ["src", "tests"]
+    assert not (tmp_path / "hello.py").exists()
+    assert next(event for event in events if event.kind == "tool_item_completed").data["code"] == "new_file_path_not_allowed"

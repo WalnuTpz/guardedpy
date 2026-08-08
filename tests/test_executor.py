@@ -64,7 +64,57 @@ def test_tail_read_does_not_authorize_patch_of_an_unread_prefix(tmp_path: Path) 
     ))
 
     assert result.code == "read_required"
+    assert result.provider_result["missing_paths"] == ["src/value.py"]
     assert target.read_text() == "first\nsecond\n"
+
+
+def test_executor_reports_every_unread_existing_patch_target(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "value.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests" / "test_value.py").write_text("def test_value(): assert True\n")
+    turn = Turn(id=uuid4(), session_id=uuid4(), initial_text="repair", mode="normal")
+    executor = ToolExecutor(tmp_path, safe_config(tmp_path))
+
+    result = executor.execute(turn, uuid4(), ToolCall(
+        "patch", "apply_patch",
+        "{\"unified_diff\":\"--- a/src/value.py\\n+++ b/src/value.py\\n@@ -1 +1 @@\\n-VALUE = 1\\n+VALUE = 2\\n--- a/tests/test_value.py\\n+++ b/tests/test_value.py\\n@@ -1 +1 @@\\n-def test_value(): assert True\\n+def test_value(): assert False\\n\"}",
+    ))
+
+    assert result.code == "read_required"
+    assert result.provider_result["missing_paths"] == ["src/value.py", "tests/test_value.py"]
+
+
+def test_executor_runs_a_project_python_file_without_a_prior_read(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "hello.py").write_text("print('hello world')\n")
+    turn = Turn(
+        id=uuid4(), session_id=uuid4(), initial_text="run it", mode="normal", needs_full_verification=True
+    )
+    executor = ToolExecutor(tmp_path, safe_config(tmp_path))
+
+    result = executor.execute(
+        turn, uuid4(), ToolCall("run", "run_python", '{"path":"src/hello.py"}')
+    )
+
+    assert result.code == "ok"
+    assert result.provider_result["output"] == "hello world\n"
+    assert turn.needs_full_verification is False
+
+
+def test_executor_rejects_non_python_program_targets(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "notes.txt").write_text("not executable\n")
+    turn = Turn(id=uuid4(), session_id=uuid4(), initial_text="run it", mode="normal")
+    executor = ToolExecutor(tmp_path, safe_config(tmp_path))
+
+    result = executor.execute(
+        turn, uuid4(), ToolCall("run", "run_python", '{"path":"src/notes.txt"}')
+    )
+
+    assert result.code == "not_python_file"
 
 
 def test_executor_keeps_verification_for_zero_collection(tmp_path: Path, monkeypatch: object) -> None:

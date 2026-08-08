@@ -67,6 +67,20 @@ class ToolExecutor:
                     "excerpt": feedback.excerpt,
                 },
             }, feedback=feedback)
+        if call.name == "run_python":
+            path = self._path(arguments, "path")
+            argv = arguments.get("argv", [])
+            if (
+                not isinstance(argv, list)
+                or len(argv) > 20
+                or any(not isinstance(argument, str) or not argument or "\x00" in argument or len(argument) > 200 for argument in argv)
+            ):
+                return self._failure(call, "invalid_tool_call")
+            result = self._workspace.run_python(path, tuple(argv))
+            execution = self._result(call, result)
+            if result.ok:
+                turn.needs_full_verification = False
+            return execution
         if call.name == "git_diff":
             return self._result(call, self._workspace.git_diff())
         if call.name == "git_status":
@@ -101,13 +115,19 @@ class ToolExecutor:
         diff = arguments.get("unified_diff")
         if not isinstance(diff, str) or len(diff.encode()) > 65536:
             return self._failure(call, "invalid_tool_call")
+        missing_paths: list[str] = []
         for path in _existing_patch_paths(diff):
             record = turn.reads.get(path)
             target = self._workspace.root / path
+            if not target.resolve().is_relative_to(self._workspace.root) or not target.is_file():
+                continue
             if record is None or not record.complete:
-                return self._failure(call, "read_required")
+                missing_paths.append(path)
+                continue
             if not target.is_file() or sha256(target.read_bytes()).hexdigest() != record.sha256:
                 return self._failure(call, "stale_read")
+        if missing_paths:
+            return self._failure(call, "read_required", missing_paths=missing_paths)
         result = self._workspace.apply_patch(diff)
         execution = self._result(call, result)
         if result.ok:
@@ -124,8 +144,8 @@ class ToolExecutor:
         return PurePosixPath(value)
 
     @staticmethod
-    def _failure(call: ToolCall, code: str) -> ToolExecution:
-        return ToolExecution(call.id, "deny", code, code, {"code": code})
+    def _failure(call: ToolCall, code: str, **details: object) -> ToolExecution:
+        return ToolExecution(call.id, "deny", code, code, {"code": code, **details})
 
     @staticmethod
     def _result(call: ToolCall, result) -> ToolExecution:

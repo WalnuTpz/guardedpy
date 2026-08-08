@@ -52,7 +52,16 @@ class ConversationStore:
             rows = connection.execute(
                 "SELECT summary_json FROM conversation_summaries"
             ).fetchall()
-        return tuple(SafeConversationSummary.model_validate_json(row[0]) for row in rows)
+        return tuple(sorted(
+            (SafeConversationSummary.model_validate_json(row[0]) for row in rows),
+            key=lambda summary: summary.updated_at,
+        ))
+
+    def delete_summary(self, conversation_id: UUID) -> None:
+        """Delete one explicitly selected persisted conversation."""
+        with closing(self._connect()) as connection:
+            connection.execute("DELETE FROM conversation_summaries WHERE id = ?", (str(conversation_id),))
+            connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
