@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Literal, TypeAlias, TypeGuard
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from guardedpy.config import HarnessConfig
 
@@ -112,6 +112,14 @@ class TaskState(BaseModel):
     path: TaskPath = TaskPath.BASELINE_PENDING
     repair_targets: tuple[str, ...] = ()
     review_path: str | None = Field(default=None, frozen=True)
+    session_goal: str | None = Field(default=None, frozen=True, max_length=500)
+
+    @field_validator("session_goal", mode="before")
+    @classmethod
+    def _strip_session_goal(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
     def model_post_init(self, __context: object) -> None:
         """Derive internal path state and validate the optional review scope."""

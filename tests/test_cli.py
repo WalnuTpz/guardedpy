@@ -17,6 +17,7 @@ class _Runtime:
         self.project_root: Path | None = None
         self.created: list[TaskState] = []
         self.setup_profiles: list[ProjectProfile] = []
+        self.configured = True
 
     def setup(self, profile: ProjectProfile, api_key: str | None) -> None:
         assert api_key is None
@@ -39,7 +40,7 @@ class _Runtime:
         return []
 
     def credential_status(self) -> CredentialStatus:
-        return CredentialStatus(configured=False)
+        return CredentialStatus(configured=self.configured)
 
 
 def _project(tmp_path: Path) -> None:
@@ -75,6 +76,21 @@ def test_direct_task_discovers_cwd_and_uses_safe_non_tty_lifecycle(tmp_path: Pat
     assert runtime.setup_profiles[0].root == tmp_path.resolve()
     assert runtime.created[0].description == "inspect project"
     assert "completed" in output.getvalue()
+
+
+def test_direct_task_stops_before_creation_without_a_credential(tmp_path: Path, monkeypatch: object) -> None:
+    """Catches the CLI bypassing the redirected credential safety stop."""
+    from guardedpy.cli import main
+
+    _project(tmp_path)
+    monkeypatch.chdir(tmp_path)  # type: ignore[attr-defined]
+    runtime = _Runtime()
+    runtime.configured = False
+    output = StringIO()
+
+    assert main(["inspect project"], runtime_factory=lambda: runtime, stdin=StringIO(), stdout=output) == 1
+    assert runtime.created == []
+    assert output.getvalue() == "需要先在交互终端配置凭据。\n"
 
 
 def test_demo_non_tty_is_offline_and_never_composes_project_runtime(monkeypatch: object) -> None:

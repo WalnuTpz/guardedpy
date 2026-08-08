@@ -2,20 +2,128 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import subprocess
 import sys
 from typing import Any, TextIO
 from uuid import UUID
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
+from guardedpy.conversations import ConversationStore
+from guardedpy.credentials import CredentialBackendUnavailableError
+from guardedpy.events import StoredRunEvent
 
 
 COMMANDS = (
-    "/new", "/clear", "/history", "/exit", "/plan", "/review", "/tests", "/diff",
-    "/permissions", "/credentials", "/memory", "/model", "/effort", "/status", "/doctor",
-    "/help",
+    "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review", "/tests", "/diff",
+    "/permissions", "/credentials", "/memory", "/model", "/effort", "/goal", "/doctor", "/help",
 )
-_HELP = "可用命令：" + " ".join(COMMANDS) + "\n"
+
+
+_ACTION_MESSAGES = {
+    "list workspace files": "查看项目文件",
+    "read workspace file": "读取项目文件",
+    "apply source patch": "应用源码修改",
+    "delete workspace path": "删除项目内路径",
+    "run configured tests": "运行配置测试",
+    "run approved command": "运行已批准命令",
+    "request action approval": "请求人工审批",
+    "propose memory for user review": "提交记忆建议供用户审查",
+    "finish task": "结束任务",
+}
+_FEEDBACK_MESSAGES = {
+    "passed": "pytest passed",
+    "assertion_failure": "pytest assertion failure",
+    "collection_error": "pytest collection error",
+    "execution_error": "pytest execution error",
+    "timeout": "pytest timed out",
+}
+_POLICY_MESSAGES = {
+    "allow": "允许",
+    "approval_required": "需要人工审批",
+    "deny": "拒绝",
+}
+_STOP_MESSAGES = {
+    "service_restarted": "服务已重启",
+    "completed": "任务完成",
+    "blocked": "任务已阻止",
+    "cancelled": "任务已取消",
+    "interrupted": "任务已中断",
+    "round_limit": "达到轮次上限",
+    "repeated_action": "检测到重复动作",
+    "invalid_model_output": "模型输出无效",
+    "provider_temporary_failure": "提供方暂时不可用",
+    "unrecoverable_error": "发生不可恢复错误",
+}
+_FINAL_MESSAGES = {
+    TaskStatus.WAITING_APPROVAL: "GuardedPy：等待人工审批。",
+    TaskStatus.COMPLETED: "GuardedPy：任务完成。",
+    TaskStatus.BLOCKED: "GuardedPy：任务已阻止。",
+    TaskStatus.CANCELLED: "GuardedPy：任务已取消。",
+    TaskStatus.INTERRUPTED: "GuardedPy：任务已中断。",
+}
+
+
+@dataclass(frozen=True)
+class TaskMessageFlow:
+    """A safe TUI projection derived solely from task state and stored audit events."""
+
+    user_message: str
+    event_messages: tuple[str, ...]
+    final_message: str | None
+    live_status: str | None
+
+
+def task_message_flow(task: TaskState, events: tuple[StoredRunEvent, ...]) -> TaskMessageFlow:
+    """Map persisted safe audit fields to the CLI-like transcript without raw payloads."""
+    messages: list[str] = []
+    for event in events:
+        if event.action_summary:
+            messages.append(
+                f"GuardedPy：动作：{_ACTION_MESSAGES.get(event.action_summary, '执行受控动作')}"
+            )
+        if event.policy_verdict:
+            messages.append(
+                f"GuardedPy：策略：{_POLICY_MESSAGES[event.policy_verdict.value]}"
+            )
+        if event.feedback_kind:
+            messages.append(
+                f"GuardedPy：反馈：{_FEEDBACK_MESSAGES[event.feedback_kind.value]}"
+            )
+        if event.stop_reason:
+            messages.append(
+                f"GuardedPy：停止：{_STOP_MESSAGES[event.stop_reason.value]}"
+            )
+    final_message = _FINAL_MESSAGES.get(task.status)
+    live_status: str | None = None
+    if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
+        action = events[-1].action_summary if events else None
+        action_message = _ACTION_MESSAGES.get(action or "")
+        live_status = (
+            f"GuardedPy：正在{action_message}。"
+            if action_message
+            else "GuardedPy：正在处理任务。"
+        )
+    return TaskMessageFlow(
+        user_message=f"› {task.description}",
+        event_messages=tuple(messages),
+        final_message=final_message,
+        live_status=live_status,
+    )
+
+
+def render_help() -> tuple[str, ...]:
+    """Return the grouped, secret-free command help shared by both session renderers."""
+    return (
+        "会话与对话：/history /conversations /new /clear /exit",
+        "任务与检查：/plan <任务> /review <路径> /tests /diff",
+        "设置与安全：/model /effort /goal /permissions /credentials /memory /doctor",
+        "参数：/plan <任务> 创建规划；/review <路径> 审查指定路径；/goal <目标> 仅交互终端可用。",
+        "交互：键盘 Enter 提交，Shift+Enter 或 Ctrl+J 换行；鼠标可选择候选命令和设置。",
+        "凭据：仅交互终端的系统安全存储可录入 Key，绝不接受明文回退。",
+        "安全与非交互：重定向会话不能录入凭据或自动审批，并在需要凭据时安全停止。",
+        "帮助：/help",
+    )
 
 
 def lifecycle_lines(runtime: Any, task: TaskState) -> tuple[str, ...]:
@@ -52,8 +160,14 @@ def run_noninteractive_task(
         output.write("任务描述不能为空。\n")
         return 2
     try:
+        if not runtime.credential_status().configured:
+            output.write("需要先在交互终端配置凭据。\n")
+            return 1
         task = runtime.create_task(description, intent, review_path=review_path)
         result = runtime.run(task.id)
+    except CredentialBackendUnavailableError:
+        output.write("安全系统密钥环不可用；请先安装或启动兼容的安全系统密钥环，再使用 /credentials。\n")
+        return 1
     except Exception:
         output.write("无法启动任务。\n")
         return 1
@@ -79,13 +193,17 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
         if name == "/exit" and not argument:
             return 0
         if name == "/help" and not argument:
-            output.write(_HELP)
+            for help_line in render_help():
+                output.write(f"{help_line}\n")
             continue
         if name in {"/new", "/clear"} and not argument:
             output.write("已清除当前视觉会话。\n")
             continue
         if name == "/history" and not argument:
             _render_history(runtime, output)
+            continue
+        if name == "/conversations" and not argument:
+            _render_conversations(runtime, output)
             continue
         if name == "/plan":
             code = run_noninteractive_task(runtime, argument, TaskIntent.PLAN, output)
@@ -120,8 +238,8 @@ def run_plain_session(runtime: Any, input_stream: TextIO, output: TextIO) -> int
         if name == "/effort":
             _update_default(runtime, "reasoning_effort", argument, output)
             continue
-        if name == "/status" and not argument:
-            _render_status(runtime, output)
+        if name == "/goal":
+            output.write("会话目标仅支持交互终端，且不会持久化。\n")
             continue
         if name == "/doctor" and not argument:
             _doctor(runtime, output)
@@ -143,6 +261,13 @@ def _render_history(runtime: Any, output: TextIO) -> None:
         return
     for task in tasks:
         render_lifecycle(runtime, task, output)
+
+
+def _render_conversations(runtime: Any, output: TextIO) -> None:
+    conversations = ConversationStore(runtime.project_root).list()
+    output.write(f"会话：{len(conversations)}\n")
+    for conversation in conversations:
+        output.write(f"{conversation.id} {conversation.updated_at.isoformat()}\n")
 
 
 def _run_tests(runtime: Any, output: TextIO) -> None:

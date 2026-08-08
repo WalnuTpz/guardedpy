@@ -31,6 +31,7 @@ class _Runtime:
         self.revoked: list[str] = []
         self.approved: list[object] = []
         self.removed: list[object] = []
+        self.configured = False
 
     def create_task(self, description: str, intent: TaskIntent = TaskIntent.CODING, review_path: str | None = None) -> TaskState:
         task = TaskState(description=description, intent=intent, config=self.config, review_path=review_path)
@@ -47,7 +48,7 @@ class _Runtime:
         return []
 
     def credential_status(self) -> CredentialStatus:
-        return CredentialStatus(configured=False)
+        return CredentialStatus(configured=self.configured)
 
     def update_credential(self, key: str) -> None:
         del key
@@ -94,6 +95,7 @@ def test_noninteractive_task_stops_on_approval_without_consuming_stdin(tmp_path:
     from guardedpy.terminal import run_noninteractive_task
 
     runtime = _Runtime(_profile(tmp_path), approval=True)
+    runtime.configured = True
     output = StringIO()
 
     code = run_noninteractive_task(runtime, "remove artifact", TaskIntent.CODING, output)
@@ -101,6 +103,36 @@ def test_noninteractive_task_stops_on_approval_without_consuming_stdin(tmp_path:
     assert code == 1
     assert "waiting_approval" in output.getvalue()
     assert "需要人工审批，非交互模式已安全停止。" in output.getvalue()
+
+
+def test_noninteractive_task_requires_configured_credential_before_creation(tmp_path: Path) -> None:
+    """Catches redirected work creating a provider task without a keyring credential."""
+    from guardedpy.terminal import run_noninteractive_task
+
+    runtime = _Runtime(_profile(tmp_path))
+    output = StringIO()
+
+    code = run_noninteractive_task(runtime, "repair test", TaskIntent.CODING, output)
+
+    assert code == 1
+    assert runtime.created == []
+    assert output.getvalue() == "需要先在交互终端配置凭据。\n"
+
+
+def test_noninteractive_task_explains_unavailable_secure_keyring(tmp_path: Path) -> None:
+    """Catches a failed backend being confused with a merely missing key."""
+    from guardedpy.credentials import CredentialBackendUnavailableError
+    from guardedpy.terminal import run_noninteractive_task
+
+    class UnavailableRuntime(_Runtime):
+        def credential_status(self) -> CredentialStatus:
+            raise CredentialBackendUnavailableError("keyring backend is unavailable")
+
+    runtime = UnavailableRuntime(_profile(tmp_path))
+    output = StringIO()
+    assert run_noninteractive_task(runtime, "repair", TaskIntent.CODING, output) == 1
+    assert runtime.created == []
+    assert "安全系统密钥环" in output.getvalue()
 
 
 def test_plain_session_refuses_piped_credential_entry_and_lists_only_supported_commands(tmp_path: Path) -> None:
@@ -122,6 +154,49 @@ def test_plain_session_refuses_piped_credential_entry_and_lists_only_supported_c
         assert retired not in rendered
 
 
+def test_plain_help_is_grouped_and_treats_status_as_unknown(tmp_path: Path) -> None:
+    """Catches the retired status command returning through the safe renderer."""
+    from guardedpy.terminal import run_plain_session
+
+    output = StringIO()
+    code = run_plain_session(_Runtime(_profile(tmp_path)), StringIO("/help\n/status\n/exit\n"), output)
+
+    assert code == 0
+    rendered = output.getvalue()
+    for group in ("会话与对话", "任务与检查", "设置与安全"):
+        assert group in rendered
+    assert "/status" not in rendered
+    assert rendered.endswith("未知命令。\n")
+
+
+def test_plain_help_explains_arguments_and_noninteractive_limits(tmp_path: Path) -> None:
+    """Catches plain help omitting the safe operating constraints needed by redirected users."""
+    from guardedpy.terminal import run_plain_session
+
+    output = StringIO()
+    run_plain_session(_Runtime(_profile(tmp_path)), StringIO("/help\n/exit\n"), output)
+    rendered = output.getvalue()
+    for phrase in ("/plan <任务>", "/review <路径>", "键盘", "鼠标", "凭据", "非交互", "安全"):
+        assert phrase in rendered
+
+
+def test_plain_conversations_prints_only_safe_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches non-TTY history reconstruction exposing task bodies."""
+    from guardedpy.conversations import ConversationStore
+    from guardedpy.terminal import run_plain_session
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    profile = _profile(tmp_path)
+    conversation = ConversationStore(profile.root).create()
+    ConversationStore(profile.root).attach_task(conversation.id, uuid4())
+    output = StringIO()
+
+    assert run_plain_session(_Runtime(profile), StringIO("/conversations\n/exit\n"), output) == 0
+    rendered = output.getvalue()
+    assert str(conversation.id) in rendered
+    assert "raw secret" not in rendered
+
+
 def test_plain_session_requires_exact_command_names_before_mutating_defaults(tmp_path: Path) -> None:
     """Catches a slash-prefix typo changing persistent model or workflow state."""
     from guardedpy.terminal import run_plain_session
@@ -138,6 +213,31 @@ def test_plain_session_requires_exact_command_names_before_mutating_defaults(tmp
     assert code == 0
     assert not hasattr(runtime, "defaults")
     assert output.getvalue() == "未知命令。\n未知命令。\n"
+
+
+def test_plain_session_goal_command_is_interactive_only_and_never_creates_a_task(tmp_path: Path) -> None:
+    """Catches redirected input creating or persisting a Goal context."""
+    from guardedpy.terminal import run_plain_session
+
+    runtime = _Runtime(_profile(tmp_path))
+    output = StringIO()
+
+    assert run_plain_session(runtime, StringIO("/goal release checklist\n/exit\n"), output) == 0
+    assert runtime.created == []
+    assert output.getvalue() == "会话目标仅支持交互终端，且不会持久化。\n"
+
+
+def test_terminal_lifecycle_never_renders_a_live_session_goal(tmp_path: Path) -> None:
+    """Catches a session-only Goal leaking into plain history or final summaries."""
+    from guardedpy.terminal import lifecycle_lines
+
+    runtime = _Runtime(_profile(tmp_path))
+    task = TaskState(
+        description="repair value", config=runtime.config, session_goal="release checklist"
+    )
+    task.status = TaskStatus.COMPLETED
+
+    assert "release checklist" not in "\n".join(lifecycle_lines(runtime, task))
 
 
 def test_plain_session_manages_only_explicit_permission_and_memory_identifiers(tmp_path: Path) -> None:

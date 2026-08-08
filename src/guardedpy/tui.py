@@ -4,26 +4,186 @@ from __future__ import annotations
 
 from io import StringIO
 from threading import Thread
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
+from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, ListItem, ListView, RichLog, Static, TextArea
+from textual.timer import Timer
+from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
 
 from guardedpy.domain import TaskIntent, TaskState, TaskStatus
+from guardedpy.conversations import ConversationStore
+from guardedpy.credentials import CredentialBackendUnavailableError
 from guardedpy.mechanism_demo import ScenarioName, run_scenario
-from guardedpy.terminal import COMMANDS, lifecycle_lines, run_plain_session
+from guardedpy.terminal import COMMANDS, render_help, run_plain_session, task_message_flow
 
 
 _NO_ARGUMENT_COMMANDS = frozenset(
     {
-        "/new", "/clear", "/history", "/exit", "/tests", "/diff",
-        "/credentials", "/status", "/doctor", "/help",
+        "/new", "/clear", "/history", "/conversations", "/exit", "/tests", "/diff",
+        "/credentials", "/doctor", "/help", "/model", "/effort",
     }
 )
+
+
+class ComposerSubmitted(Message):
+    """Deliver a composer submission that TextArea would otherwise consume."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        super().__init__()
+
+
+class TranscriptLog(Log):
+    """Selectable log that preserves one fixed safe UI projection per line."""
+
+    def write(self, data: str, scroll_end: bool | None = None) -> "TranscriptLog":
+        super().write(f"{data}\n", scroll_end=scroll_end)
+        return self
+
+
+class Composer(TextArea):
+    """TextArea with explicit submit and multiline key boundaries."""
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            self.post_message(ComposerSubmitted(self.text))
+        elif event.key in {"shift+enter", "ctrl+j"}:
+            event.prevent_default()
+            event.stop()
+            self.insert("\n")
+        elif event.key in {"up", "down"} and self.app._move_palette(event.key):
+            event.prevent_default()
+            event.stop()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if self.app._move_palette("down"):
+            event.stop()
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if self.app._move_palette("up"):
+            event.stop()
+
+
+class SettingsScreen(ModalScreen[str | None]):
+    """Choose a validated future-task setting with keyboard or mouse."""
+
+    def __init__(
+        self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
+    ) -> None:
+        super().__init__()
+        self._field = field
+        self._values = values
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("选择模型" if self._field == "model" else "选择推理强度"),
+            ListView(
+                *(ListItem(Static(value), id=f"setting-{value}") for value in self._values),
+                id="settings-picker",
+            ),
+            id="settings-modal",
+        )
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#settings-picker", ListView)
+        picker.index = 0
+        picker.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(str(event.item.query_one(Static).render()))
+
+
+class ModePickerScreen(ModalScreen[Literal["plan", "review", "goal"] | None]):
+    """Select the next in-composer task mode without attachment semantics."""
+
+    _options = (("plan", "计划"), ("review", "审查"), ("goal", "目标"))
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            ListView(
+                *(ListItem(Static(label), id=f"mode-{mode}") for mode, label in self._options),
+                id="mode-picker-list",
+            ),
+            id="mode-picker-modal",
+        )
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#mode-picker-list", ListView)
+        picker.index = 0
+        picker.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss((event.item.id or "").removeprefix("mode-") or None)
+
+
+class HelpScreen(ModalScreen[None]):
+    """Scrollable safe help, kept outside the task transcript."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(Log(id="help-content", highlight=False), Button("关闭", id="help-close"), id="help-modal")
+
+    def on_mount(self) -> None:
+        content = self.query_one("#help-content", Log)
+        for line in render_help():
+            content.write(line)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
+
+
+class CredentialBackendUnavailableScreen(ModalScreen[None]):
+    """Explain why a key cannot safely be accepted without a system keyring."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("安全系统密钥环不可用。请先安装或启动兼容的安全系统密钥环；GuardedPy 不会接受明文 Key。", id="credential-backend-unavailable"),
+            Button("关闭", id="credential-backend-close"),
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
+
+
+class ConversationScreen(ModalScreen[UUID | None]):
+    """Select a stored conversation without rendering task bodies in the selector."""
+
+    def __init__(self, conversations: tuple[Any, ...]) -> None:
+        super().__init__()
+        self._conversations = conversations
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            ListView(
+                *(ListItem(Static(f"{item.id} {item.updated_at.isoformat()}"), id=f"conversation-{item.id}") for item in self._conversations),
+                id="conversation-picker",
+            ),
+            id="conversation-modal",
+        )
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#conversation-picker", ListView)
+        picker.index = 0
+        picker.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(UUID((event.item.id or "").removeprefix("conversation-")))
+
+
+class NewConversationScreen(ModalScreen[bool]):
+    """Require a cancellation decision before discarding an active conversation view."""
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(Static("活跃任务将被取消。确认新建会话？", id="new-confirm"), Button("取消任务并新建", id="new-confirm-button"), Button("继续会话", id="new-cancel"))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "new-confirm-button")
 
 
 class ApprovalScreen(ModalScreen[str | None]):
@@ -142,9 +302,18 @@ class GuardedPyApp(App[None]):
     """The single-project interactive terminal session."""
 
     CSS = """
-    #status { height: 3; padding: 0 1; background: $panel; }
-    #transcript { height: 1fr; border: round $primary; }
-    #composer { height: 5; border: round $accent; }
+    #status { height: 1; padding: 0 1; background: $panel; }
+    #transcript-shell { height: 1fr; border: round $primary; }
+    #transcript { height: 1fr; }
+    #live-task-status { height: 1; padding: 0 1; color: $text-muted; }
+    #composer-shell { height: 6; layers: composer controls; }
+    #composer { height: 6; border: round $accent; padding: 0 35 2 0; layer: composer; }
+    #composer-controls { height: 2; layer: controls; dock: bottom; align: right middle; }
+    #mode-picker, #mode-chip, #composer-model, #composer-effort, #send { height: 1; color: $text-muted; }
+    #mode-picker { width: 3; }
+    #mode-chip { width: auto; }
+    #composer-model, #composer-effort { width: auto; }
+    #send { width: 8; }
     #command-palette { display: none; height: auto; max-height: 12; border: round $secondary; }
     """
 
@@ -158,44 +327,110 @@ class GuardedPyApp(App[None]):
         self._cancelled_task_ids: set[UUID] = set()
         self._run_threads: dict[UUID, Thread] = {}
         self._session_command_workers: dict[str, Thread] = {}
+        self._palette_index = -1
+        self._suppress_palette_once = False
+        self._pending_credential_request: tuple[str, TaskIntent, str | None, str | None] | None = None
+        self._conversation_store: ConversationStore | None = None
+        self._conversation_id: UUID | None = None
+        self._live_event_cursors: dict[UUID, int] = {}
+        self._live_finalized_task_ids: set[UUID] = set()
+        self._live_task_timer: Timer | None = None
+        self._session_goal: str | None = None
+        self._mode: Literal["coding", "plan", "review", "goal"] = "coding"
 
     def compose(self) -> ComposeResult:
-        config = self.runtime.config
         yield Static(self._status_text(), id="status")
-        yield RichLog(id="transcript", wrap=True, highlight=False, markup=False)
+        yield Vertical(
+            TranscriptLog(id="transcript", highlight=False),
+            Static("", id="live-task-status"),
+            id="transcript-shell",
+        )
         yield ListView(
             *(ListItem(Static(command), id=f"command-{command.removeprefix('/')}" ) for command in COMMANDS),
             id="command-palette",
         )
-        yield TextArea(id="composer")
-        yield Footer()
+        yield Vertical(
+            Composer(id="composer"),
+            Horizontal(
+                Button("＋", id="mode-picker"),
+                Static("", id="mode-chip"),
+                Button(self.runtime.config.model, id="composer-model"),
+                Button(self.runtime.config.reasoning_effort, id="composer-effort"),
+                Button("发送", id="send", disabled=True),
+                id="composer-controls",
+            ),
+            id="composer-shell",
+        )
 
     def on_mount(self) -> None:
+        self._clear_live_task_status()
+        self._refresh_composer_controls()
         if self.initial_task:
             self.call_after_refresh(self.submit, self.initial_task)
 
     def on_unmount(self) -> None:
         """Request cancellation before the app relinquishes a daemon worker's runtime lease."""
+        self._stop_live_task(clear_status=False)
+        self._session_goal = None
         self._cancel_active_task(render=False)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id == "composer":
+            if self._suppress_palette_once:
+                self._suppress_palette_once = False
+                return
             prefix = event.text_area.text.strip()
             palette = self.query_one("#command-palette")
             palette.display = prefix.startswith("/")
             for item in palette.query(ListItem):
                 command = str(item.query_one(Static).render())
                 item.display = command.startswith(prefix)
+            self._palette_index = -1
+            self.query_one("#send", Button).disabled = not bool(event.text_area.text.strip())
 
     def on_key(self, event: Any) -> None:
-        if event.key == "enter" and self.focused is self.query_one("#composer"):
-            event.prevent_default()
-            event.stop()
-            self.submit(self.query_one("#composer", TextArea).text)
         if event.key == "ctrl+c" and self._active_task is not None:
             event.prevent_default()
             event.stop()
             self._cancel_active_task()
+
+    def on_composer_submitted(self, event: ComposerSubmitted) -> None:
+        """Make the custom composer message the sole interactive submit path."""
+        palette = self.query_one("#command-palette", ListView)
+        if event.text.strip() in COMMANDS:
+            self.submit(event.text)
+            return
+        if palette.display:
+            items = self._visible_palette_items()
+            if items:
+                index = self._palette_index if self._palette_index >= 0 else 0
+                self._accept_palette_item(items[index])
+                return
+        self.submit(event.text)
+
+    def _visible_palette_items(self) -> list[ListItem]:
+        palette = self.query_one("#command-palette", ListView)
+        return [item for item in palette.query(ListItem) if item.display]
+
+    def _move_palette(self, direction: str) -> bool:
+        palette = self.query_one("#command-palette", ListView)
+        if not palette.display:
+            return False
+        items = self._visible_palette_items()
+        if not items:
+            return True
+        change = 1 if direction == "down" else -1
+        self._palette_index = (self._palette_index + change) % len(items)
+        palette.index = list(palette.query(ListItem)).index(items[self._palette_index])
+        return True
+
+    def _accept_palette_item(self, item: ListItem) -> None:
+        composer = self.query_one("#composer", Composer)
+        self._suppress_palette_once = True
+        composer.text = str(item.query_one(Static).render())
+        self.query_one("#command-palette", ListView).display = False
+        composer.focus()
+        composer.cursor_location = composer.document.end
 
     def submit(self, text: str) -> None:
         request = text.strip()
@@ -207,7 +442,21 @@ class GuardedPyApp(App[None]):
         if request.startswith("/"):
             self._submit_command(request)
             return
-        self._start_task(request, TaskIntent.CODING)
+        mode = self._mode
+        if mode == "goal":
+            self._set_session_goal(request)
+            return
+        self._mode = "coding"
+        self._refresh_composer_controls()
+        if mode == "plan":
+            self._require_credential_then_submit(request, TaskIntent.PLAN, session_goal=self._session_goal)
+            return
+        if mode == "review":
+            self._require_credential_then_submit(
+                "Review project", TaskIntent.REVIEW, request, session_goal=self._session_goal
+            )
+            return
+        self._require_credential_then_submit(request, TaskIntent.CODING, session_goal=self._session_goal)
 
     def request_approval(
         self,
@@ -254,31 +503,63 @@ class GuardedPyApp(App[None]):
         if name not in COMMANDS or (name in _NO_ARGUMENT_COMMANDS and argument):
             self._write("未知命令。")
             return
-        if name in {"/new", "/clear"}:
-            self.query_one("#transcript", RichLog).clear()
+        if name == "/clear":
+            self.query_one("#transcript", Log).clear()
+            return
+        if name == "/new":
+            if self._active_task is None:
+                self._new_conversation()
+            else:
+                self.push_screen(NewConversationScreen(), self._new_conversation_resolved)
+            return
+        if name == "/conversations":
+            conversations = self._conversation_store_for_session().list()
+            if conversations:
+                self.push_screen(ConversationScreen(conversations), self._conversation_selected)
+            else:
+                self._write("会话：0")
             return
         if name == "/help":
-            self._write("可用命令：" + " ".join(COMMANDS))
-            return
-        if name == "/status":
-            self._write(self.query_one("#status", Static).render())
+            self.push_screen(HelpScreen())
             return
         if name == "/credentials":
             try:
                 configured = self.runtime.credential_status().configured
+            except CredentialBackendUnavailableError:
+                self.push_screen(CredentialBackendUnavailableScreen())
+                return
             except Exception:
                 self._write("凭据状态不可用。")
                 return
             self.push_screen(CredentialScreen(configured), self._credential_resolved)
             return
+        if name == "/model":
+            self._open_settings("model", ("deepseek-v4-flash", "deepseek-v4-pro"))
+            return
+        if name == "/effort":
+            self._open_settings("reasoning_effort", ("high", "max"))
+            return
+        if name == "/goal":
+            if argument == "clear":
+                self._session_goal = None
+                self._mode = "coding"
+                self._refresh_composer_controls()
+            elif argument:
+                self._set_session_goal(argument)
+            else:
+                self._write("目标不能为空。")
+            return
         if name == "/plan":
-            self._start_task(argument, TaskIntent.PLAN)
+            self._require_credential_then_submit(argument, TaskIntent.PLAN, session_goal=self._session_goal)
             return
         if name == "/review":
-            self._start_task("Review project", TaskIntent.REVIEW, argument or None)
+            self._require_credential_then_submit(
+                "Review project", TaskIntent.REVIEW, argument or None, session_goal=self._session_goal
+            )
             return
         if name == "/exit":
             if self._active_task is None:
+                self._session_goal = None
                 self.exit()
             else:
                 self.push_screen(ExitScreen(), self._exit_resolved)
@@ -286,11 +567,34 @@ class GuardedPyApp(App[None]):
         if name in {"/tests", "/diff"}:
             self._start_session_command(name)
             return
-        if name in {"/permissions", "/memory", "/model", "/effort", "/history", "/doctor"}:
+        if name in {"/permissions", "/memory", "/history", "/doctor"}:
             output = StringIO()
             run_plain_session(self.runtime, StringIO(f"{command}\n"), output)
             for line in output.getvalue().splitlines():
                 self._write(line)
+
+    def _open_settings(
+        self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
+    ) -> None:
+        self.push_screen(SettingsScreen(field, values), lambda value: self._setting_resolved(field, value))
+
+    def _setting_resolved(
+        self, field: Literal["model", "reasoning_effort"], value: str | None
+    ) -> None:
+        if value is None:
+            return
+        try:
+            self.runtime.update_future_defaults(**{field: value})
+        except CredentialBackendUnavailableError:
+            self.push_screen(CredentialBackendUnavailableScreen())
+        except Exception:
+            self._write("设置未更新。")
+            return
+        composer = self.query_one("#composer", Composer)
+        composer.text = ""
+        composer.focus()
+        self.query_one("#status", Static).update(self._status_text())
+        self._refresh_composer_controls()
 
     def _start_session_command(self, command: str) -> None:
         if command in self._session_command_workers:
@@ -310,6 +614,9 @@ class GuardedPyApp(App[None]):
 
     def _credential_resolved(self, result: tuple[str, str | None] | None) -> None:
         if result is None:
+            if self._pending_credential_request is not None:
+                self._pending_credential_request = None
+                self._write("未配置凭据，任务未开始。")
             return
         operation, value = result
         try:
@@ -319,10 +626,38 @@ class GuardedPyApp(App[None]):
                     return
                 self.runtime.update_credential(value)
                 self._write("凭据已更新。")
+                self._resume_pending_credential_request()
             elif operation == "clear_requested":
                 self.push_screen(ClearCredentialScreen(), self._clear_credential_resolved)
         except Exception:
             self._write("凭据操作失败。")
+
+    def _require_credential_then_submit(
+        self, text: str, intent: TaskIntent, review_path: str | None = None,
+        session_goal: str | None = None,
+    ) -> None:
+        if not text.strip():
+            self._write("任务描述不能为空。")
+            return
+        try:
+            configured = self.runtime.credential_status().configured
+        except CredentialBackendUnavailableError:
+            self.push_screen(CredentialBackendUnavailableScreen())
+            return
+        except Exception:
+            self._write("凭据状态不可用。")
+            return
+        if configured:
+            self._start_task(text, intent, review_path, session_goal)
+            return
+        self._pending_credential_request = (text, intent, review_path, session_goal)
+        self.push_screen(CredentialScreen(False), self._credential_resolved)
+
+    def _resume_pending_credential_request(self) -> None:
+        pending = self._pending_credential_request
+        self._pending_credential_request = None
+        if pending is not None:
+            self._start_task(*pending)
 
     def _clear_credential_resolved(self, confirmed: bool) -> None:
         if not confirmed:
@@ -337,22 +672,73 @@ class GuardedPyApp(App[None]):
         if not confirmed:
             return
         self._cancel_active_task()
+        self._session_goal = None
         self.exit()
 
-    def _start_task(self, description: str, intent: TaskIntent, review_path: str | None = None) -> None:
+    def _start_task(
+        self, description: str, intent: TaskIntent, review_path: str | None = None,
+        session_goal: str | None = None,
+    ) -> None:
         if not description.strip():
             self._write("任务描述不能为空。")
             return
         try:
-            self._write(f"用户：{description}")
-            task = self.runtime.create_task(description, intent, review_path=review_path)
+            task = self.runtime.create_task(
+                description, intent, review_path=review_path, session_goal=session_goal
+            )
+            store = self._conversation_store_for_session()
+            if self._conversation_id is None:
+                self._conversation_id = store.create().id
+            store.attach_task(self._conversation_id, task.id)
             self._active_task = task
-            self.query_one("#status", Static).update(self._status_text(task))
+            self._write(task_message_flow(task, ()).user_message)
+            self._start_live_task(task)
             worker = Thread(target=self._run_task_in_thread, args=(task,), daemon=True)
             self._run_threads[task.id] = worker
             worker.start()
         except Exception:
             self._write("无法启动任务。")
+
+    def _new_conversation_resolved(self, confirmed: bool) -> None:
+        if confirmed:
+            self._cancel_active_task()
+            self._new_conversation()
+
+    def _new_conversation(self) -> None:
+        self._conversation_id = None
+        self._session_goal = None
+        self._mode = "coding"
+        self._refresh_composer_controls()
+        self._stop_live_task()
+        self.query_one("#transcript", Log).clear()
+        composer = self.query_one("#composer", Composer)
+        composer.focus()
+        composer.cursor_location = composer.document.end
+
+    def _conversation_store_for_session(self) -> ConversationStore:
+        if self._conversation_store is None:
+            self._conversation_store = ConversationStore(self.profile.root)
+        return self._conversation_store
+
+    def _conversation_selected(self, conversation_id: UUID | None) -> None:
+        if conversation_id is None:
+            return
+        transcript = self.query_one("#transcript", Log)
+        self._stop_live_task()
+        transcript.clear()
+        for task_id in self._conversation_store_for_session().tasks(conversation_id):
+            task = self.runtime.task(task_id)
+            try:
+                events = tuple(self.runtime.events(task.id))
+            except Exception:
+                events = ()
+            flow = task_message_flow(task, events)
+            for line in (flow.user_message, *flow.event_messages, *([flow.final_message] if flow.final_message else [])):
+                self._write(line)
+        self._conversation_id = conversation_id
+        composer = self.query_one("#composer", Composer)
+        composer.focus()
+        composer.cursor_location = composer.document.end
 
     def _run_task_in_thread(self, task: TaskState) -> None:
         """Advance one runtime task off-loop and post only a typed completion message."""
@@ -393,6 +779,9 @@ class GuardedPyApp(App[None]):
         if task_id in self._cancelled_task_ids:
             self._cancelled_task_ids.remove(task_id)
             return
+        self._stop_live_task(task_id)
+        if self._active_task is not None and self._active_task.id == task_id:
+            self._active_task = None
         self._write("无法启动任务。")
 
     def _task_run_finished(self, task: TaskState) -> None:
@@ -418,9 +807,7 @@ class GuardedPyApp(App[None]):
 
     def _render_task(self, task: TaskState) -> None:
         self._active_task = task if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL} else None
-        self.query_one("#status", Static).update(self._status_text(task))
-        for line in lifecycle_lines(self.runtime, task):
-            self._write(line)
+        self._render_live_task(task)
         if task.status is TaskStatus.WAITING_APPROVAL:
             for event in reversed(self.runtime.events(task.id)):
                 if event.action_projection and event.policy_rule_id and event.action_hash:
@@ -434,24 +821,101 @@ class GuardedPyApp(App[None]):
                     return
 
     def _write(self, value: object) -> None:
-        self.query_one("#transcript", RichLog).write(str(value))
+        self.query_one("#transcript", Log).write(str(value))
+
+    def _start_live_task(self, task: TaskState) -> None:
+        self._stop_live_task()
+        self._live_event_cursors[task.id] = 0
+        self._render_live_task(task)
+        self._live_task_timer = self.set_interval(0.1, lambda: self._render_live_task(task))
+
+    def _render_live_task(self, task: TaskState) -> None:
+        """Append only unseen safe audit messages and maintain one transient live row."""
+        try:
+            events = tuple(self.runtime.events(task.id))
+        except Exception:
+            events = ()
+        cursor = self._live_event_cursors.get(task.id, 0)
+        for event in events[cursor:]:
+            for line in task_message_flow(task, (event,)).event_messages:
+                self._write(line)
+        self._live_event_cursors[task.id] = len(events)
+        flow = task_message_flow(task, events)
+        if flow.live_status is not None:
+            live_status = self.query_one("#live-task-status", Static)
+            live_status.update(flow.live_status)
+            live_status.display = True
+            return
+        if task.id not in self._live_finalized_task_ids and flow.final_message is not None:
+            self._write(flow.final_message)
+            self._live_finalized_task_ids.add(task.id)
+        self._stop_live_task(task.id)
+
+    def _clear_live_task_status(self) -> None:
+        live_status = self.query_one("#live-task-status", Static)
+        live_status.update("")
+        live_status.display = False
+
+    def _stop_live_task(self, task_id: UUID | None = None, *, clear_status: bool = True) -> None:
+        if self._live_task_timer is not None:
+            self._live_task_timer.stop()
+            self._live_task_timer = None
+        if task_id is not None:
+            self._live_event_cursors.pop(task_id, None)
+        if clear_status:
+            self._clear_live_task_status()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "mode-picker":
+            self.push_screen(ModePickerScreen(), self._mode_resolved)
+        elif event.button.id == "composer-model":
+            self._open_settings("model", ("deepseek-v4-flash", "deepseek-v4-pro"))
+        elif event.button.id == "composer-effort":
+            self._open_settings("reasoning_effort", ("high", "max"))
+        elif event.button.id == "send":
+            self.submit(self.query_one("#composer", Composer).text)
+
+    def _mode_resolved(self, mode: Literal["plan", "review", "goal"] | None) -> None:
+        if mode is None:
+            return
+        self._mode = mode
+        self._refresh_composer_controls()
+        composer = self.query_one("#composer", Composer)
+        composer.focus()
+
+    def _set_session_goal(self, value: str) -> None:
+        goal = value.strip()
+        if not goal:
+            self._write("目标不能为空。")
+            return
+        self._session_goal = goal
+        self._mode = "coding"
+        self._refresh_composer_controls()
+
+    def _refresh_composer_controls(self) -> None:
+        composer = self.query_one("#composer", Composer)
+        chip = self.query_one("#mode-chip", Static)
+        labels = {"plan": "[计划]", "review": "[审查]", "goal": "[目标]"}
+        label = labels.get(self._mode) or ("[目标]" if self._session_goal else "")
+        chip.update(label)
+        chip.display = bool(label)
+        composer.placeholder = {
+            "coding": "输入任务",
+            "plan": "输入规划任务",
+            "review": "输入项目根内相对审查路径",
+            "goal": "输入会话目标",
+        }[self._mode]
+        self.query_one("#composer-model", Button).label = self.runtime.config.model
+        self.query_one("#composer-effort", Button).label = self.runtime.config.reasoning_effort
 
     def _status_text(self, task: TaskState | None = None) -> str:
-        config = self.runtime.config
-        active = task or self._active_task
-        baseline = active.path.value if active is not None else "未开始"
-        status = active.status.value if active is not None else "idle"
-        return (
-            f"项目：{self.profile.root}\n模型：{config.model} · effort：{config.reasoning_effort}\n"
-            f"基线：{baseline} · 任务：{status} · 测试：完整套件"
-        )
+        del task
+        return f"项目：{self.profile.root}"
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id != "command-palette":
             return
-        self.query_one("#composer", TextArea).text = str(event.item.query_one(Static).render())
-        self.query_one("#command-palette").display = False
-        self.query_one("#composer", TextArea).focus()
+        self._accept_palette_item(event.item)
 
 
 class DemoApp(App[None]):
