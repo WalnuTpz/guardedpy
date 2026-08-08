@@ -586,6 +586,56 @@ def test_steer_queue_and_interrupt_have_single_active_turn_semantics() -> None:
         agent.queue(session_id, "No active turn")
 
 
+def test_steer_arriving_during_a_final_stream_gets_its_own_model_response() -> None:
+    class Model:
+        def __init__(self) -> None:
+            self.messages: list[tuple[ProviderMessage, ...]] = []
+            self.agent: ConversationAgent | None = None
+            self.session_id = uuid4()
+            self.turn_id = uuid4()
+
+        def stream(self, messages: tuple[ProviderMessage, ...], tools: object) -> object:
+            del tools
+            self.messages.append(messages)
+            if len(self.messages) == 1:
+                yield TextDelta("先回答这一部分。")
+                assert self.agent is not None
+                self.agent.steer(self.session_id, self.turn_id, "再补充测试结果")
+                yield ResponseFinished("stop")
+                return
+            yield TextDelta("补充：测试尚未运行。")
+            yield ResponseFinished("stop")
+
+    model = Model()
+    agent = ConversationAgent(model)
+    model.agent = agent
+    model.session_id = agent.create_session()
+    model.turn_id, _ = agent.begin_turn(model.session_id, "说明当前状态")
+
+    events = list(agent.run_turn(model.session_id, model.turn_id))
+
+    assert [event.text for event in events if event.kind == "assistant_text_delta"] == [
+        "先回答这一部分。", "补充：测试尚未运行。"
+    ]
+    assert model.messages[1][-1] == ProviderMessage(role="user", content="再补充测试结果")
+    assert events[-1].kind == "turn_completed"
+
+
+def test_interrupt_clears_queued_turns_instead_of_promoting_them() -> None:
+    agent = ConversationAgent(ScriptedConversationModel([]))
+    session_id = agent.create_session()
+    active_turn, _ = agent.begin_turn(session_id, "先处理这个")
+    queued_turn, _ = agent.queue(session_id, "之后不要运行这个")
+
+    assert agent.interrupt(session_id, active_turn) is None
+    events = list(agent.run_turn(session_id, active_turn))
+
+    assert [event.turn_id for event in events if event.kind == "turn_started"] == [active_turn]
+    assert all(event.turn_id != queued_turn for event in events)
+    fresh_turn, _ = agent.begin_turn(session_id, "现在可以开始新的回合")
+    assert fresh_turn != queued_turn
+
+
 def test_next_turn_goal_is_visible_to_the_model_once_without_becoming_history() -> None:
     model = ScriptedConversationModel(
         [[TextDelta("first"), ResponseFinished("stop")], [TextDelta("second"), ResponseFinished("stop")]]

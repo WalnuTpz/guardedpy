@@ -477,6 +477,8 @@ class ConversationAgent:
                 yield terminal
                 return False
             if not calls:
+                if turn.pending_steers:
+                    continue
                 if turn.needs_full_verification:
                     terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code="verification_required")
                 else:
@@ -638,6 +640,7 @@ class ConversationAgent:
     ) -> SessionEvent | None:
         session = self._session(session_id)
         turn = self._active_turn(session, turn_id, allow_cancelling=True)
+        session.queued_turn_ids.clear()
         if turn.status == "running":
             turn.cancelled = True
             turn.status = "cancelling"

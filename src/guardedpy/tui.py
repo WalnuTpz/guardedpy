@@ -497,6 +497,9 @@ class GuardedPyApp(App[None]):
             )
             self._session_goal = None
             self._refresh_composer_controls()
+        except CredentialBackendUnavailableError:
+            self.push_screen(CredentialBackendUnavailableScreen())
+            return
         except Exception:
             self._write("无法启动会话。")
             return
@@ -534,9 +537,12 @@ class GuardedPyApp(App[None]):
             self._continuous_pending_approval = (
                 message.event.session_id, message.event.turn_id, approval_id
             )
+            tool = message.event.data.get("tool", "受控操作")
+            path = message.event.data.get("path")
+            projection = f"删除 {path}" if tool == "delete_path" and path else tool
             self.push_screen(
                 ApprovalScreen(
-                    message.event.data.get("tool", "受控操作"),
+                    projection,
                     message.event.data.get("rule_id", "approval.required"),
                     False,
                 ),

@@ -183,6 +183,29 @@ def test_first_request_resumes_after_masked_credential_entry(tmp_path: Path) -> 
     asyncio.run(check())
 
 
+def test_first_request_explains_an_unavailable_keyring_without_starting_a_turn(tmp_path: Path) -> None:
+    from guardedpy.credentials import CredentialBackendUnavailableError
+    from guardedpy.tui import GuardedPyApp
+
+    class UnavailableRuntime(_Runtime):
+        def credential_status(self) -> CredentialStatus:
+            raise CredentialBackendUnavailableError("unavailable")
+
+    profile = _profile(tmp_path)
+    app = GuardedPyApp(UnavailableRuntime(profile), profile)
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit("修复项目")
+            await pilot.pause()
+            assert "安全系统密钥环" in str(
+                app.screen.query_one("#credential-backend-unavailable").render()
+            )
+            assert "无法启动会话。" not in app.query_one("#transcript", Log).lines
+
+    asyncio.run(check())
+
+
 def test_transcript_presenter_coalesces_streaming_text_and_hides_tool_payloads() -> None:
     from guardedpy.conversation import SessionEvent
     from guardedpy.tui import TranscriptPresenter
@@ -357,7 +380,7 @@ def test_tui_controls_approval_queue_stop_and_new_session(tmp_path: Path) -> Non
 
         def run_turn(self, session: UUID, turn: UUID) -> tuple[SessionEvent, ...]:
             return (SessionEvent(session, turn, 2, "approval_requested", uuid4(), data={
-                "approval_id": str(approval_id), "tool": "delete_path", "rule_id": "delete.approval"
+                "approval_id": str(approval_id), "tool": "delete_path", "path": "src/obsolete.py", "rule_id": "delete.approval"
             }),)
 
         def resolve_approval(self, session: UUID, turn: UUID, approval: UUID, accepted: bool) -> tuple[SessionEvent, ...]:
@@ -381,6 +404,7 @@ def test_tui_controls_approval_queue_stop_and_new_session(tmp_path: Path) -> Non
             app.submit("remove old file")
             await pilot.pause()
             assert isinstance(app.screen, ApprovalScreen)
+            assert "src/obsolete.py" in str(app.screen.query_one("#approval-projection").render())
             await pilot.click("#approval-reject")
             await pilot.pause()
             assert conversation.resolutions == [False]
