@@ -1,6 +1,6 @@
 PYTHON ?= python
 
-.PHONY: test demo build cli-check
+.PHONY: test demo build
 
 test:
 	PYTHONPATH=src $(PYTHON) -m pytest tests -q
@@ -10,6 +10,3 @@ demo:
 
 build:
 	$(PYTHON) -m build --no-isolation
-
-cli-check:
-	guardedpy --help
