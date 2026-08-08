@@ -13,8 +13,18 @@ from uuid import UUID
 import yaml
 
 from guardedpy.command_rules import CommandRuleStore
-from guardedpy.config import HarnessConfig, app_state_dir, local_state_path, project_config_path
+from guardedpy.config import (
+    HarnessConfig,
+    app_state_dir,
+    load_config,
+    load_or_create_discovered_config,
+    local_state_path,
+    project_config_path,
+    save_discovered_config,
+    update_future_defaults as updated_future_defaults,
+)
 from guardedpy.credentials import CredentialStatus
+from guardedpy.discovery import ProjectProfile
 from guardedpy.domain import ApprovalDecision, CommandApprovalRule, TaskMode, TaskState, TaskStatus
 from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.lease import ExecutionLease, GlobalExecutionLease, GlobalStateLease
@@ -126,10 +136,10 @@ class LocalRuntime:
         """Return the selected non-secret configuration snapshot."""
         return self._config
 
-    def setup(self, project_root: Path, config: HarnessConfig, api_key: str | None) -> None:
-        """Atomically save non-secret setup state and optionally write the keyring key."""
+    def setup(self, profile: ProjectProfile, api_key: str | None) -> None:
+        """Atomically save discovered non-secret state and optionally write the keyring key."""
         with self._lifecycle_lock:
-            root = project_root.resolve()
+            root = profile.root
             if self._has_active_task():
                 raise RuntimeBusyError()
             execution_lease = GlobalExecutionLease()
@@ -148,7 +158,7 @@ class LocalRuntime:
                 previous_config = _snapshot_file(config_path)
                 previous_index = _snapshot_file(index_path)
                 try:
-                    _write_snapshot(root, config)
+                    config = load_or_create_discovered_config(profile, config_path.parent.parent)
                     _write_local_state(root, task_roots)
                     if api_key is not None and api_key.strip():
                         self._services.credentials.set_key(api_key)
@@ -168,6 +178,31 @@ class LocalRuntime:
                 lease.release()
                 execution_lease.release()
 
+    def update_future_defaults(
+        self, *, model: str | None = None, reasoning_effort: str | None = None
+    ) -> HarnessConfig:
+        """Persist validated selections for later tasks while no task is active."""
+        with self._lifecycle_lock:
+            if self._has_active_task():
+                raise RuntimeBusyError()
+            root, _, _ = self._configured()
+            release_after = self._require_mutation_lease()
+            global_lease: GlobalStateLease | None = None
+            try:
+                global_lease = self._acquire_global_state_lease()
+                current = _load_config(root)
+                changed = updated_future_defaults(
+                    current, model=model, reasoning_effort=reasoning_effort
+                )
+                _write_snapshot(root, changed)
+                self._config = changed
+                return changed
+            finally:
+                if global_lease is not None:
+                    global_lease.release()
+                if release_after:
+                    self._release_lease()
+
     def create_task(
         self, description: str, mode: TaskMode, bugfix_target: str | None
     ) -> TaskState:
@@ -182,11 +217,12 @@ class LocalRuntime:
         description = description.strip()
         if not description:
             raise ValueError("task description must be nonblank")
+        snapshot = config.model_copy(deep=True)
         task = TaskState(
             description=description,
             mode=mode,
             bugfix_target=bugfix_target if mode is TaskMode.BUGFIX else None,
-            config=config,
+            config=snapshot,
         )
         if self._has_active_task() or not self._acquire_lease():
             raise RuntimeBusyError()
@@ -194,9 +230,13 @@ class LocalRuntime:
         index_written = False
         global_lease: GlobalStateLease | None = None
         try:
-            event_store = EventStore(root)
-            orchestrator = self._services.orchestrator_factory(root, config, memory_store)
             global_lease = self._acquire_global_state_lease()
+            current = _load_config(root)
+            self._config = current
+            snapshot = current.model_copy(deep=True)
+            task = task.model_copy(update={"config": snapshot}, deep=True)
+            event_store = EventStore(root)
+            orchestrator = self._services.orchestrator_factory(root, snapshot, memory_store)
             index_path = local_state_path()
             previous_index = _snapshot_file(index_path)
             task_roots = _read_local_state()[1] if index_path.exists() else {}
@@ -486,14 +526,7 @@ class LocalRuntime:
 
 
 def _write_snapshot(project_root: Path, config: HarnessConfig) -> None:
-    snapshot = {
-        "source_dirs": [str(path) for path in config.source_dirs],
-        "test_dirs": [str(path) for path in config.test_dirs],
-        "pytest_command": list(config.pytest_command),
-        "model": config.model,
-        "timeout_seconds": config.timeout_seconds,
-    }
-    _atomic_write(project_config_path(project_root), yaml.safe_dump(snapshot, sort_keys=False).encode())
+    save_discovered_config(config, project_config_path(project_root).parent.parent)
 
 
 def _write_local_state(project_root: Path, task_roots: dict[UUID, Path]) -> None:
@@ -530,8 +563,7 @@ def _restored_project_root(value: str) -> Path:
 
 
 def _load_config(project_root: Path) -> HarnessConfig:
-    payload = yaml.safe_load(project_config_path(project_root).read_text())
-    return HarnessConfig.model_validate(payload)
+    return load_config(project_config_path(project_root), project_root)
 
 
 def _snapshot_file(path: Path) -> bytes | None:

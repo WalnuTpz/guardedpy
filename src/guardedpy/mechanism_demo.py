@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import sys
 from tempfile import TemporaryDirectory
 from typing import Iterator, Literal
 
@@ -15,6 +14,7 @@ from guardedpy.actions import RunCommandAction
 from guardedpy.config import HarnessConfig
 from guardedpy.context import LlmContext
 from guardedpy.domain import FeedbackKind, PolicyVerdict, TaskMode, TaskState
+from guardedpy.discovery import discover_project
 from guardedpy.events import EventStore, StoredRunEvent
 from guardedpy.llm import ScriptedLLM
 from guardedpy.orchestrator import TaskOrchestrator
@@ -89,11 +89,7 @@ def run_scenario(name: ScenarioName) -> ScenarioResult:
             description=_description_for(name),
             mode=TaskMode.BUGFIX,
             bugfix_target="tests/test_value.py::test_value_is_fixed",
-            config=HarnessConfig(
-                source_dirs=(Path("src"),),
-                test_dirs=(Path("tests"),),
-                pytest_command=(sys.executable, "-m", "pytest", "-q"),
-            ),
+            config=HarnessConfig(profile=discover_project(root)),
         )
         llm = FeedbackAwareDemoLLM() if name == "failure_feedback_corrects" else ScriptedLLM(
             _responses_for(name)

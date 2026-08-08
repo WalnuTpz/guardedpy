@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import sys
 from threading import Event, Thread
 
 import pytest
@@ -15,6 +16,7 @@ from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig, project_config_path
 from guardedpy.credentials import CredentialStatus
 from guardedpy.domain import TaskMode, TaskState, TaskStatus
+from guardedpy.discovery import ProjectProfile
 from guardedpy.events import EventStore
 from guardedpy.lease import ExecutionLease, GlobalStateLease
 from guardedpy.llm import ScriptedLLM
@@ -38,11 +40,13 @@ class FakeCredentials:
         self.configured = False
 
 
-def _config() -> HarnessConfig:
-    return HarnessConfig(
-        source_dirs=(Path("src"),),
-        test_dirs=(Path("tests"),),
-        pytest_command=("pytest",),
+def _profile(root: Path) -> ProjectProfile:
+    return ProjectProfile(
+        root=root.resolve(),
+        discovery_source="tests_dir",
+        source_dirs=(PurePosixPath("src"),),
+        test_dirs=(PurePosixPath("tests"),),
+        pytest_command=(sys.executable, "-m", "pytest"),
     )
 
 
@@ -85,13 +89,80 @@ def test_execution_lease_releases_the_nonblocking_file_lock(tmp_path: Path) -> N
     second.release()
 
 
+def test_task_snapshot_retains_model_and_effort_after_default_changes(tmp_path: Path) -> None:
+    runtime = _replacing_runtime(FakeCredentials())
+    runtime.setup(_profile(tmp_path), api_key=None)
+    runtime.update_future_defaults(model="deepseek-v4-pro", reasoning_effort="max")
+    task = runtime.create_task("first", TaskMode.FEATURE, None)
+
+    assert task.config is not runtime.config
+    runtime.cancel(task.id)
+    runtime.update_future_defaults(model="deepseek-v4-flash", reasoning_effort="high")
+
+    assert task.config.model == "deepseek-v4-pro"
+    assert task.config.reasoning_effort == "max"
+    assert runtime.config is not None
+    assert runtime.config.model == "deepseek-v4-flash"
+    assert runtime.config.reasoning_effort == "high"
+
+
+def test_future_default_update_is_rejected_while_task_is_active(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.setup(_profile(tmp_path), api_key=None)
+    runtime.create_task("active", TaskMode.FEATURE, None)
+
+    with pytest.raises(RuntimeBusyError):
+        runtime.update_future_defaults(model="deepseek-v4-pro")
+
+
+def test_cross_runtime_default_updates_merge_from_persisted_snapshot(tmp_path: Path) -> None:
+    first = _runtime(tmp_path)
+    first.setup(_profile(tmp_path), api_key=None)
+    second = _runtime(tmp_path)
+
+    first.update_future_defaults(model="deepseek-v4-pro")
+    merged = second.update_future_defaults(reasoning_effort="max")
+
+    assert merged.model == "deepseek-v4-pro"
+    assert merged.reasoning_effort == "max"
+
+
+def test_task_creation_refreshes_defaults_persisted_by_another_runtime(
+    tmp_path: Path,
+) -> None:
+    first = _runtime(tmp_path)
+    first.setup(_profile(tmp_path), api_key=None)
+    stale = _replacing_runtime(FakeCredentials())
+
+    first.update_future_defaults(model="deepseek-v4-pro", reasoning_effort="max")
+    task = stale.create_task("fresh snapshot", TaskMode.FEATURE, None)
+
+    assert task.config.model == "deepseek-v4-pro"
+    assert task.config.reasoning_effort == "max"
+
+
+def test_setup_persists_only_a_discovered_profile(tmp_path: Path) -> None:
+    credentials = FakeCredentials()
+    runtime = _replacing_runtime(credentials)
+    secret = "sentinel-credential-must-stay-in-keyring"
+
+    runtime.setup(_profile(tmp_path), api_key=secret)
+
+    assert runtime.config is not None
+    assert runtime.config.profile == _profile(tmp_path)
+    assert credentials.keys == [secret]
+    state_files = [path for path in (tmp_path / "state").rglob("*") if path.is_file()]
+    assert state_files
+    assert all(secret not in path.read_text() for path in state_files)
+
+
 def test_second_runtime_cannot_create_a_task_while_first_runtime_holds_active_lease(
     tmp_path: Path,
 ) -> None:
     first = _runtime(tmp_path)
     second = _runtime(tmp_path)
-    first.setup(tmp_path, _config(), api_key=None)
-    second.setup(tmp_path, _config(), api_key=None)
+    first.setup(_profile(tmp_path), api_key=None)
+    second.setup(_profile(tmp_path), api_key=None)
 
     task = first.create_task("repair value", TaskMode.BUGFIX, "tests/test_value.py::test_value")
 
@@ -106,8 +177,8 @@ def test_terminal_run_releases_task_lease_for_another_runtime(tmp_path: Path) ->
     finished = '{"kind":"finish","summary":"PRIVATE","status":"completed"}'
     first = _runtime(tmp_path, [[finished]])
     second = _runtime(tmp_path)
-    first.setup(tmp_path, _config(), api_key=None)
-    second.setup(tmp_path, _config(), api_key=None)
+    first.setup(_profile(tmp_path), api_key=None)
+    second.setup(_profile(tmp_path), api_key=None)
     task = first.create_task("finish", TaskMode.FEATURE, None)
 
     assert first.run(task.id).status is TaskStatus.BLOCKED
@@ -119,7 +190,7 @@ def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate
 ) -> None:
     """Catches restart recovery leaving persisted work active in the runtime cache."""
     first = _runtime(tmp_path)
-    first.setup(tmp_path, _config(), api_key=None)
+    first.setup(_profile(tmp_path), api_key=None)
     task = first.create_task("interrupted", TaskMode.FEATURE, None)
     first._release_lease()
 
@@ -133,7 +204,7 @@ def test_runtime_recovery_interrupts_restored_tasks_and_releases_the_active_gate
 
 def test_runtime_rejects_a_blank_task_description(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
-    runtime.setup(tmp_path, _config(), api_key=None)
+    runtime.setup(_profile(tmp_path), api_key=None)
 
     with pytest.raises(ValueError, match="description"):
         runtime.create_task("  ", TaskMode.FEATURE, None)
@@ -141,7 +212,7 @@ def test_runtime_rejects_a_blank_task_description(tmp_path: Path) -> None:
 
 def test_runtime_registers_a_task_after_orchestrator_startup_recovery(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
-    runtime.setup(tmp_path, _config(), api_key=None)
+    runtime.setup(_profile(tmp_path), api_key=None)
 
     task = runtime.create_task("keep pending", TaskMode.FEATURE, None)
 
@@ -155,8 +226,8 @@ def test_invalid_bugfix_target_releases_the_lease_before_another_runtime_mutates
 ) -> None:
     first = _runtime(tmp_path)
     second = _runtime(tmp_path)
-    first.setup(tmp_path, _config(), api_key=None)
-    second.setup(tmp_path, _config(), api_key=None)
+    first.setup(_profile(tmp_path), api_key=None)
+    second.setup(_profile(tmp_path), api_key=None)
 
     with pytest.raises(ValidationError):
         first.create_task("repair", TaskMode.BUGFIX, "  ")
@@ -171,7 +242,7 @@ def test_runtime_returns_event_store_safe_projection_without_pending_action_body
         tmp_path,
         [['{"kind":"finish","summary":"PRIVATE","status":"blocked"}']],
     )
-    runtime.setup(tmp_path, _config(), api_key=None)
+    runtime.setup(_profile(tmp_path), api_key=None)
     task = runtime.create_task("inspect", TaskMode.FEATURE, None)
 
     runtime.run(task.id)
@@ -183,7 +254,7 @@ def test_runtime_exposes_memory_rule_and_nonsecret_credential_operations(tmp_pat
     proposal = '{"kind":"propose_memory","summary":"remember","text":"Use focused tests"}'
     finish = '{"kind":"finish","summary":"stop","status":"completed"}'
     runtime = _runtime(tmp_path, [[proposal, finish]])
-    runtime.setup(tmp_path, _config(), api_key=None)
+    runtime.setup(_profile(tmp_path), api_key=None)
     task = runtime.create_task("remember a convention", TaskMode.FEATURE, None)
 
     runtime.run(task.id)
@@ -221,8 +292,8 @@ def test_global_execution_lease_blocks_a_second_project_task_but_preserves_index
     second_root = _project_root(tmp_path, "second")
     first = _runtime(first_root)
     second = _runtime(second_root)
-    first.setup(first_root, _config(), api_key=None)
-    second.setup(second_root, _config(), api_key=None)
+    first.setup(_profile(first_root), api_key=None)
+    second.setup(_profile(second_root), api_key=None)
 
     first_task = first.create_task("first task", TaskMode.FEATURE, None)
 
@@ -239,11 +310,11 @@ def test_setup_rejects_a_second_project_while_a_global_task_is_active(tmp_path: 
     second_root = _project_root(tmp_path, "second")
     first = _runtime(first_root)
     second = _runtime(second_root)
-    first.setup(first_root, _config(), api_key=None)
+    first.setup(_profile(first_root), api_key=None)
     first.create_task("first task", TaskMode.FEATURE, None)
 
     with pytest.raises(RuntimeBusyError):
-        second.setup(second_root, _config(), api_key=None)
+        second.setup(_profile(second_root), api_key=None)
 
     assert not project_config_path(second_root).exists()
 
@@ -274,8 +345,8 @@ def test_cross_project_credential_updates_serialize_the_shared_keyring(tmp_path:
 
     first = LocalRuntime(RuntimeServices(credentials=credentials, orchestrator_factory=factory))
     second = LocalRuntime(RuntimeServices(credentials=credentials, orchestrator_factory=factory))
-    first.setup(first_root, _config(), api_key=None)
-    second.setup(second_root, _config(), api_key=None)
+    first.setup(_profile(first_root), api_key=None)
+    second.setup(_profile(second_root), api_key=None)
 
     failures: list[RuntimeBusyError] = []
 
@@ -307,10 +378,10 @@ def test_setup_releases_its_project_lease_when_global_state_is_busy(tmp_path: Pa
     second = _runtime(tmp_path)
 
     with pytest.raises(RuntimeBusyError):
-        first.setup(tmp_path, _config(), api_key=None)
+        first.setup(_profile(tmp_path), api_key=None)
 
     global_lease.release()
-    second.setup(tmp_path, _config(), api_key=None)
+    second.setup(_profile(tmp_path), api_key=None)
 
 
 @dataclass
@@ -342,8 +413,8 @@ def test_failing_submit_keeps_global_index_locked_until_rollback_finishes(
         )
     )
     second = _runtime(second_root, [[], []])
-    first.setup(first_root, _config(), api_key=None)
-    second.setup(second_root, _config(), api_key=None)
+    first.setup(_profile(first_root), api_key=None)
+    second.setup(_profile(second_root), api_key=None)
     restore_started = Event()
     allow_restore = Event()
     original_restore = runtime_module._restore_file
@@ -402,8 +473,8 @@ def test_same_runtime_task_rollback_cannot_release_a_serialized_winner_lease(
         )
     )
     second = _runtime(second_root)
-    first.setup(first_root, _config(), api_key=None)
-    second.setup(second_root, _config(), api_key=None)
+    first.setup(_profile(first_root), api_key=None)
+    second.setup(_profile(second_root), api_key=None)
 
     def blocked_restore(path: Path, content: bytes | None) -> None:
         if path == runtime_module.local_state_path():
@@ -470,8 +541,8 @@ def test_run_caches_a_replacement_terminal_task_and_releases_its_lease(tmp_path:
     credentials = FakeCredentials()
     first = _replacing_runtime(credentials)
     second = _runtime(tmp_path)
-    first.setup(tmp_path, _config(), api_key=None)
-    second.setup(tmp_path, _config(), api_key=None)
+    first.setup(_profile(tmp_path), api_key=None)
+    second.setup(_profile(tmp_path), api_key=None)
     task = first.create_task("finish", TaskMode.FEATURE, None)
 
     returned = first.run(task.id)
@@ -485,8 +556,8 @@ def test_cancel_caches_a_replacement_terminal_task_and_releases_its_lease(tmp_pa
     credentials = FakeCredentials()
     first = _replacing_runtime(credentials)
     second = _runtime(tmp_path)
-    first.setup(tmp_path, _config(), api_key=None)
-    second.setup(tmp_path, _config(), api_key=None)
+    first.setup(_profile(tmp_path), api_key=None)
+    second.setup(_profile(tmp_path), api_key=None)
     task = first.create_task("cancel", TaskMode.FEATURE, None)
 
     returned = first.cancel(task.id)

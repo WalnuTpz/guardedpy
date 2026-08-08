@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path, PurePosixPath
-import sys
 from uuid import uuid4
 
 import pytest
 
 import guardedpy.orchestrator as orchestrator_module
+from conftest import safe_config
 from guardedpy.actions import RunCommandAction
 from guardedpy.command_rules import CommandRuleStore
 from guardedpy.config import HarnessConfig
@@ -23,11 +23,7 @@ from guardedpy.workspace import ToolResult, Workspace
 
 
 def _config() -> HarnessConfig:
-    return HarnessConfig(
-        source_dirs=(Path("src"),),
-        test_dirs=(Path("tests"),),
-        pytest_command=(sys.executable, "-m", "pytest", "-q"),
-    )
+    return safe_config(Path.cwd())
 
 
 def _action(**payload: object) -> str:
@@ -872,11 +868,7 @@ def test_pytest_execution_error_does_not_count_as_the_required_red_observation(
         description="Repair a test",
         mode=TaskMode.BUGFIX,
         bugfix_target="tests/test_value.py::test_value_is_fixed",
-        config=HarnessConfig(
-            source_dirs=(Path("src"),),
-            test_dirs=(Path("tests"),),
-            pytest_command=(sys.executable, "-c", "raise SystemExit(3)"),
-        ),
+        config=safe_config(tmp_path),
     )
     llm = ScriptedLLM(
         [

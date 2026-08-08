@@ -1,4 +1,6 @@
-from pathlib import Path
+from hashlib import sha256
+from pathlib import Path, PurePosixPath
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -7,96 +9,138 @@ import yaml
 from guardedpy.config import (
     HarnessConfig,
     app_state_dir,
-    load_config,
+    load_or_create_discovered_config,
     local_state_path,
     project_config_path,
+    update_future_defaults,
 )
+from guardedpy.discovery import ProjectProfile
 
 
-def test_config_rejects_parent_escape(tmp_path: Path) -> None:
-    """Catches a configuration change that permits escaping the selected root."""
-    (tmp_path / "harness.yaml").write_text(
-        "source_dirs: ['../x']\ntest_dirs: [tests]\npytest_command: [pytest]\n"
+def _profile(root: Path, *, tests: str = "tests") -> ProjectProfile:
+    (root / "src").mkdir(parents=True, exist_ok=True)
+    (root / tests).mkdir(parents=True, exist_ok=True)
+    return ProjectProfile(
+        root=root.resolve(),
+        discovery_source="tests_dir",
+        source_dirs=(PurePosixPath("src"),),
+        test_dirs=(PurePosixPath(tests),),
+        pytest_command=(sys.executable, "-m", "pytest"),
     )
 
-    with pytest.raises(ValidationError, match="inside the project root"):
-        load_config(tmp_path / "harness.yaml", tmp_path)
+
+def test_discovered_config_defaults_are_closed_and_frozen(tmp_path: Path) -> None:
+    profile = _profile(tmp_path)
+    config = HarnessConfig(profile=profile)
+
+    assert config.profile == profile
+    assert config.source_dirs == (PurePosixPath("src"),)
+    assert config.test_dirs == (PurePosixPath("tests"),)
+    assert config.pytest_command == (sys.executable, "-m", "pytest")
+    assert config.model == "deepseek-v4-flash"
+    assert config.thinking_enabled is True
+    assert config.reasoning_effort == "high"
+    assert config.timeout_seconds == 120
+    with pytest.raises(ValidationError):
+        config.model = "deepseek-v4-pro"
 
 
-def test_config_rejects_absolute_directory(tmp_path: Path) -> None:
-    """Catches a configuration change that accepts an absolute source directory."""
-    (tmp_path / "harness.yaml").write_text(
-        "source_dirs: ['/tmp/x']\ntest_dirs: [tests]\npytest_command: [pytest]\n"
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"model": "deepseek-chat"},
+        {"reasoning_effort": "medium"},
+        {"thinking_enabled": False},
+    ],
+)
+def test_discovered_config_rejects_unsupported_provider_choices(
+    tmp_path: Path, changes: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError):
+        HarnessConfig(profile=_profile(tmp_path), **changes)
+
+
+def test_load_or_create_discovered_config_persists_only_nonsecret_task_defaults(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    state_dir = tmp_path / "state"
+    root.mkdir()
+    profile = _profile(root)
+
+    config = load_or_create_discovered_config(profile, state_dir)
+
+    root_hash = sha256(str(root.resolve()).encode()).hexdigest()[:16]
+    snapshot_path = state_dir / root_hash / "harness.yaml"
+    assert config.profile == profile
+    assert snapshot_path.is_file()
+    assert yaml.safe_load(snapshot_path.read_text()) == {
+        "profile": {
+            "root": str(root.resolve()),
+            "discovery_source": "tests_dir",
+            "source_dirs": ["src"],
+            "test_dirs": ["tests"],
+            "pytest_command": [sys.executable, "-m", "pytest"],
+        },
+        "model": "deepseek-v4-flash",
+        "thinking_enabled": True,
+        "reasoning_effort": "high",
+        "timeout_seconds": 120,
+    }
+    assert "key" not in snapshot_path.read_text().lower()
+
+
+def test_load_or_create_uses_current_discovery_and_retains_valid_future_defaults(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    state_dir = tmp_path / "state"
+    root.mkdir()
+    old_profile = _profile(root)
+    old = load_or_create_discovered_config(old_profile, state_dir)
+    changed = update_future_defaults(
+        old, model="deepseek-v4-pro", reasoning_effort="max"
+    ).model_copy(update={"timeout_seconds": 17})
+    snapshot = yaml.safe_load(
+        (state_dir / sha256(str(root.resolve()).encode()).hexdigest()[:16] / "harness.yaml").read_text()
+    )
+    snapshot.update(
+        {
+            "model": changed.model,
+            "reasoning_effort": changed.reasoning_effort,
+            "timeout_seconds": changed.timeout_seconds,
+        }
+    )
+    snapshot["profile"]["test_dirs"] = ["old-tests"]
+    snapshot_path = state_dir / sha256(str(root.resolve()).encode()).hexdigest()[:16] / "harness.yaml"
+    snapshot_path.write_text(yaml.safe_dump(snapshot, sort_keys=False))
+    new_profile = _profile(root, tests="checks")
+
+    loaded = load_or_create_discovered_config(new_profile, state_dir)
+
+    assert loaded.profile == new_profile
+    assert loaded.model == "deepseek-v4-pro"
+    assert loaded.reasoning_effort == "max"
+    assert loaded.timeout_seconds == 17
+
+
+def test_update_future_defaults_returns_a_new_frozen_config(tmp_path: Path) -> None:
+    original = HarnessConfig(profile=_profile(tmp_path))
+
+    changed = update_future_defaults(
+        original, model="deepseek-v4-pro", reasoning_effort="max"
     )
 
-    with pytest.raises(ValidationError, match="inside the project root"):
-        load_config(tmp_path / "harness.yaml", tmp_path)
+    assert changed is not original
+    assert (original.model, original.reasoning_effort) == ("deepseek-v4-flash", "high")
+    assert (changed.model, changed.reasoning_effort) == ("deepseek-v4-pro", "max")
 
 
 @pytest.mark.parametrize("timeout", [4, 121])
 def test_config_rejects_timeout_outside_allowed_range(timeout: int) -> None:
     """Catches a configuration change that allows a test timeout outside 5–120 seconds."""
     with pytest.raises(ValidationError):
-        HarnessConfig(
-            source_dirs=("src",),
-            test_dirs=("tests",),
-            pytest_command=("pytest",),
-            timeout_seconds=timeout,
-        )
-
-
-def test_load_config_returns_relative_directory_configuration(tmp_path: Path) -> None:
-    """Catches a loader that loses the configured project-relative boundaries."""
-    config_file = tmp_path / "harness.yaml"
-    config_file.write_text(
-        "source_dirs: [src]\ntest_dirs: [tests]\npytest_command: [pytest, -q]\n"
-    )
-
-    config = load_config(config_file, tmp_path)
-
-    assert config.source_dirs == (Path("src"),)
-    assert config.test_dirs == (Path("tests"),)
-    assert config.pytest_command == ("pytest", "-q")
-
-
-@pytest.mark.parametrize(
-    "snapshot",
-    [
-        {"source_dirs": [], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
-        {"source_dirs": ["src"], "test_dirs": [], "pytest_command": ["pytest"]},
-        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": []},
-        {"source_dirs": [""], "test_dirs": ["tests"], "pytest_command": ["pytest"]},
-        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest", " "]},
-        {"source_dirs": ["src"], "test_dirs": ["tests"], "pytest_command": ["pytest"], "model": "  "},
-    ],
-)
-def test_load_config_rejects_empty_required_values(tmp_path: Path, snapshot: dict[str, object]) -> None:
-    """Catches restored configuration accepting an empty required value."""
-    config_file = tmp_path / "harness.yaml"
-    config_file.write_text(yaml.safe_dump(snapshot))
-
-    with pytest.raises(ValidationError):
-        load_config(config_file, tmp_path)
-
-
-def test_load_config_normalizes_command_tokens_and_model(tmp_path: Path) -> None:
-    """Catches persisted command/model whitespace becoming part of the runtime configuration."""
-    config_file = tmp_path / "harness.yaml"
-    config_file.write_text(
-        yaml.safe_dump(
-            {
-                "source_dirs": ["src"],
-                "test_dirs": ["tests"],
-                "pytest_command": [" pytest ", " -q "],
-                "model": " deepseek-chat ",
-            }
-        )
-    )
-
-    config = load_config(config_file, tmp_path)
-
-    assert config.pytest_command == ("pytest", "-q")
-    assert config.model == "deepseek-chat"
+        HarnessConfig(profile=_profile(Path.cwd()), timeout_seconds=timeout)
 
 
 def test_app_state_dir_is_outside_project_and_root_isolated(
