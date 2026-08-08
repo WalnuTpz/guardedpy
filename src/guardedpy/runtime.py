@@ -31,6 +31,11 @@ from guardedpy.conversation import (
 from guardedpy.conversations import ConversationStore
 from guardedpy.credentials import CredentialStatus
 from guardedpy.discovery import ProjectProfile
+from guardedpy.feedback import FeedbackCollector
+from guardedpy.workspace import Workspace
+
+
+_MAX_SUMMARY_TEXT = 1200
 
 
 class CredentialPort(Protocol):
@@ -86,8 +91,10 @@ class ConversationRuntime:
             self._summaries[session_id] = summary
             return summary
 
-    def begin_turn(self, session_id: UUID, text: str, mode: TurnMode = "normal") -> tuple[UUID, SessionEvent]:
-        return self._agent.begin_turn(session_id, text, mode)
+    def begin_turn(
+        self, session_id: UUID, text: str, mode: TurnMode = "normal", *, goal: str | None = None
+    ) -> tuple[UUID, SessionEvent]:
+        return self._agent.begin_turn(session_id, text, mode, goal=goal)
 
     def run_turn(self, session_id: UUID, turn_id: UUID):
         return self._capture(session_id, turn_id, self._agent.run_turn(session_id, turn_id))
@@ -109,8 +116,6 @@ class ConversationRuntime:
 
     def _capture(self, session_id: UUID, turn_id: UUID, events: object):
         for event in events:  # type: ignore[union-attr]
-            if event.kind == "assistant_text_delta":
-                self._texts.setdefault((session_id, turn_id), []).append(event.text)
             facts = self._facts.setdefault((session_id, turn_id), {
                 "changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none",
             })
@@ -135,11 +140,41 @@ class ConversationRuntime:
         turn = SafeTurnSummary(
             terminal_status=status, changed_paths=tuple(sorted(facts["changed_paths"])),
             pytest_outcome=facts["pytest_outcome"], approval_outcome=facts["approval_outcome"],
-            final_text="".join(self._texts.pop((session_id, turn_id), [])),
+            final_text=_bounded_safe_summary(_safe_summary_text(status, facts)),
         )
         updated = summary.model_copy(update={"updated_at": datetime.now(timezone.utc), "turns": (*summary.turns, turn)})
         self._summaries[session_id] = updated
         self.store.save_summary(updated)
+
+def _safe_summary_text(status: str, facts: dict[str, object]) -> str:
+    """Persist only deterministic lifecycle and tool facts, never model text."""
+    text = {
+        "completed": "本轮已完成。",
+        "interrupted": "本轮已中断。",
+        "failed": "本轮未完成。",
+    }[status]
+    paths = facts["changed_paths"]
+    if paths:
+        text += f"已修改 {', '.join(sorted(paths))}。"
+    pytest_outcome = facts["pytest_outcome"]
+    if pytest_outcome != "not_run":
+        text += {
+            "passed": "pytest：通过。",
+            "assertion_failure": "pytest：发现断言失败。",
+            "collection_error": "pytest：收集失败。",
+            "execution_error": "pytest：执行失败。",
+            "timeout": "pytest：超时。",
+        }[pytest_outcome]
+    approval_outcome = facts["approval_outcome"]
+    if approval_outcome == "approved":
+        text += "危险操作已批准。"
+    elif approval_outcome == "rejected":
+        text += "危险操作已拒绝。"
+    return text
+
+
+def _bounded_safe_summary(text: str) -> str:
+    return text if len(text) <= _MAX_SUMMARY_TEXT else text[: _MAX_SUMMARY_TEXT - 1] + "…"
 
 
 class LocalRuntime:
@@ -186,6 +221,23 @@ class LocalRuntime:
 
     def clear_credential(self) -> None:
         self._services.credentials.clear_key()
+
+    def local_check(self, name: str) -> str:
+        """Run one explicitly requested, bounded local diagnostic."""
+        root, config = self._configured()
+        workspace = Workspace(root, config)
+        if name == "tests":
+            feedback = FeedbackCollector().collect(workspace.run_pytest(()))
+            return f"pytest：{feedback.kind.value}"
+        if name == "diff":
+            result = workspace.git_diff()
+            if not result.ok:
+                return "Git diff：不可用"
+            return "Git diff：有变更" if result.data.get("output") else "Git diff：无变更"
+        if name == "doctor":
+            configured = self.credential_status().configured
+            return f"诊断：项目已识别；凭据{'已配置' if configured else '未配置'}"
+        raise ValueError("unknown local check")
 
     def _configured(self) -> tuple[Path, HarnessConfig]:
         if self._project_root is None or self._config is None:

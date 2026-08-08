@@ -111,6 +111,15 @@ class ToolGovernor:
             sort_keys=True, separators=(",", ":"),
         )
 
+    def presentation(self, call: ToolCall) -> dict[str, str]:
+        """Return the small, schema-validated tool fact safe for the transcript."""
+        try:
+            parsed = parse_tool_call(call)
+        except ValueError:
+            return {"tool": call.name}
+        path = getattr(parsed, "path", None)
+        return {"tool": call.name} if path is None else {"tool": call.name, "path": path}
+
     def decide(self, turn: Turn, item_id: UUID, call: ToolCall) -> GovernanceDecision:
         try:
             normalized = self.normalized_call(call)

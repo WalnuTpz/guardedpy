@@ -9,33 +9,38 @@ from uuid import UUID
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual import events
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, ListItem, ListView, Log, RichLog, Static, TextArea
 
-from guardedpy.conversation import SessionEvent
+from guardedpy.conversation import SessionEvent, TurnNotActiveError, safe_event_message
 from guardedpy.credentials import CredentialBackendUnavailableError
 from guardedpy.mechanism_demo import ScenarioName, run_scenario
 
 
 COMMANDS = (
     "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
-    "/credentials", "/model", "/effort", "/goal", "/help", "/stop", "/queue",
+    "/tests", "/diff", "/permissions", "/credentials", "/memory", "/model", "/effort",
+    "/doctor", "/goal", "/help", "/stop", "/queue",
 )
 
 _HELP_LINES = (
-    "会话与对话：/history /conversations /new /clear /exit",
-    "任务：/plan <任务> /review <路径> /stop /queue <任务>",
-    "设置与安全：/model /effort /goal /credentials",
-    "交互：Enter 提交，Shift+Enter 或 Ctrl+J 换行。",
+    "会话：/new 新建；/conversations 选择历史；/history 查看当前摘要；/clear 清屏；/exit 退出。",
+    "工作：直接输入即可对话或编码；/plan <任务> 只读计划；/review <路径> 只读审查；/stop 中断；/queue <任务> 排队。",
+    "检查：/tests 运行 pytest；/diff 查看 Git diff；/doctor 查看本地状态；/permissions 说明工具权限。",
+    "设置：/credentials 安全录入、查看或清除 Key；/model 与 /effort 设置后续回合；/goal <目标> 仅作用下一回合，/goal clear 取消。",
+    "记忆：/memory 查看当前会话的安全摘要。交互：Enter 提交；Shift+Enter 或 Ctrl+J 换行；Ctrl+Shift+C 复制安全 transcript。",
+    "危险操作：删除始终逐次要求批准；非交互终端不会自动批准。",
 )
 
 
 _NO_ARGUMENT_COMMANDS = frozenset(
     {
         "/new", "/clear", "/history", "/conversations", "/exit", "/credentials",
-        "/help", "/model", "/effort", "/stop",
+        "/help", "/model", "/effort", "/stop", "/tests", "/diff", "/permissions",
+        "/memory", "/doctor",
     }
 )
 
@@ -72,17 +77,8 @@ class TranscriptPresenter:
                 return None
             text = self._assistant_text.get(event.item_id, "") + event.text
             self._assistant_text[event.item_id] = text
-            return TranscriptUpdate(event.item_id, f"助手：{text}", replace=True)
-        status = {
-            "tool_item_started": "正在使用受控工具。",
-            "tool_output": "工具已返回受限结果。",
-            "tool_item_completed": "工具执行完成。",
-            "approval_requested": "需要精确审批。",
-            "approval_resolved": "审批已处理。",
-            "turn_completed": "本轮回复已完成。",
-            "turn_interrupted": "本轮回复已中断。",
-            "turn_failed": "本轮回复未完成。",
-        }.get(event.kind)
+            return TranscriptUpdate(event.item_id, text, replace=True)
+        status = safe_event_message(event)
         if status is None:
             return None
         return TranscriptUpdate(event.item_id, status)
@@ -149,11 +145,15 @@ class SettingsScreen(ModalScreen[str | None]):
     """Choose a validated future-task setting with keyboard or mouse."""
 
     def __init__(
-        self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
+        self,
+        field: Literal["model", "reasoning_effort"],
+        values: tuple[str, ...],
+        current: str,
     ) -> None:
         super().__init__()
         self._field = field
         self._values = values
+        self._current = current
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -167,34 +167,11 @@ class SettingsScreen(ModalScreen[str | None]):
 
     def on_mount(self) -> None:
         picker = self.query_one("#settings-picker", ListView)
-        picker.index = 0
+        picker.index = self._values.index(self._current)
         picker.focus()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(str(event.item.query_one(Static).render()))
-
-
-class ModePickerScreen(ModalScreen[Literal["plan", "review", "goal"] | None]):
-    """Select the next in-composer task mode without attachment semantics."""
-
-    _options = (("plan", "计划"), ("review", "审查"), ("goal", "目标"))
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            ListView(
-                *(ListItem(Static(label), id=f"mode-{mode}") for mode, label in self._options),
-                id="mode-picker-list",
-            ),
-            id="mode-picker-modal",
-        )
-
-    def on_mount(self) -> None:
-        picker = self.query_one("#mode-picker-list", ListView)
-        picker.index = 0
-        picker.focus()
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        self.dismiss((event.item.id or "").removeprefix("mode-") or None)
 
 
 class HelpScreen(ModalScreen[None]):
@@ -355,6 +332,8 @@ class SessionEventReceived(Message):
 class GuardedPyApp(App[None]):
     """The single-project interactive terminal session."""
 
+    BINDINGS = [("ctrl+shift+c", "copy_transcript", "复制会话")]
+
     CSS = """
     #status { height: 1; padding: 0 1; background: $panel; }
     #transcript-shell { height: 1fr; border: round $primary; }
@@ -384,12 +363,13 @@ class GuardedPyApp(App[None]):
         self._palette_index = -1
         self._suppress_palette_once = False
         self._session_goal: str | None = None
-        self._mode: Literal["coding", "plan", "review", "goal"] = "coding"
         self._conversation_runtime = conversation
         self._continuous_session_id: UUID | None = None
         self._continuous_turn_id: UUID | None = None
         self._continuous_pending_approval: tuple[UUID, UUID, UUID] | None = None
+        self._pending_submission: tuple[str, Literal["normal", "plan", "review"]] | None = None
         self._transcript_presenter = TranscriptPresenter()
+        self._seen_events: set[tuple[UUID, UUID, int]] = set()
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text(), id="status")
@@ -494,21 +474,14 @@ class GuardedPyApp(App[None]):
         if request.startswith("/"):
             self._submit_command(request)
             return
-        mode = self._mode
-        if mode == "goal":
-            self._set_session_goal(request)
-            return
-        self._mode = "coding"
-        self._refresh_composer_controls()
-        self._submit_continuous(
-            request, {"coding": "normal", "plan": "plan", "review": "review"}[mode]
-        )
+        self._submit_continuous(request, "normal")
 
     def _submit_continuous(self, text: str, mode: Literal["normal", "plan", "review"]) -> None:
         """Start or steer one continuous session without the legacy task renderer."""
         try:
             if not self.runtime.credential_status().configured:
-                self._write("需要先在交互终端配置凭据。")
+                self._pending_submission = (text, mode)
+                self.push_screen(CredentialScreen(False), self._credential_resolved)
                 return
             if self._continuous_session_id is None:
                 self._continuous_session_id = self._conversation_runtime.create_session(str(self.profile.root))
@@ -518,9 +491,12 @@ class GuardedPyApp(App[None]):
                 )
                 self._present_session_event(event)
                 return
+            goal = self._session_goal
             turn_id, event = self._conversation_runtime.begin_turn(
-                self._continuous_session_id, text, mode
+                self._continuous_session_id, text, mode, **({"goal": goal} if goal else {})
             )
+            self._session_goal = None
+            self._refresh_composer_controls()
         except Exception:
             self._write("无法启动会话。")
             return
@@ -542,7 +518,17 @@ class GuardedPyApp(App[None]):
             ))
 
     def on_session_event_received(self, message: SessionEventReceived) -> None:
+        event_key = (
+            message.event.session_id,
+            message.event.turn_id,
+            message.event.sequence,
+        )
+        if event_key in self._seen_events:
+            return
+        self._seen_events.add(event_key)
         self._present_session_event(message.event)
+        if message.event.kind == "turn_started":
+            self._continuous_turn_id = message.event.turn_id
         if message.event.kind == "approval_requested":
             approval_id = UUID(message.event.data["approval_id"])
             self._continuous_pending_approval = (
@@ -556,7 +542,7 @@ class GuardedPyApp(App[None]):
                 ),
                 self._continuous_approval_resolved,
             )
-        if message.event.kind in {"turn_completed", "turn_interrupted", "turn_failed"}:
+        if message.event.kind in {"turn_completed", "turn_interrupted", "turn_failed"} and message.event.turn_id == self._continuous_turn_id:
             self._continuous_turn_id = None
 
     def _continuous_approval_resolved(self, decision: str | None) -> None:
@@ -586,9 +572,13 @@ class GuardedPyApp(App[None]):
     def _interrupt_continuous(self) -> None:
         if self._continuous_session_id is None or self._continuous_turn_id is None:
             return
-        event = self._conversation_runtime.interrupt(
-            self._continuous_session_id, self._continuous_turn_id
-        )
+        try:
+            event = self._conversation_runtime.interrupt(
+                self._continuous_session_id, self._continuous_turn_id
+            )
+        except TurnNotActiveError:
+            self._continuous_turn_id = None
+            return
         if event is not None:
             self._present_session_event(event)
             self._continuous_turn_id = None
@@ -596,7 +586,10 @@ class GuardedPyApp(App[None]):
     def _present_session_event(self, event: SessionEvent) -> None:
         update = self._transcript_presenter.present(event)
         if update is not None:
-            self.query_one("#transcript", TranscriptLog).apply_update(update)
+            try:
+                self.query_one("#transcript", TranscriptLog).apply_update(update)
+            except NoMatches:
+                return
 
     def _submit_command(self, command: str) -> None:
         name, _, argument = command.partition(" ")
@@ -625,6 +618,25 @@ class GuardedPyApp(App[None]):
             else:
                 self._render_summary(self._conversation_runtime.summary(self._continuous_session_id))
             return
+        if name == "/memory":
+            if self._continuous_session_id is None:
+                self._write("暂无安全摘要")
+            else:
+                summary = self._conversation_runtime.summary(self._continuous_session_id)
+                if summary.turns:
+                    self._render_summary(summary)
+                else:
+                    self._write("暂无安全摘要")
+            return
+        if name == "/permissions":
+            self._write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。")
+            return
+        if name in {"/tests", "/diff", "/doctor"}:
+            try:
+                self._write(self.runtime.local_check(name.removeprefix("/")))
+            except Exception:
+                self._write("本地检查不可用。")
+            return
         if name == "/help":
             self.push_screen(HelpScreen())
             return
@@ -648,7 +660,6 @@ class GuardedPyApp(App[None]):
         if name == "/goal":
             if argument == "clear":
                 self._session_goal = None
-                self._mode = "coding"
                 self._refresh_composer_controls()
             elif argument:
                 self._set_session_goal(argument)
@@ -672,6 +683,9 @@ class GuardedPyApp(App[None]):
             self._present_session_event(event)
             return
         if name == "/plan":
+            if not argument:
+                self._write("计划任务不能为空。")
+                return
             self._submit_continuous(argument, "plan")
             return
         if name == "/review":
@@ -688,7 +702,11 @@ class GuardedPyApp(App[None]):
     def _open_settings(
         self, field: Literal["model", "reasoning_effort"], values: tuple[str, ...]
     ) -> None:
-        self.push_screen(SettingsScreen(field, values), lambda value: self._setting_resolved(field, value))
+        current = getattr(self.runtime.config, field)
+        self.push_screen(
+            SettingsScreen(field, values, current),
+            lambda value: self._setting_resolved(field, value),
+        )
 
     def _setting_resolved(
         self, field: Literal["model", "reasoning_effort"], value: str | None
@@ -719,6 +737,10 @@ class GuardedPyApp(App[None]):
                     return
                 self.runtime.update_credential(value)
                 self._write("凭据已更新。")
+                pending = self._pending_submission
+                self._pending_submission = None
+                if pending is not None:
+                    self._submit_continuous(*pending)
             elif operation == "clear_requested":
                 self.push_screen(ClearCredentialScreen(), self._clear_credential_resolved)
         except Exception:
@@ -749,8 +771,8 @@ class GuardedPyApp(App[None]):
         self._continuous_session_id = self._conversation_runtime.create_session(str(self.profile.root))
         self._continuous_turn_id = None
         self._transcript_presenter = TranscriptPresenter()
+        self._seen_events.clear()
         self._session_goal = None
-        self._mode = "coding"
         self._refresh_composer_controls()
         self.query_one("#transcript", TranscriptLog).reset_continuous()
         composer = self.query_one("#composer", Composer)
@@ -766,6 +788,7 @@ class GuardedPyApp(App[None]):
         summary = self._conversation_runtime.summary(self._continuous_session_id)
         self._continuous_turn_id = None
         self._transcript_presenter = TranscriptPresenter()
+        self._seen_events.clear()
         self.query_one("#transcript", TranscriptLog).reset_continuous()
         self._render_summary(summary)
         composer = self.query_one("#composer", Composer)
@@ -776,7 +799,7 @@ class GuardedPyApp(App[None]):
         for index, turn in enumerate(summary.turns, start=1):
             if turn.final_text:
                 self.query_one("#transcript", TranscriptLog).apply_update(
-                    TranscriptUpdate(UUID(int=index), f"助手：{turn.final_text}")
+                    TranscriptUpdate(UUID(int=index), turn.final_text)
                 )
             terminal = {
                 "completed": "turn_completed",
@@ -789,9 +812,15 @@ class GuardedPyApp(App[None]):
     def _write(self, value: object) -> None:
         self.query_one("#transcript", Log).write(str(value))
 
+    def action_copy_transcript(self) -> None:
+        transcript = self.query_one("#transcript", TranscriptLog)
+        self.copy_to_clipboard("\n".join(transcript.lines).rstrip("\n"))
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "mode-picker":
-            self.push_screen(ModePickerScreen(), self._mode_resolved)
+            composer = self.query_one("#composer", Composer)
+            composer.text = "/"
+            composer.focus()
         elif event.button.id == "composer-model":
             self._open_settings("model", ("deepseek-v4-flash", "deepseek-v4-pro"))
         elif event.button.id == "composer-effort":
@@ -799,36 +828,21 @@ class GuardedPyApp(App[None]):
         elif event.button.id == "send":
             self.submit(self.query_one("#composer", Composer).text)
 
-    def _mode_resolved(self, mode: Literal["plan", "review", "goal"] | None) -> None:
-        if mode is None:
-            return
-        self._mode = mode
-        self._refresh_composer_controls()
-        composer = self.query_one("#composer", Composer)
-        composer.focus()
-
     def _set_session_goal(self, value: str) -> None:
         goal = value.strip()
         if not goal:
             self._write("目标不能为空。")
             return
         self._session_goal = goal
-        self._mode = "coding"
         self._refresh_composer_controls()
 
     def _refresh_composer_controls(self) -> None:
         composer = self.query_one("#composer", Composer)
         chip = self.query_one("#mode-chip", Static)
-        labels = {"plan": "[计划]", "review": "[审查]", "goal": "[目标]"}
-        label = labels.get(self._mode) or ("[目标]" if self._session_goal else "")
+        label = "[目标]" if self._session_goal else ""
         chip.update(label)
         chip.display = bool(label)
-        composer.placeholder = {
-            "coding": "输入任务",
-            "plan": "输入规划任务",
-            "review": "输入项目根内相对审查路径",
-            "goal": "输入会话目标",
-        }[self._mode]
+        composer.placeholder = "输入任务"
         self.query_one("#composer-model", Button).label = self.runtime.config.model
         self.query_one("#composer-effort", Button).label = self.runtime.config.reasoning_effort
 

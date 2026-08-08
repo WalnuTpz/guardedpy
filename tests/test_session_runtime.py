@@ -7,6 +7,7 @@ from uuid import uuid4
 from guardedpy.conversation import (
     ConversationAgent,
     ConversationSummary,
+    ProviderMessage,
     ResponseFinished,
     ScriptedConversationModel,
     TextDelta,
@@ -33,9 +34,9 @@ def test_summary_store_round_trips_only_the_safe_summary(tmp_path: Path, monkeyp
     assert ConversationStore(tmp_path / "project").load_summary(summary.id) == summary
 
 
-def test_runtime_persists_terminal_turn_without_provider_thread(tmp_path: Path, monkeypatch: object) -> None:
+def test_runtime_persists_only_a_deterministic_terminal_summary(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
-    model = ScriptedConversationModel([[TextDelta("hello"), ResponseFinished("stop")]])
+    model = ScriptedConversationModel([[TextDelta("API_KEY=secret"), ResponseFinished("stop")]])
     runtime = ConversationRuntime(ConversationAgent(model), ConversationStore(tmp_path))
     session_id = runtime.create_session("demo")
     turn_id, immediate = runtime.begin_turn(session_id, "private user text")
@@ -46,8 +47,21 @@ def test_runtime_persists_terminal_turn_without_provider_thread(tmp_path: Path, 
     assert immediate.kind == "user_message"
     assert events[-1].kind == "turn_completed"
     assert summary.turns[0].terminal_status == "completed"
-    assert summary.turns[0].final_text == "hello"
+    assert summary.turns[0].final_text == "本轮已完成。"
     assert "private user text" not in runtime.store.database_path.read_text(errors="ignore")
+    assert "API_KEY=secret" not in runtime.store.database_path.read_text(errors="ignore")
+
+
+def test_runtime_forwards_a_one_turn_goal_to_the_agent(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))  # type: ignore[attr-defined]
+    model = ScriptedConversationModel([[TextDelta("done"), ResponseFinished("stop")]])
+    runtime = ConversationRuntime(ConversationAgent(model), ConversationStore(tmp_path))
+    session_id = runtime.create_session("demo")
+
+    turn_id, _ = runtime.begin_turn(session_id, "repair", goal="Keep it small")
+    list(runtime.run_turn(session_id, turn_id))
+
+    assert ProviderMessage(role="system", content="Current turn goal: Keep it small") in model.received_messages[0]
 
 
 def test_runtime_summary_maps_safe_tool_facts_from_actual_events(tmp_path: Path, monkeypatch: object) -> None:
@@ -77,3 +91,4 @@ def test_runtime_summary_maps_safe_tool_facts_from_actual_events(tmp_path: Path,
     assert summary.changed_paths == ("src/value.py",)
     assert summary.pytest_outcome == "passed"
     assert summary.approval_outcome == "none"
+    assert summary.final_text == "本轮已完成。已修改 src/value.py。pytest：通过。"

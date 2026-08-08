@@ -107,6 +107,16 @@ def test_repair_turn_receives_assertion_feedback_then_patches_and_full_retests(t
     first_result = json.loads(model.received_messages[1][-1].content)
     assert first_result["feedback"]["kind"] == "assertion_failure"
     assert first_result["feedback"]["node_ids"] == ["tests/test_calc.py::test_value"]
+    patch_event = next(
+        event for event in events
+        if event.kind == "tool_item_completed" and event.data.get("changed_paths")
+    )
+    assert patch_event.data["tool"] == "apply_patch"
+    read_event = next(
+        event for event in events
+        if event.kind == "tool_item_started" and event.data.get("tool") == "read_file"
+    )
+    assert read_event.data["path"] == "src/calc.py"
     assert (tmp_path / "src" / "calc.py").read_text() == "VALUE = 20\n"
     assert (events[-1].kind, events[-1].data) == ("turn_completed", {})
 
@@ -307,9 +317,60 @@ def test_normal_chat_returns_immediate_user_event_then_text_deltas_and_terminal(
     ]
     assert later_events[0].item_id is None
     assert later_events[-1].item_id is None
-    assert model.received_messages == [
-        (ProviderMessage(role="user", content="hello"),)
-    ]
+    assert model.received_messages[0][-1] == ProviderMessage(role="user", content="hello")
+
+
+def test_session_context_tells_the_model_to_converse_and_use_governed_tools() -> None:
+    model = ScriptedConversationModel([[ResponseFinished("stop")]])
+    agent = ConversationAgent(model)
+    session_id = agent.create_session()
+    turn_id, _ = agent.begin_turn(session_id, "hello")
+
+    list(agent.run_turn(session_id, turn_id))
+
+    context = model.received_messages[0]
+    assert context[0].role == "system"
+    assert "interactive coding agent" in context[0].content
+    assert "ordinary conversation" in context[0].content
+    assert context[-1] == ProviderMessage(role="user", content="hello")
+
+
+def test_one_session_can_chat_repair_and_answer_a_grounded_follow_up(tmp_path: Path) -> None:
+    _prepare_project(tmp_path)
+    (tmp_path / "src" / "calc.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests" / "test_calc.py").write_text(
+        "from src.calc import VALUE\n\ndef test_value():\n    assert VALUE == 20\n"
+    )
+    agent, model = _governed_agent(tmp_path, [
+        [TextDelta("你好，我可以帮你检查并修改这个项目。"), ResponseFinished("stop")],
+        _tool_response(("baseline", "run_pytest", {})),
+        _tool_response(("read", "read_file", {"path": "src/calc.py"})),
+        _tool_response(("patch", "apply_patch", {"unified_diff": _patch("VALUE = 1", "VALUE = 20")})),
+        _tool_response(("verify", "run_pytest", {})),
+        [TextDelta("已修复并完成完整 pytest 验证。"), ResponseFinished("stop")],
+        [TextDelta("错误是 VALUE 的值错误；我已将它改为 20，pytest 已通过。"), ResponseFinished("stop")],
+    ])
+    session_id = agent.create_session()
+
+    greeting_turn, _ = agent.begin_turn(session_id, "你好")
+    assert [event.kind for event in agent.run_turn(session_id, greeting_turn)][-1] == "turn_completed"
+
+    repair_turn, _ = agent.begin_turn(session_id, "现在仓库里存在若干错误，请帮我全部找出并修复。")
+    repair_events = list(agent.run_turn(session_id, repair_turn))
+    assert repair_events[-1].kind == "turn_completed"
+    assert (tmp_path / "src" / "calc.py").read_text() == "VALUE = 20\n"
+
+    follow_up_turn, _ = agent.begin_turn(session_id, "解释一下你找到了哪些错误")
+    follow_up_events = list(agent.run_turn(session_id, follow_up_turn))
+
+    assert follow_up_events[-1].kind == "turn_completed"
+    assert "错误是 VALUE" in "".join(
+        event.text for event in follow_up_events if event.kind == "assistant_text_delta"
+    )
+    follow_up_context = model.received_messages[-1]
+    assert ProviderMessage(role="user", content="现在仓库里存在若干错误，请帮我全部找出并修复。") in follow_up_context
+    assert any(message.role == "tool" and "assertion_failure" in message.content for message in follow_up_context)
+    assert any(message.role == "tool" and '"passed"' in message.content for message in follow_up_context)
 
 
 def test_assistant_item_has_started_delta_completed_lifecycle() -> None:
@@ -359,7 +420,10 @@ def test_reasoning_is_retained_only_in_provider_message() -> None:
         if event.kind == "assistant_text_delta"
     ] == ["Visible", "Again"]
     assert "private" not in repr(first_events + second_events)
-    prior_assistant = model.received_messages[1][1]
+    prior_assistant = next(
+        message for message in model.received_messages[1]
+        if message.role == "assistant"
+    )
     assert prior_assistant == ProviderMessage(
         role="assistant",
         content="Visible",
@@ -401,7 +465,10 @@ def test_tool_call_fragments_are_joined_but_unavailable_runner_has_zero_side_eff
         event.turn_id == queued_turn_id and event.kind == "turn_completed"
         for event in events
     )
-    joined_assistant = model.received_messages[1][1]
+    joined_assistant = next(
+        message for message in model.received_messages[1]
+        if message.role == "assistant"
+    )
     assert joined_assistant.tool_calls[0].id == "call-1"
     assert joined_assistant.tool_calls[0].name == "read_file"
     assert joined_assistant.tool_calls[0].arguments_json == '{"path":"README.md"}'
@@ -491,7 +558,7 @@ def test_steer_queue_and_interrupt_have_single_active_turn_semantics() -> None:
     assert queued_event.kind == "user_message"
     assert queued_event.sequence == 1
     assert queued_event.data == {"queued": "true"}
-    assert model.received_messages[0] == (
+    assert model.received_messages[0][-2:] == (
         ProviderMessage(role="user", content="First"),
         ProviderMessage(role="user", content="More context"),
     )
@@ -517,3 +584,21 @@ def test_steer_queue_and_interrupt_have_single_active_turn_semantics() -> None:
         agent.interrupt(session_id, uuid4())
     with pytest.raises(TurnNotActiveError):
         agent.queue(session_id, "No active turn")
+
+
+def test_next_turn_goal_is_visible_to_the_model_once_without_becoming_history() -> None:
+    model = ScriptedConversationModel(
+        [[TextDelta("first"), ResponseFinished("stop")], [TextDelta("second"), ResponseFinished("stop")]]
+    )
+    agent = ConversationAgent(model)
+    session_id = agent.create_session()
+
+    first_turn, _ = agent.begin_turn(session_id, "inspect", goal="Keep the repair minimal")
+    list(agent.run_turn(session_id, first_turn))
+    second_turn, _ = agent.begin_turn(session_id, "continue")
+    list(agent.run_turn(session_id, second_turn))
+
+    assert ProviderMessage(
+        role="system", content="Current turn goal: Keep the repair minimal"
+    ) in model.received_messages[0]
+    assert all(message.content != "Current turn goal: Keep the repair minimal" for message in model.received_messages[1])

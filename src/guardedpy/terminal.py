@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Any, TextIO
 
-from guardedpy.conversation import SessionEvent
+from guardedpy.conversation import SessionEvent, safe_event_message
 from guardedpy.credentials import CredentialBackendUnavailableError
 
 
 COMMANDS = (
     "/history", "/conversations", "/new", "/clear", "/exit", "/plan", "/review",
-    "/credentials", "/model", "/effort", "/goal", "/help", "/stop", "/queue",
+    "/tests", "/diff", "/permissions", "/credentials", "/memory", "/model", "/effort",
+    "/doctor", "/goal", "/help", "/stop", "/queue",
 )
 
 
@@ -18,7 +19,8 @@ def render_help() -> tuple[str, ...]:
     return (
         "会话与对话：/history /conversations /new /clear /exit",
         "任务：直接输入任务；/plan <任务>；/review <路径>；/stop；/queue <任务>",
-        "设置与安全：/model /effort /goal /credentials",
+        "检查与安全：/tests /diff /permissions /memory /doctor /credentials",
+        "设置：/model /effort /goal",
         "非交互模式不能录入凭据或批准危险操作。",
     )
 
@@ -96,6 +98,16 @@ def _local_command(
         for summary in summaries:
             output.write(f"{summary.id} {summary.updated_at.isoformat()}\n")
         return True, session_id, 0
+    if name == "/permissions" and not argument:
+        output.write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。\n")
+        return True, session_id, 0
+    if name == "/memory" and not argument:
+        summary = runtime.summary(session_id)
+        if not summary.turns:
+            output.write("暂无安全摘要\n")
+        else:
+            _render_summary(summary, output)
+        return True, session_id, 0
     if name in {"/stop", "/queue"}:
         output.write("非交互模式没有可控制的活跃回合。\n")
         return True, session_id, 1
@@ -104,6 +116,12 @@ def _local_command(
         return True, session_id, 0
     if local_runtime is None:
         return False, session_id, 0
+    if name in {"/tests", "/diff", "/doctor"} and not argument:
+        try:
+            output.write(local_runtime.local_check(name.removeprefix("/")) + "\n")
+        except Exception:
+            output.write("本地检查不可用。\n")
+        return True, session_id, 0
     if name == "/credentials":
         _credentials(local_runtime, argument, output)
         return True, session_id, 0
@@ -120,23 +138,17 @@ def _render_event(event: SessionEvent, output: TextIO) -> None:
     if event.kind == "user_message":
         output.write(f"› {event.text}\n")
     elif event.kind == "assistant_text_delta":
-        output.write(f"助手：{event.text}\n")
-    elif event.kind == "tool_item_started":
-        output.write("正在使用受控工具。\n")
-    elif event.kind == "tool_item_completed":
-        output.write("工具执行完成。\n")
-    elif event.kind == "turn_completed":
-        output.write("本轮回复已完成。\n")
-    elif event.kind == "turn_interrupted":
-        output.write("本轮回复已中断。\n")
-    elif event.kind == "turn_failed":
-        output.write("本轮回复未完成。\n")
+        output.write(f"{event.text}\n")
+    else:
+        message = safe_event_message(event)
+        if message is not None:
+            output.write(f"{message}\n")
 
 
 def _render_summary(summary: Any, output: TextIO) -> None:
     for turn in summary.turns:
         if turn.final_text:
-            output.write(f"助手：{turn.final_text}\n")
+            output.write(f"{turn.final_text}\n")
         status = {
             "completed": "本轮回复已完成。",
             "interrupted": "本轮回复已中断。",

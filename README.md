@@ -1,6 +1,6 @@
 # GuardedPy
 
-GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its self-owned loop creates context, asks one structured LLM action at a time, applies deterministic policy, runs restricted project tools, feeds back concise pytest evidence, and stops at a bounded result. It is a CLI-only Python package: start it from the project you want to inspect or change.
+GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its self-owned continuous loop keeps one session and one active turn, streams model text and governed tool status, feeds concise pytest results back to the same turn, and preserves only safe summaries across restarts. It is a CLI-only Python package: start it from the project you want to inspect or change.
 
 ## Installation
 
@@ -42,13 +42,14 @@ When stdin or stdout is redirected, GuardedPy uses a safe plain-text session. It
 The interactive command set is:
 
 ```text
-会话与对话：/history /new /clear /exit
-任务与检查：/plan /review /tests /diff
-设置与安全：/model /effort /permissions /credentials /memory /doctor
+会话与对话：/history /conversations /new /clear /exit
+回合控制：/plan <任务> /review <路径> /goal <目标> /queue <任务> /stop
+本地检查与安全：/tests /diff /permissions /memory /doctor /credentials
+设置：/model /effort
 帮助：/help
 ```
 
-`/plan <request>` and `/review [path]` are read-only workflows. `/tests`, `/diff`, and `/doctor` are deterministic local checks, not LLM requests. A coding task first runs the discovered full test suite: a passing baseline enters feature TDD, assertion failures enter the repair path, and collection/execution errors or a timeout block further automated changes.
+直接输入自然语言即可开始同一连续会话；不再对首条输入做 feature/bugfix/闲聊分类。`/plan <request>` 与 `/review [path]` 是只读回合；`/goal <目标>` 仅约束下一回合；`/queue` 显式排队下一回合，`/stop` 请求中断当前回合。工具失败、pytest failure 和无效 patch 都会回灌给同一回合，而不是自动取消。鼠标可以选择 transcript，`Ctrl+Shift+C` 可复制当前安全 transcript。
 
 ## Credentials, model, and effort
 
@@ -76,11 +77,23 @@ make demo
 
 Interactive `guardedpy demo` lets you select one fixed request and press Enter. `make demo` runs all three deterministic mock-LLM scenarios without interaction:
 
-1. a privileged command request is denied before command dispatch;
-2. assertion feedback is required before the mock returns a repair patch, then the full suite passes;
-3. a production patch before an observed red test is denied.
+1. 已读取项目文件后的删除请求暂停审批；拒绝后目标文件保留；
+2. assertion feedback 回灌后 mock 返回修复补丁，随后 pytest 通过；
+3. 伪造或过期 approval ID 被确定性拒绝。
 
 This is mechanism evidence, not a substitute for using a real provider on a target project.
+
+## Manual provider acceptance (not yet claimed complete)
+
+After configuring a DeepSeek key in the interactive `/credentials` dialog, use a disposable Python + pytest project and verify the real provider in this order:
+
+1. Send a normal greeting and a project question; both should receive a natural response without starting a form or a fixed task workflow.
+2. Send a repair request such as “找出并修复所有测试错误”; the transcript should stream the user message, assistant text, safe read/test/change status, and a final response.
+3. Ask “刚才改了什么，测试结果怎样？” in the same session; the reply should use the preceding tool facts.
+4. Ask to delete a previously read project file; verify that the approval dialog names that file, then reject it and confirm the file remains.
+5. Start a longer request, use `/stop`, and verify that the turn becomes interrupted only after its terminal event. Restart `guardedpy`, use `/conversations`, and confirm that only the safe summary—not raw chat or source—returns.
+
+Do not paste API keys into chat, project files, command arguments, environment variables, or screenshots. Record this manual result only after performing it; it is intentionally not claimed by this repository yet.
 
 ## Test, build, and local release artifact
 
@@ -110,7 +123,7 @@ make build PYTHON=python
 
 ## Safety boundaries and limitations
 
-GuardedPy treats LLM output and repository text as untrusted. Deterministic code enforces project-root boundaries, read-before-patch, baseline/TDD transitions, restricted pytest invocation, explicit approvals, and bounded task execution. The harness is not an operating-system sandbox: a selected repository and its pytest code are trusted inputs, so malicious tests are out of scope.
+GuardedPy treats LLM output and repository text as untrusted. Deterministic code enforces project-root boundaries, read-before-patch, atomic patch application, restricted pytest invocation, exact delete approvals, safe summary persistence, and bounded turn/tool execution. The harness is not an operating-system sandbox: a selected repository and its pytest code are trusted inputs, so malicious tests are out of scope.
 
 The first release supports one active task at a time and Python 3.11+ pytest projects on Linux or WSL. It does not support Windows-native execution leases, multi-project operation, remote workspaces, arbitrary shell access, deployment, browser delivery, or an HTTP interface. Textual needs an interactive TTY; redirected I/O has the deliberately narrower safe text mode.
 

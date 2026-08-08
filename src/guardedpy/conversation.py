@@ -102,6 +102,14 @@ ModelChunk: TypeAlias = (
 )
 
 
+_SESSION_CONTEXT = (
+    "You are GuardedPy, an interactive coding agent working in one local project. "
+    "Answer ordinary conversation naturally. For coding requests, inspect the project, "
+    "use the provided governed tools when evidence is needed, and report only results "
+    "actually returned by those tools. Continue the same conversation across turns."
+)
+
+
 class ConversationModel(Protocol):
     def stream(
         self,
@@ -133,6 +141,81 @@ class SafeTurnSummary(BaseModel):
     ]
     approval_outcome: Literal["none", "approved", "rejected"]
     final_text: str
+
+
+def safe_event_message(event: SessionEvent) -> str | None:
+    """Project only deterministic tool facts; never render raw tool output."""
+    if event.kind == "tool_output":
+        return None
+    if event.kind == "tool_item_started":
+        path = event.data.get("path")
+        verb = {
+            "list_files": "正在列举",
+            "read_file": "正在读取",
+            "delete_path": "正在准备删除",
+        }.get(event.data.get("tool"))
+        if path is not None and verb is not None:
+            return f"{verb} {path}。"
+        return {
+            "list_files": "正在列举项目文件。", "read_file": "正在读取项目文件。",
+            "apply_patch": "正在应用代码补丁。", "run_pytest": "正在运行 pytest。",
+            "git_diff": "正在检查 Git diff。", "git_status": "正在检查 Git 状态。",
+            "delete_path": "正在准备删除项目路径。",
+        }.get(event.data.get("tool"), "正在使用受控工具。")
+    if event.kind == "tool_item_completed":
+        raw_paths = event.data.get("changed_paths")
+        if raw_paths is not None:
+            try:
+                paths = json.loads(raw_paths)
+            except json.JSONDecodeError:
+                paths = []
+            if isinstance(paths, list) and all(isinstance(path, str) for path in paths):
+                if event.data.get("tool") == "delete_path":
+                    return f"已删除 {', '.join(paths)}。"
+                return f"已修改 {', '.join(paths)}。"
+        outcome = {
+            "passed": "pytest：通过。", "assertion_failure": "pytest：发现断言失败。",
+            "collection_error": "pytest：收集失败。", "execution_error": "pytest：执行失败。",
+            "timeout": "pytest：超时。",
+        }.get(event.data.get("pytest_outcome"))
+        if outcome is not None:
+            return outcome
+        code = event.data.get("code")
+        failure = {
+            "patch_invalid": "补丁格式无效，未改动文件。",
+            "patch_not_applied": "补丁未应用，未改动文件。",
+            "read_required": "无法修改：需先完整读取目标文件。",
+            "stale_read": "修改未执行：目标文件已变化，请重新读取。",
+            "not_a_file": "工具未执行：目标不是文件。",
+            "not_a_directory": "工具未执行：目标不是目录。",
+            "protected_path": "工具未执行：目标受保护。",
+            "mode_read_only": "当前模式只允许读取和检查。",
+            "approval_rejected": "删除已拒绝，未改动项目文件。",
+            "not_executed_after_approval": "后续操作未执行。",
+        }.get(code)
+        if failure is not None:
+            return failure
+        if code == "ok":
+            tool = event.data.get("tool")
+            path = event.data.get("path")
+            if tool == "read_file" and path is not None:
+                return f"已读取 {path}。"
+            return {
+                "list_files": "已列出项目文件。", "run_pytest": "pytest 已完成。",
+                "git_diff": "已检查 Git diff。", "git_status": "已检查 Git 状态。",
+                "delete_path": "已删除项目路径。",
+            }.get(tool, "工具执行完成。")
+        return "工具未完成。"
+    if event.kind == "approval_requested":
+        path = event.data.get("path")
+        return f"需要批准：删除 {path}。" if path is not None else "需要精确审批：删除项目路径。"
+    if event.kind == "approval_resolved":
+        return "审批已批准。" if event.data.get("accepted") == "true" else "审批已拒绝。"
+    return {
+        "turn_completed": "本轮回复已完成。",
+        "turn_interrupted": "本轮回复已中断。",
+        "turn_failed": "本轮回复未完成。",
+    }.get(event.kind)
 
 
 class ConversationSummary(BaseModel):
@@ -175,6 +258,7 @@ class Turn:
     waiting_approval: PendingApproval | None = None
     pending_steers: deque[ProviderMessage] = field(default_factory=deque)
     cancelled: bool = False
+    goal_message: ProviderMessage | None = None
 
 
 @dataclass
@@ -240,7 +324,7 @@ class ConversationAgent:
         self, safe_summary: ConversationSummary | None = None
     ) -> UUID:
         session_id = uuid4()
-        messages: list[ProviderMessage] = []
+        messages = [ProviderMessage(role="system", content=_SESSION_CONTEXT)]
         if safe_summary is not None:
             messages.append(
                 ProviderMessage(
@@ -259,20 +343,26 @@ class ConversationAgent:
         return session_id
 
     def begin_turn(
-        self, session_id: UUID, text: str, mode: TurnMode = "normal"
+        self, session_id: UUID, text: str, mode: TurnMode = "normal", *, goal: str | None = None
     ) -> tuple[UUID, SessionEvent]:
         session = self._session(session_id)
         initial_text = _nonblank(text)
         if session.active_turn_id is not None:
             raise TurnNotActiveError("session already has an active turn")
+        goal_message = None if goal is None else ProviderMessage(
+            role="system", content=f"Current turn goal: {_nonblank(goal)}"
+        )
         turn = Turn(
             id=uuid4(),
             session_id=session_id,
             initial_text=initial_text,
             mode=mode,
+            goal_message=goal_message,
         )
         session.turns[turn.id] = turn
         session.active_turn_id = turn.id
+        if goal_message is not None:
+            session.provider_messages.append(goal_message)
         session.provider_messages.append(
             ProviderMessage(role="user", content=initial_text)
         )
@@ -400,7 +490,8 @@ class ConversationAgent:
                 return False
             for index, call in enumerate(calls):
                 item_id = uuid4()
-                yield self._event(turn, "tool_item_started", item_id=item_id, data={"tool": call.name})
+                presentation = self._governor.presentation(call)
+                yield self._event(turn, "tool_item_started", item_id=item_id, data=presentation)
                 decision = self._governor.decide(turn, item_id, call)
                 if decision.verdict == "approval_required":
                     assert decision.approval_id is not None
@@ -408,13 +499,16 @@ class ConversationAgent:
                     turn.status = "waiting_approval"
                     yield self._event(
                         turn, "approval_requested", item_id=item_id,
-                        data={"approval_id": str(decision.approval_id), "tool": call.name, "rule_id": decision.rule_id},
+                        data={**presentation, "approval_id": str(decision.approval_id), "rule_id": decision.rule_id},
                     )
                     return True
                 if decision.verdict == "deny":
                     payload = {"ok": False, "code": decision.code, "summary": decision.code}
                     self._append_tool_result(session, call, payload)
-                    yield self._event(turn, "tool_item_completed", item_id=item_id, data={"code": decision.code, "verdict": "deny"})
+                    yield self._event(
+                        turn, "tool_item_completed", item_id=item_id,
+                        data={**presentation, "code": decision.code, "verdict": "deny"},
+                    )
                     continue
                 execution = self._executor.execute(turn, item_id, call)
                 yield from self._execution_events(session, turn, item_id, call, execution)
@@ -451,13 +545,21 @@ class ConversationAgent:
         else:
             payload = {"ok": False, "code": decision.code, "summary": decision.code}
             self._append_tool_result(session, pending.call, payload)
-            yield self._event(turn, "tool_item_completed", item_id=pending.item_id, data={"code": decision.code, "verdict": "deny"})
+            yield self._event(
+                turn, "tool_item_completed", item_id=pending.item_id,
+                data={**self._governor.presentation(pending.call), "code": decision.code, "verdict": "deny"},
+            )
         for call in pending.later_calls:
             item_id = uuid4()
-            yield self._event(turn, "tool_item_started", item_id=item_id, data={"tool": call.name})
+            yield self._event(
+                turn,
+                "tool_item_started",
+                item_id=item_id,
+                data=self._governor.presentation(call),
+            )
             payload = {"ok": False, "code": "not_executed_after_approval", "summary": "not_executed_after_approval"}
             self._append_tool_result(session, call, payload)
-            yield self._event(turn, "tool_item_completed", item_id=item_id, data={"code": "not_executed_after_approval", "verdict": "deny"})
+            yield self._event(turn, "tool_item_completed", item_id=item_id, data={"tool": call.name, "code": "not_executed_after_approval", "verdict": "deny"})
         turn.waiting_approval = None
         turn.status = "running"
         paused = yield from self._advance(session, turn)
@@ -481,7 +583,10 @@ class ConversationAgent:
         summary = str(execution.summary)
         if summary:
             yield self._event(turn, "tool_output", item_id=item_id, text=summary)
-        data = {"code": str(execution.code), "verdict": str(execution.verdict)}
+        data = {
+            **self._governor.presentation(call),
+            "code": str(execution.code), "verdict": str(execution.verdict),
+        }
         if execution.changed_paths:
             data["changed_paths"] = json.dumps(execution.changed_paths)
         if execution.feedback is not None:
@@ -659,6 +764,8 @@ class ConversationAgent:
     ) -> tuple[SessionEvent, Turn | None]:
         turn.status = status
         turn.waiting_approval = None
+        if turn.goal_message is not None:
+            session.provider_messages.remove(turn.goal_message)
         event = self._event(
             turn, kind, data={} if code is None else {"code": code}
         )
