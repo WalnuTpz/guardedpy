@@ -44,21 +44,23 @@ def test_make_and_ci_run_the_three_cli_delivery_commands() -> None:
 
 
 def test_readme_is_a_cli_only_installation_and_operation_guide() -> None:
-    """Catches user guidance retaining obsolete setup, server, deployment, or web claims."""
+    """Catches the final guide omitting required operation or delivery facts."""
     readme = _text("README.md").lower()
 
     for heading in (
-        "## installation",
-        "## run in a project",
-        "## credentials, model, and effort",
-        "## mechanism demo",
-        "## test, build, and local release artifact",
-        "## safety boundaries and limitations",
+        "## 安装",
+        "## 运行",
+        "## 凭据配置",
+        "## 机制演示",
+        "## 测试与构建",
+        "## 安全边界",
+        "## 已知限制",
     ):
         assert heading in readme
     for command in ("guardedpy", "/credentials", "/model", "/effort", "guardedpy demo", "make test", "make demo", "make build"):
         assert command in readme
-    for retired in ("guardedpy-server", "guardedpy serve", "webui", "render.yaml", "fastapi", "/init", "guardedpy-cli"):
+    for retired in ("guardedpy-server", "guardedpy serve", "render.yaml", "fastapi", "guardedpy-cli"):
         assert retired not in readme
-    assert "teacher clarification" in readme
-    assert "not uploaded" in readme
+    assert "无需 `/init`" in readme
+    assert "教师确认" in readme
+    assert "尚未发布" in readme
