@@ -1,18 +1,44 @@
 # GuardedPy
 
-GuardedPy is a local, governed coding-agent harness for small Python and pytest repositories. Its self-owned continuous loop keeps one session and one active turn, streams model text and governed tool status, feeds concise pytest results back to the same turn, and restores visible user/Agent conversation plus safe tool facts across restarts. It is a CLI-only Python package: start it from the project you want to inspect or change.
+GuardedPy 是一个面向小型 Python + pytest 项目的本地 CLI Coding Agent Harness。它自行实现连续 Agent 主循环，让用户在同一终端会话中自然对话、检查项目、修改代码、运行测试并继续追问；文件边界、测试反馈、危险动作审批、凭据和会话恢复由确定性代码控制。
 
-## Installation
+当前产品只提供 CLI，不包含 WebUI、HTTP server，也不向模型提供任意 Shell、通用网络、依赖安装或自动发布工具。
 
-GuardedPy supports Python 3.11+ on Linux and WSL. Install from a source checkout for development:
+## 核心功能
+
+- 从当前目录自动发现 Python 源码、测试目录和 pytest 命令；
+- 连续 Session/Turn 对话，不对首条输入进行固定任务分类；
+- 流式显示模型回复和安全工具状态；
+- 受限文件列表、读取、原子补丁和源码/测试新文件创建；
+- pytest 反馈分类、回灌和修改后的完整套件验证；
+- 项目内 Python 程序运行与文件删除的精确人工审批；
+- 只读计划、审查、Git status/diff 和本地诊断；
+- keyring-only DeepSeek API Key 管理；
+- 会话保存、恢复、选择与删除；
+- 离线 mock LLM 单元测试和可观看的机制演示；
+- wheel/sdist 构建及 GitHub/GitLab CI。
+
+## 支持环境
+
+- Linux 或 WSL；
+- Python 3.11+；
+- 目标项目使用 pytest；
+- 交互 TUI 需要真实终端；
+- 真实 DeepSeek 调用需要可用的系统 keyring/Secret Service 和到 provider 的网络连接。
+
+## 安装
+
+### 从源码安装
 
 ```bash
+git clone git@github.com:WalnuTpz/guardedpy.git
+cd guardedpy
 python3 -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
-To verify the distributable form locally, build it first and install the generated wheel into a separate environment:
+### 从本地构建产物安装
 
 ```bash
 make build
@@ -20,129 +46,217 @@ python3 -m venv /tmp/guardedpy-release-env
 /tmp/guardedpy-release-env/bin/python -m pip install dist/guardedpy-*.whl
 ```
 
-The release artifact is **not uploaded** to a hosting platform yet. Until a real release is published, use this source checkout or a wheel built by the commands above; this README deliberately provides no invented download link.
+项目将采用经教师确认可接受的 CLI-only GitHub Release 方式提交。真实 Release 尚未发布，因此此处不提供占位下载链接；发布完成后应将具体 Release URL 和文件名补入本节。
 
-## Run in a project
+## 运行
 
-Move into a supported Python + pytest repository and launch the one command:
+进入需要处理的 Python + pytest 项目，直接启动：
 
 ```bash
-cd /path/to/python-pytest-project
+cd /path/to/python-project
 guardedpy
 ```
 
-GuardedPy discovers the current project, its common source/test layout, and the full pytest command automatically. There is no manual root, source-directory, test-directory, or pytest-command setup flow. In an interactive terminal, enter a natural-language coding task or choose a command from the live command palette. A short initial task may also be passed directly:
+GuardedPy 会把当前目录固定为项目根，自动发现源码、测试和 pytest 配置。无需 `/init`，也不要求手工输入目录或测试命令。
+
+可以传入一条初始请求：
 
 ```bash
-guardedpy "find the failing tests and explain a safe repair plan"
+guardedpy "检查当前项目并说明测试失败原因，不要修改"
 ```
 
-When stdin or stdout is redirected, GuardedPy uses a safe plain-text session. It cannot accept secret input there and stops rather than auto-approving a dangerous action.
+stdin 或 stdout 被重定向时，GuardedPy 使用安全纯文本模式。该模式不能录入秘密或批准危险操作；遇到审批会停止。
 
-The interactive command set is:
+## 凭据配置
+
+在交互界面输入：
 
 ```text
-/conversations：选择并恢复历史对话
-/new：新建会话
-/delete：删除当前会话并回到上一条
-/exit：退出 GuardedPy
-/plan <任务>：只读制定计划
-/review <路径>：只读审查
-/goal <目标>：只约束下一回合
-/queue <任务>：将下一项工作排队
-/stop：中断当前回合
-/tests：运行配置的 pytest
-/diff：查看当前 Git diff
-/permissions：查看自动允许与须审批的操作
-/doctor：查看本地项目状态
-/credentials：管理 API Key
-/model：选择后续回合模型
-/effort：选择后续回合思考强度
-/help：打开完整帮助
+/credentials
 ```
 
-直接输入自然语言即可开始同一连续会话；不再对首条输入做 feature/bugfix/闲聊分类。启动时会自动载入最近保存的会话，首次启动才新建空会话。`/plan <request>` 与 `/review [path]` 是只读回合；`/goal <目标>` 仅约束下一回合；`/queue` 显式排队下一回合，`/stop` 请求中断当前回合。工具失败、pytest failure 和无效 patch 都会回灌给同一回合，而不是自动取消。Agent 可请求在不经过 shell 的前提下运行项目内单个 Python 程序，但执行须由用户逐次批准；网络、安装、任意命令和 Git 写入仍不可由它执行。transcript 是自动换行、仅纵向滚动的只读文本；鼠标可以选择它，`Ctrl+Shift+C` 可复制当前安全记录。`/conversations` 会重放所选历史的可见用户/Agent 对话，并只将有界的最近对话和安全事实恢复为后续模型上下文；`/delete` 删除当前会话后回到上一条，最后一条不能删除。
+凭据界面支持：
 
-## Credentials, model, and effort
+- 查看是否已配置；
+- 掩码录入或更新 DeepSeek API Key；
+- 清除 Key。
 
-In an interactive session, `/credentials` opens a masked input for the DeepSeek API key. The value is written only through the operating-system keyring, is not echoed in the transcript, and can be updated or cleared through the same controlled UI. Before any coding, plan, or review task starts, GuardedPy requires this interactive credential step; redirected sessions stop with an explicit message and never create the task. Do not put a key in project files, command arguments, environment variables, logs, or examples. An unavailable keyring fails safely; there is no plaintext fallback.
+Key 只写入操作系统 keyring，不会进入项目文件、Git、会话数据库、日志或终端输出。GuardedPy 不提供 `.env`、命令行参数或明文配置回退。若 keyring 不可用，程序会说明需要先修复系统密钥环。
 
-The default is `deepseek-v4-flash` with `high` effort. In the interactive session, `/model` or `/effort` opens a keyboard- and mouse-selectable picker; the selected value applies only to later tasks. In redirected plain text, provide the supported value explicitly:
+不要把 API Key 粘贴到对话、命令、项目文件、截图或测试中。
 
-```text
-/model deepseek-v4-flash
-/model deepseek-v4-pro
-/effort high
-/effort max
-```
+## 交互方式
 
-An active task retains its creation snapshot. `max` effort can increase latency and provider cost.
+- Enter：提交消息；
+- Shift+Enter：输入换行；
+- `/` 或 `[+]`：打开命令面板；
+- 方向键/鼠标滚轮：移动选择；
+- Enter 或鼠标点击：把候选项填入输入框；
+- `Ctrl+Shift+C`：复制当前安全 transcript；
+- Ctrl+C、Esc 或 `/stop`：请求中断当前回合。
 
-## Mechanism demo
+键盘可以完成全部操作，鼠标用于辅助选择、滚动和点击。transcript 自动换行，只保留纵向滚动条。
 
-The fixed demo is offline and does not inspect the caller project, touch the keyring, or call a provider:
+## 命令
+
+| 命令 | 作用 |
+|---|---|
+| `/conversations` | 选择并恢复已保存会话 |
+| `/new` | 新建会话 |
+| `/delete` | 删除当前会话并切回上一条；最后一条不能删除 |
+| `/plan <任务>` | 用只读模式制定计划 |
+| `/review <路径>` | 用只读模式审查项目或路径 |
+| `/goal <目标>` | 设置只影响下一回合的目标；`/goal clear` 取消 |
+| `/queue <任务>` | 把下一回合排到当前回合之后 |
+| `/stop` | 中断当前回合并清除排队回合 |
+| `/tests` | 运行发现到的 pytest 套件 |
+| `/diff` | 查看当前 Git diff |
+| `/permissions` | 查看自动允许、须审批和拒绝的操作 |
+| `/doctor` | 查看当前项目、配置和凭据状态 |
+| `/credentials` | 安全管理 API Key |
+| `/model` | 为后续回合选择模型 |
+| `/effort` | 为后续回合选择思考强度 |
+| `/help` | 打开分组帮助面板 |
+| `/exit` | 退出 GuardedPy |
+
+支持的模型为 `deepseek-v4-flash`、`deepseek-v4-pro`；思考强度为 `high`、`max`。修改只影响后续回合，不改变正在运行的 Turn。
+
+## 工具和审批
+
+模型只能调用 GuardedPy 声明的受限工具：
+
+- 列出和读取项目文件；
+- 对源码/测试应用原子补丁；
+- 运行 pytest；
+- 读取 Git status/diff；
+- 运行一个项目内 Python 文件；
+- 删除一个普通文件或空目录。
+
+读取、合法补丁、pytest 和 Git 只读检查经过确定性校验后自动执行。以下操作每次都需要精确审批：
+
+- 运行项目内 Python 程序：审批框显示路径和参数；
+- 删除文件或空目录：审批框显示目标路径。
+
+拒绝、过期或伪造的审批不会执行动作。GuardedPy 不向模型提供任意 Shell、网络、包安装、Git 写入、部署或发布工具。
+
+## 会话恢复
+
+无初始任务启动时，GuardedPy 自动载入当前项目最近的会话。`/conversations` 可选择其他会话，`/delete` 可删除当前会话。
+
+会话状态位于项目目录之外、按项目根隔离的应用状态目录。可恢复内容包括可见用户/Agent 对话和受限工具事实。以下内容不会保存或恢复：
+
+- API Key；
+- 隐藏 reasoning；
+- 源码正文；
+- 完整 diff；
+- 原始工具参数；
+- 完整 pytest 输出；
+- 中断进程的执行状态。
+
+## 机制演示
+
+### 交互式演示
 
 ```bash
 guardedpy demo
+```
+
+演示使用正常 TUI 外壳，但项目、请求和 mock 输出均为隔离的固定数据。使用 ↑/↓ 切换场景，按 Enter 或 `[发送]` 开始。删除场景会显示真实审批弹层，可以允许或拒绝。
+
+### 无交互演示
+
+```bash
 make demo
 ```
 
-Interactive `guardedpy demo` reuses the normal project bar, transcript, composer frame, `[+]` selector, and approval dialog. Its header shows `项目：机制演示临时项目` plus the right-aligned hint `按↑↓来切换场景`; the composer provides visual-only selectors for `Mock LLM1/2`, `high/max`, and `[发送]`. Those selectors never change the fixed scenario or mock event sequence. ↑/↓ switches the fixed request. `[+]` opens the normal command palette, whose choices intentionally have no effect in this locked demonstration. Press Enter or `[发送]` to run the selected fixed request. The request then drives the actual `ConversationAgent` event loop; the transcript displays its governed tool, approval, feedback, and final-reply events rather than a prewritten chat record. `make demo` runs all three deterministic mock-LLM scenarios without interaction and asserts their mechanism facts:
+该命令使用同一 `ConversationAgent` 路径，确定性验证三个场景：
 
-1. 已读取项目文件后的删除请求暂停并显示审批；交互演示中可允许或拒绝，`make demo` 固定拒绝并验证目标文件保留；
-2. assertion feedback 回灌后 mock 返回修复补丁，随后 pytest 通过；
-3. 伪造或过期 approval ID 被确定性拒绝。
+1. 删除操作暂停等待审批；headless 模式固定拒绝并验证文件仍存在；
+2. pytest assertion failure 回灌后，mock 改变下一步动作为补丁，最终测试通过；
+3. 伪造或过期审批 ID 被拒绝。
 
-This is mechanism evidence, not a substitute for using a real provider on a target project.
+演示不读取调用者项目、keyring，不访问网络，也不调用真实 provider。
 
-## Manual provider acceptance
-
-The Task 22 core paths were manually accepted with a real DeepSeek provider in a disposable Python + pytest project: normal conversation, inspection without mutation, a failing-test repair followed by pytest, source-directory program creation and execution, exact delete approval, and recovered-conversation follow-up. The key was entered through `/credentials` and was not read, logged, or committed. A final review then tightened program execution to require exact approval; that approval path is reserved for the separate final-acceptance worktree.
-
-The following checks remain useful when reproducing that acceptance:
-
-1. Send a normal greeting and a project question; both should receive a natural response without starting a form or a fixed task workflow.
-2. Send a repair request such as “找出并修复所有测试错误”; the transcript should stream the user message, assistant text, safe read/test/change status, and a final response.
-3. Ask “刚才改了什么，测试结果怎样？” in the same session; the reply should use the preceding tool facts.
-4. Ask to run a project Python program and to delete a previously read project file; each approval dialog must name the exact path (the program dialog also shows arguments). Approve the program only if the displayed call is expected; reject the delete and confirm the file remains.
-5. Start a longer request, use `/stop`, and verify that the turn becomes interrupted only after its terminal event. Restart `guardedpy`, use `/conversations`, and confirm that visible user/Agent dialogue returns and can ground a follow-up, while source, raw diffs, tool arguments and hidden reasoning do not return. This stop-path check is reserved for the separate post-Task-22 final-acceptance worktree.
-
-Do not paste API keys into chat, project files, command arguments, environment variables, or screenshots.
-
-## Test, build, and local release artifact
-
-All repository checks are local and use mock/stub LLMs rather than a real key or network call:
+## 测试与构建
 
 ```bash
-make test PYTHON=python
-make demo PYTHON=python
-make build PYTHON=python
+make test
+make demo
+make build
+python -m compileall -q src tests
+git diff --check
 ```
 
-`make test` runs the offline test suite. `make demo` asserts the stable safe summaries for the three mechanism scenarios. `make build` creates a wheel and source distribution in `dist/`. The CI definitions use these same three commands; the GitLab job is named `unit-test`. Remote CI, a release upload, GitLab mirroring, collaborator access, and the student's own reflection remain external handoff steps and are not claimed complete here.
+- `make test`：运行全部离线单元与集成测试；
+- `make demo`：运行固定 mock 机制证据；
+- `make build`：在 `dist/` 生成 wheel 和 sdist。
 
-## Directory structure
+离线测试使用 mock/stub LLM，不需要真实 Key 或网络。GitHub Actions 和 GitLab CI 执行相同的 test/demo/build 门禁；GitLab job 名为 `unit-test`。
+
+## 快速人工验收
+
+可在一个带已知失败测试的临时项目中依次验证：
+
+1. 普通问候和项目问题能自然回答；
+2. “检查错误但不要修复”不会写文件；
+3. 修复请求会读取、补丁、运行完整 pytest 并总结结果；
+4. 新建文件只能位于发现的源码或测试目录；
+5. 运行 Python 程序会显示准确审批，批准后显示有界输出；
+6. 删除操作可先拒绝并确认文件保留；
+7. `/stop` 能中断活动回合；
+8. 重启后从 `/conversations` 恢复，并能基于此前事实继续追问。
+
+## 目录结构
 
 ```text
 .
-├── src/guardedpy/          # self-owned loop, policy, tools, feedback, and terminal client
-├── tests/                  # offline unit, integration, terminal, and artifact contracts
-├── scripts/                # non-interactive mechanism demonstration runner
-├── docs/                   # course requirements, design records, and implementation plans
-├── Makefile                # test, demo, and build entry points
-├── pyproject.toml          # package metadata and sole `guardedpy` console entry point
+├── src/guardedpy/
+│   ├── conversation.py     # Session/Turn/Event 与连续主循环
+│   ├── governor.py         # 工具治理与审批身份
+│   ├── executor.py         # 工具分发和反馈回灌
+│   ├── workspace.py        # 根目录受限文件、pytest、Python、Git 工具
+│   ├── feedback.py         # pytest 确定性分类
+│   ├── runtime.py          # 会话组成、持久化与恢复
+│   ├── conversations.py    # 项目隔离的 SQLite 会话存储
+│   ├── credentials.py      # keyring-only 凭据服务
+│   ├── discovery.py        # Python/pytest 项目发现
+│   ├── tui.py              # Textual 正常界面与演示界面
+│   ├── terminal.py         # 安全纯文本入口
+│   └── mechanism_demo.py   # 三个 scripted mock 场景
+├── tests/                  # 离线机制、终端和安装产物测试
+├── scripts/                # 无交互机制演示入口
+├── docs/                   # 项目资料
+├── Makefile
+├── pyproject.toml
 ├── .github/workflows/ci.yml
 └── .gitlab-ci.yml
 ```
 
-## Safety boundaries and limitations
+## 安全边界
 
-GuardedPy treats LLM output and repository text as untrusted. Deterministic code enforces project-root boundaries, read-before-patch, atomic patch application, restricted pytest invocation, exact delete approvals, safe summary persistence, and bounded turn/tool execution. The harness is not an operating-system sandbox: a selected repository and its pytest code are trusted inputs, so malicious tests are out of scope.
+- LLM 输出、仓库内容和测试输出都按不可信数据处理；
+- 所有路径在执行前重新解析并限制在项目根；
+- 补丁只能修改发现到的源码/测试范围，失败时零写入；
+- 子进程使用固定 argv、超时和 `shell=False`；
+- 删除和程序运行使用绑定当前调用的精确审批；
+- transcript 和摘要在持久化前脱敏并限制长度；
+- 凭据只进入系统 keyring 和实际 provider 调用。
 
-The first release supports one active task at a time and Python 3.11+ pytest projects on Linux or WSL. It does not support Windows-native execution leases, multi-project operation, remote workspaces, arbitrary shell access, deployment, browser delivery, or an HTTP interface. Textual needs an interactive TTY; redirected I/O has the deliberately narrower safe text mode.
+## 已知限制
 
-The project owner reports a teacher clarification permitting a CLI-only release artifact. The general course materials still describe a browser-interface default, so that clarification must be retained as real submission evidence; this repository does not represent the CLI-only form as satisfying that default without it.
+- pytest 会执行项目代码；恶意仓库不在安全模型内；
+- 只支持 Linux/WSL、Python 3.11+ 和 pytest 项目；
+- 只支持一个本地项目和一个活动 Turn；
+- 不支持 Windows 原生终端、远程工作区、非 pytest 测试框架或多 Agent；
+- 不向模型提供任意 Shell、通用网络、安装、Git 写入、发布、部署或后台终端管理工具；
+- TUI 需要交互终端；重定向模式功能更窄；
+- keyring/Secret Service 不可用时不会回退到明文凭据；
+- 恢复会话只重建有界对话和安全事实，不恢复模型进程全部状态。
 
-## Third-party software and licenses
+## 分发状态
 
-GuardedPy declares these direct dependencies and imports their installed distributions rather than copying their source: Pydantic (MIT), keyring (MIT), OpenAI Python SDK (Apache-2.0), pytest (MIT), PyYAML (MIT), Textual (MIT), build (MIT), and setuptools (MIT). Distributors should check the resolved package metadata for the versions they actually ship.
+仓库已提供构建配置和可安装 wheel/sdist 测试。GitHub Release、GitLab 最终镜像、最后一次流水线记录和发布链接必须在真实完成后补入，当前不写成已发布。
+
+## 第三方依赖与许可证
+
+GuardedPy 通过包管理器使用下列直接依赖，不复制其源码：Pydantic（MIT）、keyring（MIT）、OpenAI Python SDK（Apache-2.0）、pytest（MIT）、PyYAML（MIT）、Textual（MIT）、build（MIT）和 setuptools（MIT）。发布时应以实际构建环境中的包元数据为准复核版本与许可证。
