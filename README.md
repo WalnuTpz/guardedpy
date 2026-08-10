@@ -233,7 +233,6 @@ git diff --check
 │   └── mechanism_demo.py   # 三个 scripted mock 场景
 ├── tests/                  # 离线机制、终端和安装产物测试
 ├── scripts/                # 无交互机制演示入口
-├── docs/                   # 项目资料
 ├── Makefile
 ├── pyproject.toml
 ├── .github/workflows/ci.yml
@@ -263,7 +262,7 @@ git diff --check
 
 ## 分发状态
 
-仓库已提供构建配置和可安装 wheel/sdist 测试。GitHub Release、GitLab 最终镜像、最后一次流水线记录和发布链接必须在真实完成后补入，当前不写成已发布。
+本仓库用于公开发布 GuardedPy，提供构建配置和可安装 wheel/sdist 测试。GitHub Release 尚未发布，因此当前不提供占位下载链接。课程过程文档与个人反思仅保存在供课程评审访问的私有仓库中。
 
 ## 第三方依赖与许可证
 
