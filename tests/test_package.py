@@ -62,5 +62,5 @@ def test_readme_is_a_cli_only_installation_and_operation_guide() -> None:
     for retired in ("guardedpy-server", "guardedpy serve", "render.yaml", "fastapi", "guardedpy-cli"):
         assert retired not in readme
     assert "无需 `/init`" in readme
-    assert "教师确认" in readme
+    assert "cli-only github release" in readme
     assert "尚未发布" in readme
