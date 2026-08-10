@@ -4,13 +4,9 @@ GuardedPy 是一个面向小型 Python + pytest 项目的本地 CLI Coding Agent
 
 当前产品只提供 CLI，不包含 WebUI、HTTP server，也不向模型提供任意 Shell、通用网络、依赖安装或自动发布工具。
 
-## 交付文档
-
-- [产品规格](docs/SPEC.md)
-- [实现计划](docs/PLAN.md)
-- [规格形成过程](docs/SPEC_PROCESS.md)
-- [开发过程日志](docs/AGENT_LOG.md)
-- [学生反思](docs/REFLECTION.md)
+> 本仓库是 GuardedPy 的公开展示与 Release 分发镜像，提供当前可运行的源码、测试、构建配置和发布资产。
+>
+> 课程过程文档、开发日志与学生反思仅保存在供课程评审访问的私有课程仓库；本公开仓库不包含这些材料。
 
 ## 核心功能
 
@@ -54,7 +50,7 @@ python3 -m venv /tmp/guardedpy-release-env
 /tmp/guardedpy-release-env/bin/python -m pip install dist/guardedpy-*.whl
 ```
 
-项目将采用 CLI-only GitHub Release 方式提交。真实 Release 尚未发布，因此此处不提供占位下载链接；发布完成后应将具体 Release URL 和文件名补入本节。
+当前稳定版本为 [v0.1.0](https://github.com/WalnuTpz/guardedpy/releases/tag/v0.1.0)，可直接安装 [wheel](https://github.com/WalnuTpz/guardedpy/releases/download/v0.1.0/guardedpy-0.1.0-py3-none-any.whl)。
 
 ## 运行
 
@@ -199,7 +195,7 @@ git diff --check
 - `make demo`：运行固定 mock 机制证据；
 - `make build`：在 `dist/` 生成 wheel 和 sdist。
 
-离线测试使用 mock/stub LLM，不需要真实 Key 或网络。GitHub Actions 和 GitLab CI 执行相同的 test/demo/build 门禁；GitLab job 名为 `unit-test`。
+离线测试使用 mock/stub LLM，不需要真实 Key 或网络。GitHub Actions 执行 test/demo/build 门禁；仓库同时附带 GitLab CI 配置，其中 job 名为 `unit-test`。
 
 ## 快速人工验收
 
@@ -262,7 +258,7 @@ git diff --check
 
 ## 分发状态
 
-本仓库用于公开发布 GuardedPy，提供构建配置和可安装 wheel/sdist 测试。首个公开版本为 [v0.1.0](https://github.com/WalnuTpz/guardedpy/releases/tag/v0.1.0)，可直接安装 [wheel](https://github.com/WalnuTpz/guardedpy/releases/download/v0.1.0/guardedpy-0.1.0-py3-none-any.whl)。课程过程文档与个人反思仅保存在供课程评审访问的私有仓库中。
+当前稳定发布为 [v0.1.0](https://github.com/WalnuTpz/guardedpy/releases/tag/v0.1.0)，提供 wheel 与 sdist 两种安装资产。
 
 ## 第三方依赖与许可证
 
