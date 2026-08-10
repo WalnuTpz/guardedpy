@@ -262,7 +262,7 @@ git diff --check
 
 ## 分发状态
 
-本仓库用于公开发布 GuardedPy，提供构建配置和可安装 wheel/sdist 测试。GitHub Release 尚未发布，因此当前不提供占位下载链接。课程过程文档与个人反思仅保存在供课程评审访问的私有仓库中。
+本仓库用于公开发布 GuardedPy，提供构建配置和可安装 wheel/sdist 测试。首个公开版本为 [v0.1.0](https://github.com/WalnuTpz/guardedpy/releases/tag/v0.1.0)，可直接安装 [wheel](https://github.com/WalnuTpz/guardedpy/releases/download/v0.1.0/guardedpy-0.1.0-py3-none-any.whl)。课程过程文档与个人反思仅保存在供课程评审访问的私有仓库中。
 
 ## 第三方依赖与许可证
 
