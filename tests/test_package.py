@@ -44,7 +44,7 @@ def test_make_and_ci_run_the_three_cli_delivery_commands() -> None:
 
 
 def test_readme_is_a_cli_only_installation_and_operation_guide() -> None:
-    """Catches the final guide omitting required operation or delivery facts."""
+    """Catches the final guide omitting required installation or operation facts."""
     readme = _text("README.md").lower()
 
     for heading in (
@@ -62,5 +62,3 @@ def test_readme_is_a_cli_only_installation_and_operation_guide() -> None:
     for retired in ("guardedpy-server", "guardedpy serve", "render.yaml", "fastapi", "guardedpy-cli"):
         assert retired not in readme
     assert "无需 `/init`" in readme
-    assert "公开展示与 release 分发镜像" in readme
-    assert "releases/tag/v0.1.0" in readme

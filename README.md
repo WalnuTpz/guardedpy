@@ -1,12 +1,10 @@
 # GuardedPy
 
+> 智软训练营暑期学校期末项目
+
 GuardedPy 是一个面向小型 Python + pytest 项目的本地 CLI Coding Agent Harness。它自行实现连续 Agent 主循环，让用户在同一终端会话中自然对话、检查项目、修改代码、运行测试并继续追问；文件边界、测试反馈、危险动作审批、凭据和会话恢复由确定性代码控制。
 
 当前产品只提供 CLI，不包含 WebUI、HTTP server，也不向模型提供任意 Shell、通用网络、依赖安装或自动发布工具。
-
-> 本仓库是 GuardedPy 的公开展示与 Release 分发镜像，提供当前可运行的源码、测试、构建配置和发布资产。
->
-> 课程过程文档、开发日志与学生反思仅保存在供课程评审访问的私有课程仓库；本公开仓库不包含这些材料。
 
 ## 核心功能
 
@@ -20,7 +18,7 @@ GuardedPy 是一个面向小型 Python + pytest 项目的本地 CLI Coding Agent
 - keyring-only DeepSeek API Key 管理；
 - 会话保存、恢复、选择与删除；
 - 离线 mock LLM 单元测试和可观看的机制演示；
-- wheel/sdist 构建及 GitHub/GitLab CI。
+- 一键测试、机制演示、wheel/sdist 构建及 GitHub/GitLab CI。
 
 ## 支持环境
 
@@ -41,16 +39,6 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
-
-### 从本地构建产物安装
-
-```bash
-make build
-python3 -m venv /tmp/guardedpy-release-env
-/tmp/guardedpy-release-env/bin/python -m pip install dist/guardedpy-*.whl
-```
-
-当前稳定版本为 [v0.1.0](https://github.com/WalnuTpz/guardedpy/releases/tag/v0.1.0)，可直接安装 [wheel](https://github.com/WalnuTpz/guardedpy/releases/download/v0.1.0/guardedpy-0.1.0-py3-none-any.whl)。
 
 ## 运行
 
@@ -255,10 +243,6 @@ git diff --check
 - TUI 需要交互终端；重定向模式功能更窄；
 - keyring/Secret Service 不可用时不会回退到明文凭据；
 - 恢复会话只重建有界对话和安全事实，不恢复模型进程全部状态。
-
-## 分发状态
-
-当前稳定发布为 [v0.1.0](https://github.com/WalnuTpz/guardedpy/releases/tag/v0.1.0)，提供 wheel 与 sdist 两种安装资产。
 
 ## 第三方依赖与许可证
 
