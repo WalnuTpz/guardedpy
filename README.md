@@ -1,8 +1,6 @@
 # GuardedPy
 
-> 智软训练营暑期学校期末项目
-
-GuardedPy 是一个面向小型 Python + pytest 项目的本地 CLI Coding Agent Harness。它自行实现连续 Agent 主循环，让用户在同一终端会话中自然对话、检查项目、修改代码、运行测试并继续追问；文件边界、测试反馈、危险动作审批、凭据和会话恢复由确定性代码控制。
+GuardedPy 是智软训练营暑期学校的期末项目，也是一个面向小型 Python + pytest 项目的本地 CLI Coding Agent Harness。它自行实现连续 Agent 主循环，让用户在同一终端会话中自然对话、检查项目、修改代码、运行测试并继续追问；文件边界、测试反馈、危险动作审批、凭据和会话恢复由确定性代码控制。
 
 当前产品只提供 CLI，不包含 WebUI、HTTP server，也不向模型提供任意 Shell、通用网络、依赖安装或自动发布工具。
 
