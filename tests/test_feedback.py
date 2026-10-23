@@ -252,3 +252,38 @@ def test_run_pytest_rejects_empty_or_option_targets_even_with_project_test_root(
 
     with pytest.raises(ValueError, match="must name files"):
         Workspace(tmp_path, config).run_pytest((target,))
+
+
+def test_failed_parameterized_nodes_can_be_selected_again(tmp_path: Path) -> None:
+    """Keep summary separators inside parameter IDs when selecting failed tests."""
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\ndisable_test_id_escaping_and_forfeit_all_rights_to_community_support = true\n"
+    )
+    (tmp_path / "test_values.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.parametrize('value', [1, 3, 5], "
+        "ids=['left - right', '左侧 [nested] - 右侧', '['])\n"
+        "def test_value(value):\n"
+        "    if value == 1:\n"
+        "        assert [value] == [2]\n"
+        "    assert [value] == [2], 'different [values] - expected [2]'\n"
+    )
+    command = (sys.executable, "-m", "pytest", "-q", "--color=no")
+    completed = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True)
+    assert completed.returncode == 1
+
+    feedback = FeedbackCollector().collect(
+        PytestRun(completed.returncode, completed.stdout, completed.stderr, False)
+    )
+    assert feedback.kind is FeedbackKind.ASSERTION_FAILURE
+    assert feedback.node_ids == (
+        "test_values.py::test_value[left - right]",
+        "test_values.py::test_value[左侧 [nested] - 右侧]",
+        "test_values.py::test_value[[]",
+    )
+    for node in feedback.node_ids:
+        selected = subprocess.run(
+            (*command, node), cwd=tmp_path, capture_output=True, text=True
+        )
+        assert selected.returncode == 1, selected.stderr
+        assert "1 failed" in selected.stdout

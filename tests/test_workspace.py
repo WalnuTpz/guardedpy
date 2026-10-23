@@ -1,6 +1,9 @@
 from pathlib import Path, PurePosixPath
 import stat
 from dataclasses import replace
+from difflib import unified_diff
+
+import pytest
 
 from guardedpy.workspace import Workspace
 
@@ -140,6 +143,32 @@ def test_matching_multi_file_patch_updates_all_files(tmp_path: Path) -> None:
     assert (tmp_path / "tests" / "second.py").read_text() == "new\n"
 
 
+@pytest.mark.parametrize("context", [0, 3])
+def test_patch_keeps_paired_header_like_content_inside_its_hunk(tmp_path: Path, context: int) -> None:
+    config = safe_config(tmp_path)
+    before = 'TEXT = """\n-- section\n"""\nVALUE = 1\n'
+    after = 'TEXT = """\n++ section\n"""\nVALUE = 2\n'
+    first = tmp_path / "src" / "first.py"
+    second = tmp_path / "src" / "second.py"
+    first.write_text(before)
+    second.write_text("VALUE = 1\n")
+    diff = "".join(unified_diff(
+        before.splitlines(keepends=True), after.splitlines(keepends=True),
+        fromfile="a/src/first.py", tofile="b/src/first.py",
+        n=context,
+    ))
+    diff += "".join(unified_diff(
+        ["VALUE = 1\n"], ["VALUE = 2\n"],
+        fromfile="a/src/second.py", tofile="b/src/second.py",
+    ))
+
+    result = Workspace(tmp_path, config).apply_patch(diff)
+
+    assert result.ok is True
+    assert first.read_text() == after
+    assert second.read_text() == "VALUE = 2\n"
+
+
 def test_patch_can_create_a_file_from_an_empty_hunk(tmp_path: Path) -> None:
     """Catches a parser that treats a zero-line creation hunk as one old line."""
     (tmp_path / "src").mkdir()
@@ -199,7 +228,7 @@ def test_patch_allows_zero_line_hunk_at_end_of_file(tmp_path: Path) -> None:
     result = Workspace(tmp_path, safe_config(tmp_path)).apply_patch(
         """--- a/src/notes.txt
 +++ b/src/notes.txt
-@@ -2,0 +3 @@
+@@ -1,0 +2 @@
 +two
 """
     )

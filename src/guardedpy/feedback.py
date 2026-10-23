@@ -12,11 +12,14 @@ _MAX_EXCERPT_CHARS = 800
 _MAX_NORMALIZED_NODE_IDS = 100
 _MAX_NORMALIZED_NODE_ID_CHARS = 500
 _MAX_NORMALIZED_NODE_CHARS = 20_000
-_FAILED_NODE = re.compile(r"^FAILED (?P<node>\S+)(?P<detail>[^\n]*)$", re.MULTILINE)
-_COLLECTION_NODE = re.compile(r"^ERROR collecting (?P<node>\S+)(?:\s|$)", re.MULTILINE)
+_FAILED_SUMMARY = re.compile(r"^FAILED (?P<summary>[^\n]+)$", re.MULTILINE)
+_FAILURE_DETAIL_SEPARATOR = re.compile(
+    r" - (?=(?:assert(?:ion failed)?(?:\s|$)|[\w.]+(?::|$)))"
+)
+_COLLECTION_NODE = re.compile(r"^(?:_+\s+)?ERROR collecting (?P<node>.+?)(?:\s+_+)?$", re.MULTILINE)
 _ERROR_PHASE = re.compile(r"^ERROR(?:\s|$)", re.MULTILINE)
 _USEFUL_OUTPUT = re.compile(
-    r"^(FAILED |ERROR collecting |INTERNALERROR|E\s{7}|.*(?:AssertionError|assert ).*)"
+    r"^(FAILED |(?:_+\s+)?ERROR collecting |INTERNALERROR|E\s+|.*(?:AssertionError|assert ).*)"
 )
 _ASSERTION_EVIDENCE = re.compile(r"^E\s+(?:AssertionError\b|assert\b)", re.MULTILINE)
 _ASSERTION_SUMMARY = re.compile(r"(?:AssertionError\b|\bassert(?:ion failed)?\b)", re.IGNORECASE)
@@ -81,13 +84,16 @@ class FeedbackCollector:
         if _ERROR_PHASE.search(output):
             return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), self._excerpt(output))
 
-        failed_matches = tuple(_FAILED_NODE.finditer(output))
-        failed_nodes = tuple(match.group("node") for match in failed_matches)
+        failed_summaries = tuple(
+            self._split_failure_summary(match.group("summary"))
+            for match in _FAILED_SUMMARY.finditer(output)
+        )
+        failed_nodes = tuple(node for node, _ in failed_summaries)
         if failed_nodes:
             excerpt = self._excerpt(output)
             per_node_assertions = tuple(
-                bool(_ASSERTION_SUMMARY.search(match.group("detail")))
-                for match in failed_matches
+                bool(_ASSERTION_SUMMARY.search(detail))
+                for _, detail in failed_summaries
             )
             all_assertions = all(per_node_assertions) or (
                 len(failed_nodes) == 1 and _ASSERTION_EVIDENCE.search(excerpt) is not None
@@ -133,6 +139,15 @@ class FeedbackCollector:
                         return PytestFeedback(FeedbackKind.EXECUTION_ERROR, (), feedback.excerpt)
                     normalized.append(projected)
         return PytestFeedback(feedback.kind, tuple(normalized), feedback.excerpt)
+
+    @staticmethod
+    def _split_failure_summary(summary: str) -> tuple[str, str]:
+        """Keep parameter IDs intact before pytest's assertion or exception detail."""
+        separator = _FAILURE_DETAIL_SEPARATOR.search(summary)
+        if separator is not None:
+            return summary[: separator.start()], summary[separator.end() :]
+        node, _, detail = summary.partition(" - ")
+        return node, detail
 
     @staticmethod
     def _node_ids(pattern: re.Pattern[str], output: str) -> tuple[str, ...]:

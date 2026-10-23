@@ -43,22 +43,21 @@ def test_make_and_ci_run_the_three_cli_delivery_commands() -> None:
     assert gitlab["unit-test"]["script"][-3:] == ["make test", "make demo", "make build"]
 
 
-def test_readme_is_a_cli_only_installation_and_operation_guide() -> None:
-    """Catches the final guide omitting required installation or operation facts."""
+def test_documentation_covers_cli_installation_and_operation() -> None:
+    """Keep the project guides reachable from the package README."""
     readme = _text("README.md").lower()
+    tutorial = _text("docs/getting-started.md").lower()
+    usage = _text("docs/usage.md").lower()
+    design = _text("docs/design.md").lower()
 
-    for heading in (
-        "## 安装",
-        "## 运行",
-        "## 凭据配置",
-        "## 机制演示",
-        "## 测试与构建",
-        "## 安全边界",
-        "## 已知限制",
-    ):
-        assert heading in readme
-    for command in ("guardedpy", "/credentials", "/model", "/effort", "guardedpy demo", "make test", "make demo", "make build"):
+    for path in ("docs/getting-started.md", "docs/usage.md", "docs/design.md"):
+        assert f"]({path.lower()})" in readme
+        assert (ROOT / path).is_file()
+    for command in ("git clone", "python3 -m venv", "python -m pip install", "guardedpy", "/credentials"):
         assert command in readme
+        assert command in tutorial
+    for command in ("/model", "/effort", "/conversations", "/tests", "/diff"):
+        assert command in usage
+    documentation = "\n".join((readme, tutorial, usage, design))
     for retired in ("guardedpy-server", "guardedpy serve", "render.yaml", "fastapi", "guardedpy-cli"):
-        assert retired not in readme
-    assert "无需 `/init`" in readme
+        assert retired not in documentation

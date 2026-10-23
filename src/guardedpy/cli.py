@@ -13,7 +13,7 @@ from openai import OpenAI
 
 from guardedpy.conversation import ConversationAgent
 from guardedpy.conversations import ConversationStore
-from guardedpy.credentials import CredentialService
+from guardedpy.credentials import CredentialBackendUnavailableError, CredentialService
 from guardedpy.discovery import ProjectDiscoveryError, discover_project
 from guardedpy.executor import ToolExecutor
 from guardedpy.governor import ToolGovernor, governed_tool_definitions
@@ -38,16 +38,19 @@ def continuous_runtime(runtime: LocalRuntime, profile: Any) -> ConversationRunti
     config = runtime.config
     if config is None:
         raise RuntimeError("runtime is not configured")
-    model = DeepSeekConversationModel(
-        CredentialService(_system_keyring()).get_key,
-        config,
-        lambda api_key, *, max_retries: _deepseek_transport(
-            api_key, timeout_seconds=config.timeout_seconds
-        ),
-    )
+
+    def model_for_turn() -> DeepSeekConversationModel:
+        turn_config = runtime.config
+        return DeepSeekConversationModel(
+            CredentialService(_system_keyring()).get_key,
+            turn_config,
+            lambda api_key, *, max_retries: _deepseek_transport(
+                api_key, timeout_seconds=turn_config.timeout_seconds
+            ),
+        )
     return ConversationRuntime(
         ConversationAgent(
-            model,
+            model_for_turn,
             governed_tool_definitions(config),
             ToolGovernor(config),
             ToolExecutor(profile.root, config),
@@ -103,7 +106,12 @@ def main(
     runtime = runtime_factory()
     runtime.setup(profile, api_key=None)
     if not source.isatty() or not output.isatty():
-        if not runtime.credential_status().configured:
+        try:
+            configured = runtime.credential_status().configured
+        except CredentialBackendUnavailableError:
+            output.write("安全系统密钥环不可用；请先安装或启动兼容的安全系统密钥环。\n")
+            return 1
+        if not configured:
             output.write("需要先在交互终端配置凭据。\n")
             return 1
         return run_plain_conversation(

@@ -43,7 +43,7 @@ _HELP_LINES = (
     "/stop：中断当前回合并取消排队任务。",
     "/queue <任务>：把下一项工作排到当前回合之后。",
     "/tests：运行配置的 pytest。",
-    "/diff：查看当前 Git diff。",
+    "/diff：显示 Git 未暂存修改状态。",
     "/doctor：查看本地项目状态。",
     "/permissions：查看可自动执行与需审批的操作。",
     "/credentials：安全录入、更新或清除 API Key。",
@@ -51,7 +51,7 @@ _HELP_LINES = (
     "/effort：选择后续回合思考强度。",
     "/help：打开本帮助面板。",
     "输入：Enter 提交；Shift+Enter 或 Ctrl+J 换行；输入 / 或点击 ＋ 打开命令选择；选择命令后再按 Enter 执行；Ctrl+Shift+C 复制安全对话记录。",
-    "安全：读取、补丁、pytest 和只读 Git 在项目边界内自动执行；删除始终逐次请求批准；非交互终端会安全停止，不会代替你批准。",
+    "权限：读取、补丁、pytest 和只读 Git 在项目边界内自动执行；删除和运行项目 Python 程序逐次请求批准；非交互终端遇到审批时停止当前任务。",
 )
 
 
@@ -206,11 +206,13 @@ class TranscriptLog(TextArea):
     def _render_entries(self) -> None:
         self.load_text("\n".join(text for _item_id, text in self._continuous_entries))
         self.scroll_end(animate=False)
+        self.refresh()
 
     def reset_continuous(self) -> None:
         """Discard the current session's rendered event projection."""
         self._continuous_entries.clear()
         self.load_text("")
+        self.refresh()
 
 
 class Composer(TextArea):
@@ -481,6 +483,7 @@ class GuardedPyApp(App[None]):
         self._continuous_turn_id: UUID | None = None
         self._continuous_pending_approval: tuple[UUID, UUID, UUID] | None = None
         self._pending_submission: tuple[str, Literal["normal", "plan", "review"]] | None = None
+        self._new_after_interrupt = False
         self._transcript_presenter = TranscriptPresenter()
         self._seen_events: set[tuple[UUID, UUID, int]] = set()
 
@@ -544,7 +547,7 @@ class GuardedPyApp(App[None]):
             self.query_one("#send", Button).disabled = not bool(event.text_area.text.strip())
 
     def on_key(self, event: Any) -> None:
-        if event.key == "ctrl+c" and self._continuous_turn_id is not None:
+        if event.key in {"ctrl+c", "escape"} and self._continuous_turn_id is not None:
             event.prevent_default()
             event.stop()
             self._interrupt_continuous()
@@ -609,6 +612,9 @@ class GuardedPyApp(App[None]):
             if self._continuous_session_id is None:
                 self._continuous_session_id = self._conversation_runtime.create_session(str(self.profile.root))
             if self._continuous_turn_id is not None:
+                if mode != "normal":
+                    self._write("请先停止当前任务或等待结束，再启动计划或审查。")
+                    return
                 event = self._conversation_runtime.steer(
                     self._continuous_session_id, self._continuous_turn_id, text
                 )
@@ -644,6 +650,8 @@ class GuardedPyApp(App[None]):
             ))
 
     def on_session_event_received(self, message: SessionEventReceived) -> None:
+        if message.event.session_id != self._continuous_session_id:
+            return
         event_key = (
             message.event.session_id,
             message.event.turn_id,
@@ -670,6 +678,8 @@ class GuardedPyApp(App[None]):
             )
         if message.event.kind in {"turn_completed", "turn_interrupted", "turn_failed"} and message.event.turn_id == self._continuous_turn_id:
             self._continuous_turn_id = None
+            if self._new_after_interrupt:
+                self._new_conversation()
 
     def _continuous_approval_resolved(self, decision: str | None) -> None:
         pending = self._continuous_pending_approval
@@ -698,6 +708,10 @@ class GuardedPyApp(App[None]):
     def _interrupt_continuous(self) -> None:
         if self._continuous_session_id is None or self._continuous_turn_id is None:
             return
+        if self._continuous_pending_approval is not None:
+            self._continuous_pending_approval = None
+            if isinstance(self.screen, ApprovalScreen):
+                self.screen.dismiss(None)
         try:
             event = self._conversation_runtime.interrupt(
                 self._continuous_session_id, self._continuous_turn_id
@@ -741,6 +755,9 @@ class GuardedPyApp(App[None]):
                 self.push_screen(NewConversationScreen(), self._new_conversation_resolved)
             return
         if name == "/conversations":
+            if self._continuous_turn_id is not None:
+                self._write("请先停止当前会话后再切换。")
+                return
             conversations = self._conversation_runtime.store.summaries()
             if conversations:
                 self.push_screen(ConversationScreen(conversations), self._conversation_selected)
@@ -748,7 +765,7 @@ class GuardedPyApp(App[None]):
                 self._write("会话：0")
             return
         if name == "/permissions":
-            self._write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。")
+            self._write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除和运行项目 Python 程序须逐次审批。")
             return
         if name in {"/tests", "/diff", "/doctor"}:
             try:
@@ -883,10 +900,13 @@ class GuardedPyApp(App[None]):
 
     def _new_conversation_resolved(self, confirmed: bool) -> None:
         if confirmed:
+            self._new_after_interrupt = True
             self._interrupt_continuous()
-            self._new_conversation()
+            if self._continuous_turn_id is None:
+                self._new_conversation()
 
     def _new_conversation(self) -> None:
+        self._new_after_interrupt = False
         self._continuous_session_id = self._conversation_runtime.create_session(str(self.profile.root))
         self._continuous_turn_id = None
         self._transcript_presenter = TranscriptPresenter()
@@ -900,6 +920,9 @@ class GuardedPyApp(App[None]):
 
     def _conversation_selected(self, summary_id: UUID | None) -> None:
         if summary_id is None:
+            return
+        if self._continuous_turn_id is not None:
+            self._write("请先停止当前会话后再切换。")
             return
         self._continuous_session_id = self._conversation_runtime.create_session(
             str(self.profile.root), summary_id

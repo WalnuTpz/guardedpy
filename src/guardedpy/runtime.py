@@ -75,6 +75,7 @@ class ConversationRuntime:
     def __init__(self, agent: ConversationAgent, store: ConversationStore) -> None:
         self._agent = agent
         self.store = store
+        self._lock = RLock()
         self._summaries: dict[UUID, ConversationSummary] = {}
         self._texts: dict[tuple[UUID, UUID], list[str]] = {}
         self._facts: dict[tuple[UUID, UUID], dict[str, object]] = {}
@@ -128,9 +129,9 @@ class ConversationRuntime:
         conversations = self.store.summaries()
         if len(conversations) <= 1:
             return None
+        self._agent.discard_session(session_id)
         self.store.delete_summary(current.id)
         self._summaries.pop(session_id, None)
-        self._agent.discard_session(session_id)
         return max((summary for summary in conversations if summary.id != current.id), key=lambda summary: summary.updated_at)
 
     def queue(self, session_id: UUID, text: str, mode: TurnMode = "normal") -> tuple[UUID, SessionEvent]:
@@ -169,29 +170,32 @@ class ConversationRuntime:
             yield event
 
     def _record_terminal(self, session_id: UUID, turn_id: UUID, event: SessionEvent) -> None:
-        summary = self.summary(session_id)
-        status = {"turn_completed": "completed", "turn_interrupted": "interrupted", "turn_failed": "failed"}[event.kind]
-        facts = self._facts.pop((session_id, turn_id), {
-            "changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none",
-        })
-        turn = SafeTurnSummary(
-            terminal_status=status, changed_paths=tuple(sorted(facts["changed_paths"])),
-            pytest_outcome=facts["pytest_outcome"], approval_outcome=facts["approval_outcome"],
-            final_text=_bounded_safe_summary(_safe_summary_text(status, facts)),
-        )
-        updated = summary.model_copy(update={"updated_at": datetime.now(timezone.utc), "turns": (*summary.turns, turn)})
-        self._summaries[session_id] = updated
-        self.store.save_summary(updated)
+        with self._lock:
+            summary = self.summary(session_id)
+            status = {"turn_completed": "completed", "turn_interrupted": "interrupted", "turn_failed": "failed"}[event.kind]
+            facts = self._facts.pop((session_id, turn_id), {
+                "changed_paths": set(), "pytest_outcome": "not_run", "approval_outcome": "none",
+            })
+            turn = SafeTurnSummary(
+                terminal_status=status, changed_paths=tuple(sorted(facts["changed_paths"])),
+                pytest_outcome=facts["pytest_outcome"], approval_outcome=facts["approval_outcome"],
+                final_text=_bounded_safe_summary(_safe_summary_text(status, facts)),
+            )
+            updated = summary.model_copy(update={"updated_at": datetime.now(timezone.utc), "turns": (*summary.turns, turn)})
+            self._summaries[session_id] = updated
+            self.store.save_summary(updated)
 
     def _append_visible_message(self, session_id: UUID, role: str, text: str) -> None:
-        summary = self.summary(session_id)
-        entry = VisibleTranscriptEntry(role=role, text=_redact_visible_text(text))
-        updated = summary.model_copy(update={
-            "updated_at": datetime.now(timezone.utc),
-            "transcript": (*summary.transcript, entry),
-        })
-        self._summaries[session_id] = updated
-        self.store.save_summary(updated)
+        with self._lock:
+            summary = self.summary(session_id)
+            entry = VisibleTranscriptEntry(role=role, text=_redact_visible_text(text))
+            updated = summary.model_copy(update={
+                "updated_at": datetime.now(timezone.utc),
+                "transcript": (*summary.transcript, entry),
+            })
+            self._summaries[session_id] = updated
+            self.store.save_summary(updated)
+
 
 def _safe_summary_text(status: str, facts: dict[str, object]) -> str:
     """Persist only deterministic lifecycle and tool facts, never model text."""

@@ -1,4 +1,4 @@
-"""Project-scoped, text-free conversation references."""
+"""Project-scoped persistence for conversation summaries and visible messages."""
 
 from __future__ import annotations
 

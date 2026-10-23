@@ -35,7 +35,7 @@ def test_discover_project_prefers_existing_pytest_testpaths(tmp_path: Path) -> N
     [
         ("pytest.ini", "[pytest]\ntestpaths = checks nested/checks\n"),
         ("tox.ini", "[pytest]\ntestpaths = checks nested/checks\n"),
-        ("setup.cfg", "[pytest]\ntestpaths = checks nested/checks\n"),
+        ("setup.cfg", "[tool:pytest]\ntestpaths = checks nested/checks\n"),
     ],
 )
 def test_discover_project_reads_supported_ini_testpaths(
@@ -55,7 +55,7 @@ def test_discover_project_reads_supported_ini_testpaths(
     )
 
 
-def test_first_existing_pytest_config_controls_fallback(tmp_path: Path) -> None:
+def test_pytest_ini_takes_precedence_over_pyproject(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
     (tmp_path / "pytest.ini").write_text("[pytest]\ntestpaths = checks\n")
     (tmp_path / "checks").mkdir()
@@ -64,8 +64,8 @@ def test_first_existing_pytest_config_controls_fallback(tmp_path: Path) -> None:
 
     profile = discover_project(tmp_path)
 
-    assert profile.discovery_source == "tests_dir"
-    assert profile.test_dirs == (PurePosixPath("tests"),)
+    assert profile.discovery_source == "pytest_config"
+    assert profile.test_dirs == (PurePosixPath("checks"),)
 
 
 def test_discover_project_uses_tests_and_src_directories(tmp_path: Path) -> None:
@@ -279,3 +279,19 @@ def test_discover_project_rejects_tests_only_and_no_evidence_layouts(tmp_path: P
     with pytest.raises(ProjectDiscoveryError) as no_tests:
         discover_project(tmp_path)
     assert no_tests.value.code == "unsupported_project"
+
+
+def test_discovery_ignores_tests_inside_the_project_virtualenv(tmp_path: Path) -> None:
+    _write_source(tmp_path, under_src=False)
+    dependency_tests = tmp_path / ".venv/lib/python3.11/site-packages/dependency/tests"
+    dependency_tests.mkdir(parents=True)
+    (dependency_tests / "test_dependency.py").write_text("def test_dependency(): pass\n")
+
+    with pytest.raises(ProjectDiscoveryError) as no_project_tests:
+        discover_project(tmp_path)
+    assert no_project_tests.value.code == "unsupported_project"
+
+    checks = tmp_path / "checks"
+    checks.mkdir()
+    (checks / "test_app.py").write_text("def test_app(): pass\n")
+    assert discover_project(tmp_path).discovery_source == "root_tests"

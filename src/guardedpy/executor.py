@@ -103,8 +103,17 @@ class ToolExecutor:
         result = self._workspace.read_file(path, offset, limit)
         execution = self._result(call, result)
         if result.ok:
+            digest = str(result.data["sha256"])
+            previous = turn.reads.get(path.as_posix())
+            if previous is not None and previous.sha256 != digest:
+                previous = None
+            covered = previous.next_offset if previous is not None else 0
+            complete = previous.complete if previous is not None else False
+            if offset <= covered:
+                covered = max(covered, int(result.data["next_offset"]))
+                complete = complete or bool(result.data["eof"])
             turn.reads[path.as_posix()] = ReadRecord(
-                path.as_posix(), str(result.data["sha256"]), bool(result.data["complete"])
+                path.as_posix(), digest, complete, covered
             )
         return execution
 
@@ -112,8 +121,14 @@ class ToolExecutor:
         diff = arguments.get("unified_diff")
         if not isinstance(diff, str) or len(diff.encode()) > 65536:
             return self._failure(call, "invalid_tool_call")
+        patches = self._workspace._parse_patch(diff)
+        if patches is None:
+            return self._failure(call, "patch_invalid")
         missing_paths: list[str] = []
-        for path in _existing_patch_paths(diff):
+        for file_patch in patches:
+            if file_patch.create:
+                continue
+            path = file_patch.path.as_posix()
             record = turn.reads.get(path)
             target = self._workspace.root / path
             if not target.resolve().is_relative_to(self._workspace.root) or not target.is_file():
@@ -121,7 +136,7 @@ class ToolExecutor:
             if record is None or not record.complete:
                 missing_paths.append(path)
                 continue
-            if not target.is_file() or sha256(target.read_bytes()).hexdigest() != record.sha256:
+            if sha256(target.read_bytes()).hexdigest() != record.sha256:
                 return self._failure(call, "stale_read")
         if missing_paths:
             return self._failure(call, "read_required", missing_paths=missing_paths)
@@ -152,18 +167,3 @@ class ToolExecutor:
             call.id, "allow", code, result.summary,
             {"ok": result.ok, "code": code, "summary": result.summary, **result.data},
         )
-
-
-def _existing_patch_paths(diff: str) -> tuple[str, ...]:
-    paths: list[str] = []
-    lines = diff.splitlines()
-    for index, line in enumerate(lines):
-        if not line.startswith("--- ") or index + 1 == len(lines) or not lines[index + 1].startswith("+++ "):
-            continue
-        path = line[4:].split("\t", 1)[0]
-        if path == "/dev/null":
-            continue
-        if path.startswith("a/"):
-            path = path[2:]
-        paths.append(path)
-    return tuple(paths)

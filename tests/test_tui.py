@@ -56,6 +56,38 @@ def _transcript_lines(app: object) -> tuple[str, ...]:
     return app.query_one("#transcript", TranscriptLog).text_entries  # type: ignore[attr-defined]
 
 
+def test_transcript_repaints_streamed_text_and_clears_without_resize() -> None:
+    from textual.app import App
+
+    from guardedpy.tui import TranscriptLog, TranscriptUpdate
+
+    class TranscriptApp(App):
+        def compose(self):
+            yield TranscriptLog(id="transcript")
+
+    app = TranscriptApp()
+    item_id = uuid4()
+
+    async def check() -> None:
+        async with app.run_test(size=(80, 20)) as pilot:
+            transcript = app.query_one(TranscriptLog)
+            transcript.apply_update(TranscriptUpdate(item_id, "STREAM_ALPHA"))
+            await pilot.pause()
+            assert "STREAM_ALPHA" in app.export_screenshot()
+
+            transcript.apply_update(TranscriptUpdate(item_id, "STREAM_BRAVO", replace=True))
+            await pilot.pause()
+            rendered = app.export_screenshot()
+            assert "STREAM_BRAVO" in rendered
+            assert "STREAM_ALPHA" not in rendered
+
+            transcript.reset_continuous()
+            await pilot.pause()
+            assert "STREAM_BRAVO" not in app.export_screenshot()
+
+    asyncio.run(check())
+
+
 def test_composer_keeps_enter_submit_multiline_and_command_palette(tmp_path: Path) -> None:
     from guardedpy.tui import COMMANDS, Composer, GuardedPyApp, _HELP_LINES
 
@@ -312,7 +344,7 @@ def test_transcript_presenter_explains_safe_tool_completion_and_denial() -> None
     assert denied is not None and denied.text == "无法修改：需先完整读取目标文件。"
     assert missing is not None and missing.text == "无法修改：需先完整读取 src/calc.py。"
     assert program is not None and program.text == "程序输出：\nhello world"
-    assert failed is None
+    assert failed is not None and failed.text == "本轮未完成。"
 
 
 def test_approval_projection_identifies_the_exact_python_program_and_arguments() -> None:
@@ -645,16 +677,18 @@ def test_tui_keeps_the_promoted_fifo_turn_controllable(tmp_path: Path) -> None:
     from guardedpy.tui import GuardedPyApp, SessionEventReceived
 
     profile = _profile(tmp_path)
-    first, promoted = uuid4(), uuid4()
+    session, first, promoted = uuid4(), uuid4(), uuid4()
     app = GuardedPyApp(_Runtime(profile), profile)
+    app._continuous_session_id = session
     app._continuous_turn_id = first
 
     async def check() -> None:
         async with app.run_test() as pilot:
-            app.on_session_event_received(SessionEventReceived(SessionEvent(uuid4(), first, 1, "turn_completed")))
-            app.on_session_event_received(SessionEventReceived(SessionEvent(uuid4(), promoted, 1, "turn_started")))
+            app.on_session_event_received(SessionEventReceived(SessionEvent(session, first, 1, "turn_completed")))
+            app.on_session_event_received(SessionEventReceived(SessionEvent(session, promoted, 1, "turn_started")))
             await pilot.pause()
             assert app._continuous_turn_id == promoted
+            app._continuous_turn_id = None
 
     asyncio.run(check())
 
@@ -666,6 +700,7 @@ def test_tui_projects_a_replayed_session_event_once(tmp_path: Path) -> None:
     profile = _profile(tmp_path)
     app = GuardedPyApp(_Runtime(profile), profile)
     event = SessionEvent(uuid4(), uuid4(), 1, "user_message", uuid4(), "hello")
+    app._continuous_session_id = event.session_id
 
     async def check() -> None:
         async with app.run_test() as pilot:
@@ -688,6 +723,66 @@ def test_tui_explains_that_plan_needs_a_request(tmp_path: Path) -> None:
             app.submit("/plan")
             await pilot.pause()
             assert "计划任务不能为空。" in _transcript_lines(app)
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("mode", ("plan", "review"))
+def test_tui_keeps_read_only_requests_out_of_an_active_turn(tmp_path: Path, mode: str) -> None:
+    from guardedpy.conversation import SessionEvent
+    from guardedpy.tui import GuardedPyApp, SessionEventReceived
+
+    session_id, active_turn_id = uuid4(), uuid4()
+
+    class Conversation:
+        def __init__(self) -> None:
+            self.steered: list[str] = []
+            self.started: list[tuple[str, str]] = []
+
+        def steer(self, session: UUID, turn: UUID, text: str) -> SessionEvent:
+            assert (session, turn) == (session_id, active_turn_id)
+            self.steered.append(text)
+            return SessionEvent(session, turn, 1, "user_message", uuid4(), text)
+
+        def begin_turn(self, session: UUID, text: str, mode: str) -> tuple[UUID, SessionEvent]:
+            assert session == session_id
+            self.started.append((text, mode))
+            turn = uuid4()
+            return turn, SessionEvent(session, turn, 1, "user_message", uuid4(), text)
+
+        def run_turn(self, session: UUID, turn: UUID) -> tuple[SessionEvent, ...]:
+            return (SessionEvent(session, turn, 2, "turn_completed"),)
+
+        def interrupt(self, session: UUID, turn: UUID) -> SessionEvent:
+            return SessionEvent(session, turn, 3, "turn_interrupted")
+
+    profile = _profile(tmp_path)
+    conversation = Conversation()
+    app = GuardedPyApp(_Runtime(profile), profile, conversation=conversation)
+    app._continuous_session_id = session_id
+    app._continuous_turn_id = active_turn_id
+
+    async def check() -> None:
+        async with app.run_test() as pilot:
+            app.submit(f"/{mode} inspect the calculation")
+            assert conversation.steered == []
+            assert "请先停止当前任务或等待结束，再启动计划或审查。" in _transcript_lines(app)
+            assert app._continuous_turn_id == active_turn_id
+
+            app.submit("keep the existing function signature")
+            assert conversation.steered == ["keep the existing function signature"]
+
+            app.on_session_event_received(SessionEventReceived(
+                SessionEvent(session_id, active_turn_id, 2, "turn_completed")
+            ))
+            app.submit(f"/{mode} inspect the calculation")
+            await pilot.pause()
+            assert conversation.started == [("inspect the calculation", mode)]
+            assert app._continuous_turn_id is None
+
+            app.submit("continue fixing the calculation")
+            await pilot.pause()
+            assert conversation.started[-1] == ("continue fixing the calculation", "normal")
 
     asyncio.run(check())
 

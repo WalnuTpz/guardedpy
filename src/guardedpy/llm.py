@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import closing
 from typing import Any, Callable
 
 from openai import APIConnectionError, APITimeoutError
@@ -45,19 +46,20 @@ class DeepSeekConversationModel:
             "reasoning_effort": self._config.reasoning_effort,
             "extra_body": {"thinking": {"type": "enabled"}},
         }
-        for attempt in range(2):
-            yielded = False
-            try:
-                response = transport.chat.completions.create(**request)
-                for provider_chunk in response:
-                    for chunk in _model_chunks(provider_chunk):
-                        yielded = True
-                        yield chunk
-                return
-            except (ConnectionError, TimeoutError, APIConnectionError, APITimeoutError):
-                if yielded or attempt == 1:
-                    raise TemporaryProviderFailure from None
-        raise AssertionError("unreachable")
+        with closing(transport):
+            for attempt in range(2):
+                yielded = False
+                try:
+                    with closing(transport.chat.completions.create(**request)) as response:
+                        for provider_chunk in response:
+                            for chunk in _model_chunks(provider_chunk):
+                                yielded = True
+                                yield chunk
+                    return
+                except (ConnectionError, TimeoutError, APIConnectionError, APITimeoutError):
+                    if yielded or attempt == 1:
+                        raise TemporaryProviderFailure from None
+            raise AssertionError("unreachable")
 
 
 def _provider_message(message: ProviderMessage) -> dict[str, object]:

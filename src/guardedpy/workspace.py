@@ -100,6 +100,8 @@ class Workspace:
             size += len(encoded)
         content = "".join(page)
         next_offset = offset + len(page)
+        if selected and not page:
+            return ToolResult(False, "Line exceeds the supported read size", {"reason": "line_too_long"})
         return ToolResult(
             True,
             "Read project file",
@@ -109,6 +111,7 @@ class Workspace:
                 "next_offset": next_offset,
                 "sha256": sha256(content_bytes).hexdigest(),
                 "complete": offset == 0 and next_offset == len(lines),
+                "eof": next_offset == len(lines),
             },
         )
 
@@ -400,30 +403,50 @@ class Workspace:
 
             hunks: list[_Hunk] = []
             while index < len(lines):
-                if lines[index].startswith("--- ") and index + 1 < len(lines) and lines[index + 1].startswith("+++ "):
+                if self._starts_file_patch(lines, index):
                     break
                 match = _HUNK_HEADER.match(lines[index].rstrip("\n"))
                 if match is None:
                     return None
-                old_start, _old_count, _new_start, _new_count = match.groups()
+                old_start, old_count, _new_start, new_count = match.groups()
+                declared_old_count = int(old_count) if old_count is not None else 1
+                declared_new_count = int(new_count) if new_count is not None else 1
                 index += 1
                 hunk_lines: list[str] = []
+                actual_old_count = actual_new_count = 0
                 while index < len(lines):
-                    if lines[index].startswith("@@ ") or (lines[index].startswith("--- ") and index + 1 < len(lines) and lines[index + 1].startswith("+++ ")):
+                    if lines[index].startswith("@@ ") or (
+                        actual_old_count >= declared_old_count
+                        and actual_new_count >= declared_new_count
+                        and self._starts_file_patch(lines, index)
+                    ):
                         break
+                    if lines[index].rstrip("\n") == "\\ No newline at end of file" and hunk_lines:
+                        hunk_lines[-1] = hunk_lines[-1].removesuffix("\n")
+                        index += 1
+                        continue
                     if not lines[index].startswith((" ", "+", "-")):
                         return None
                     hunk_lines.append(lines[index])
+                    actual_old_count += lines[index][0] in " -"
+                    actual_new_count += lines[index][0] in " +"
                     index += 1
                 if not hunk_lines:
                     return None
-                actual_old_count = sum(line[0] in " -" for line in hunk_lines)
-                actual_new_count = sum(line[0] in " +" for line in hunk_lines)
                 hunks.append(_Hunk(int(old_start), actual_old_count, actual_new_count, tuple(hunk_lines)))
             if not hunks:
                 return None
             patches.append(_FilePatch(PurePosixPath(patch_path), create, tuple(hunks)))
-        return tuple(patches)
+        return tuple(patches) or None
+
+    @staticmethod
+    def _starts_file_patch(lines: list[str], index: int) -> bool:
+        return (
+            index + 2 < len(lines)
+            and lines[index].startswith("--- ")
+            and lines[index + 1].startswith("+++ ")
+            and _HUNK_HEADER.match(lines[index + 2].rstrip("\n")) is not None
+        )
 
     @staticmethod
     def _patch_path(header_value: str) -> str | None:
@@ -439,7 +462,7 @@ class Workspace:
         lines = original.splitlines(keepends=True)
         line_delta = 0
         for hunk in hunks:
-            position = (hunk.old_start - 1 if hunk.old_start else 0) + line_delta
+            position = (hunk.old_start if hunk.old_count == 0 else hunk.old_start - 1) + line_delta
             if position < 0 or position > len(lines):
                 return None
             expected = [line[1:] for line in hunk.lines if line[0] in " -"]

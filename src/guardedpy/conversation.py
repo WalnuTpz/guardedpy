@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+import subprocess
 from typing import Literal, Protocol, TypeAlias
 from uuid import UUID, uuid4
 
@@ -284,7 +285,13 @@ def safe_event_message(event: SessionEvent) -> str | None:
     return {
         "turn_completed": None,
         "turn_interrupted": "本轮回复已中断。",
-        "turn_failed": None,
+        "turn_failed": {
+            "verification_required": "本轮未完成：修改后尚未通过完整 pytest 验证。",
+            "provider_temporary_failure": "本轮未完成：模型服务连接失败。",
+            "provider_protocol_error": "本轮未完成：模型返回无效或不完整的响应。",
+            "tool_execution_error": "本轮未完成：本地工具执行失败。",
+            "round_limit": "本轮未完成：已达到回合执行上限。",
+        }.get(event.data.get("code"), "本轮未完成。"),
     }.get(event.kind)
 
 
@@ -304,6 +311,7 @@ class ReadRecord:
     path: str
     sha256: str
     complete: bool
+    next_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -330,6 +338,8 @@ class Turn:
     pending_steers: deque[ProviderMessage] = field(default_factory=deque)
     cancelled: bool = False
     goal_message: ProviderMessage | None = None
+    model: ConversationModel | None = None
+    pending_tool_calls: deque[ToolCall] = field(default_factory=deque)
 
 
 @dataclass
@@ -381,12 +391,12 @@ class ConversationAgent:
 
     def __init__(
         self,
-        model: ConversationModel,
+        model: ConversationModel | Callable[[], ConversationModel],
         tools: tuple[ToolDefinition, ...] = (),
         governor: ToolGovernor | None = None,
         executor: ToolExecutor | None = None,
     ) -> None:
-        self._model = model
+        self._model_factory = model if callable(model) else lambda: model
         self._tools = tools
         self._governor = governor
         self._executor = executor
@@ -450,6 +460,7 @@ class ConversationAgent:
             initial_text=initial_text,
             mode=mode,
             goal_message=goal_message,
+            model=self._model_factory(),
         )
         session.turns[turn.id] = turn
         session.active_turn_id = turn.id
@@ -500,7 +511,7 @@ class ConversationAgent:
 
             try:
                 chunks = iter(
-                    self._model.stream(
+                    turn.model.stream(
                         tuple(session.provider_messages), self._tools
                     )
                 )
@@ -558,6 +569,7 @@ class ConversationAgent:
                 yield terminal
                 return False
             turn.provider_responses += 1
+            turn.pending_tool_calls.extend(calls)
             session.provider_messages.append(
                 ProviderMessage(
                     role="assistant", content="".join(text_parts), tool_calls=calls,
@@ -586,6 +598,10 @@ class ConversationAgent:
                 item_id = uuid4()
                 presentation = self._governor.presentation(call)
                 yield self._event(turn, "tool_item_started", item_id=item_id, data=presentation)
+                if turn.cancelled:
+                    terminal, _ = self._terminate(session, turn, "interrupted", "turn_interrupted")
+                    yield terminal
+                    return False
                 decision = self._governor.decide(turn, item_id, call)
                 if decision.verdict == "approval_required":
                     assert decision.approval_id is not None
@@ -598,14 +614,14 @@ class ConversationAgent:
                     return True
                 if decision.verdict == "deny":
                     payload = {"ok": False, "code": decision.code, "summary": decision.code}
-                    self._append_tool_result(session, call, payload)
+                    self._append_tool_result(session, turn, call, payload)
                     yield self._event(
                         turn, "tool_item_completed", item_id=item_id,
                         data={**presentation, "code": decision.code, "verdict": "deny"},
                     )
                     continue
-                execution = self._executor.execute(turn, item_id, call)
-                yield from self._execution_events(session, turn, item_id, call, execution)
+                if not (yield from self._execute_call(session, turn, item_id, call)):
+                    return False
 
     def resolve_approval(
         self,
@@ -629,16 +645,23 @@ class ConversationAgent:
         )
         if decision.code == "approval_stale":
             raise TurnNotActiveError("approval is stale")
+        turn.waiting_approval = None
+        turn.status = "running"
         yield self._event(
             turn, "approval_resolved", item_id=pending.item_id,
             data={"approval_id": str(approval_id), "accepted": str(accepted).lower()},
         )
+        if turn.cancelled:
+            terminal, _ = self._terminate(session, turn, "interrupted", "turn_interrupted")
+            yield terminal
+            return
         if decision.verdict == "allow":
-            execution = self._executor.execute(turn, pending.item_id, pending.call)
-            yield from self._execution_events(session, turn, pending.item_id, pending.call, execution)
+            if not (yield from self._execute_call(session, turn, pending.item_id, pending.call)):
+                yield from self._run_promoted_turns(session)
+                return
         else:
             payload = {"ok": False, "code": decision.code, "summary": decision.code}
-            self._append_tool_result(session, pending.call, payload)
+            self._append_tool_result(session, turn, pending.call, payload)
             yield self._event(
                 turn, "tool_item_completed", item_id=pending.item_id,
                 data={**self._governor.presentation(pending.call), "code": decision.code, "verdict": "deny"},
@@ -652,13 +675,14 @@ class ConversationAgent:
                 data=self._governor.presentation(call),
             )
             payload = {"ok": False, "code": "not_executed_after_approval", "summary": "not_executed_after_approval"}
-            self._append_tool_result(session, call, payload)
+            self._append_tool_result(session, turn, call, payload)
             yield self._event(turn, "tool_item_completed", item_id=item_id, data={"tool": call.name, "code": "not_executed_after_approval", "verdict": "deny"})
-        turn.waiting_approval = None
-        turn.status = "running"
         paused = yield from self._advance(session, turn)
         if paused:
             return
+        yield from self._run_promoted_turns(session)
+
+    def _run_promoted_turns(self, session: Session) -> Iterator[SessionEvent]:
         while session.active_turn_id is not None:
             promoted = session.turns[session.active_turn_id]
             yield self._event(promoted, "turn_started")
@@ -666,14 +690,25 @@ class ConversationAgent:
                 return
 
     @staticmethod
-    def _append_tool_result(session: Session, call: ToolCall, payload: Mapping[str, object]) -> None:
+    def _append_tool_result(session: Session, turn: Turn, call: ToolCall, payload: Mapping[str, object]) -> None:
         session.provider_messages.append(
             ProviderMessage(role="tool", content=json.dumps(payload, sort_keys=True, separators=(",", ":")), tool_call_id=call.id)
         )
+        turn.pending_tool_calls.popleft()
+
+    def _execute_call(self, session: Session, turn: Turn, item_id: UUID, call: ToolCall) -> Iterator[SessionEvent]:
+        try:
+            execution = self._executor.execute(turn, item_id, call)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            terminal, _ = self._terminate(session, turn, "failed", "turn_failed", code="tool_execution_error")
+            yield terminal
+            return False
+        yield from self._execution_events(session, turn, item_id, call, execution)
+        return True
 
     def _execution_events(self, session: Session, turn: Turn, item_id: UUID, call: ToolCall, execution: object) -> Iterator[SessionEvent]:
         payload = execution.provider_result
-        self._append_tool_result(session, call, payload)
+        self._append_tool_result(session, turn, call, payload)
         summary = str(execution.summary)
         if summary:
             yield self._event(turn, "tool_output", item_id=item_id, text=summary)
@@ -740,7 +775,7 @@ class ConversationAgent:
         session = self._session(session_id)
         turn = self._active_turn(session, turn_id, allow_cancelling=True)
         session.queued_turn_ids.clear()
-        if turn.status == "running":
+        if turn.status in {"running", "cancelling"}:
             turn.cancelled = True
             turn.status = "cancelling"
             return None
@@ -866,6 +901,12 @@ class ConversationAgent:
     ) -> tuple[SessionEvent, Turn | None]:
         turn.status = status
         turn.waiting_approval = None
+        while turn.pending_tool_calls:
+            call = turn.pending_tool_calls[0]
+            self._append_tool_result(session, turn, call, {
+                "ok": False, "code": code or "turn_interrupted",
+                "summary": "Tool call did not complete before the turn ended.",
+            })
         if turn.goal_message is not None:
             session.provider_messages.remove(turn.goal_message)
         event = self._event(
@@ -877,6 +918,7 @@ class ConversationAgent:
         if session.queued_turn_ids:
             promoted = session.turns[session.queued_turn_ids.popleft()]
             promoted.status = "running"
+            promoted.model = self._model_factory()
             session.active_turn_id = promoted.id
             session.provider_messages.append(
                 ProviderMessage(role="user", content=promoted.initial_text)

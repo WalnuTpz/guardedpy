@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "guardedpy"
 version = "0.1.0"
 description = "A governed, test-driven coding agent harness"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2,<3",
@@ -20,7 +23,7 @@ dependencies = [
 guardedpy = "guardedpy.cli:main"
 
 [project.optional-dependencies]
-dev = ["build"]
+dev = ["build", "setuptools>=77.0.3", "wheel"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

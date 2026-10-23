@@ -212,6 +212,12 @@ def test_wheel_metadata_declares_every_runtime_dependency(tmp_path: Path) -> Non
     """Catches a built wheel silently dropping a module required by the installed CLI."""
     _project_copy, wheel, _sdist = _copy_and_build(tmp_path)
 
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        metadata_text = archive.read(metadata_name).decode("utf-8")
+    assert "Description-Content-Type: text/markdown" in metadata_text
+    assert "\n# GuardedPy\n" in metadata_text
+
     assert _wheel_requirement_names(wheel) == {
         "keyring",
         "openai",
@@ -243,7 +249,7 @@ def test_wheel_install_resolves_declared_dependencies_without_host_path_injectio
     assert installed.returncode == 0, installed.stderr
 
 
-def test_local_wheel_runs_the_cli_and_sdist_is_scanned_without_the_source_checkout(tmp_path: Path) -> None:
+def test_local_wheel_and_sdist_work_without_the_source_checkout(tmp_path: Path) -> None:
     """Catches release artifacts that include retired UI files or cannot run the installed CLI."""
     project_copy, wheel, sdist = _copy_and_build(tmp_path)
     assert project_copy != ROOT
@@ -251,7 +257,7 @@ def test_local_wheel_runs_the_cli_and_sdist_is_scanned_without_the_source_checko
     wheelhouse = tmp_path / "offline-wheelhouse"
     wheelhouse.mkdir()
     _build_local_wheelhouse(wheel, wheelhouse)
-    _python, guardedpy, command_env = _installed_environment(tmp_path, wheel, wheelhouse)
+    python, guardedpy, command_env = _installed_environment(tmp_path, wheel, wheelhouse)
     target = _temporary_pytest_project(tmp_path)
 
     help_result = _run([str(guardedpy), "--help"], cwd=target, env=command_env)
@@ -270,3 +276,14 @@ def test_local_wheel_runs_the_cli_and_sdist_is_scanned_without_the_source_checko
         "feedback_repair status=completed",
         "stale_approval_denied status=completed",
     ]
+
+    source_release = tmp_path / "source-release"
+    with tarfile.open(sdist) as archive:
+        archive.extractall(source_release, filter="data")
+    source_root = next(source_release.iterdir())
+    for command in (
+        [str(python), "-m", "pytest", "tests/test_package.py", "tests/test_executor.py", "-q"],
+        ["make", f"PYTHON={python}", "demo"],
+    ):
+        result = _run(command, cwd=source_root, env=command_env)
+        assert result.returncode == 0, result.stdout + result.stderr

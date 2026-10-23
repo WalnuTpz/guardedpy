@@ -25,7 +25,8 @@ def test_plain_conversation_renders_continuous_events_and_stops_for_approval() -
         def run_turn(self, session: object, turn: object) -> tuple[SessionEvent, ...]:
             return (
                 SessionEvent(session_id, turn_id, 2, "assistant_text_delta", assistant_item, "Checking."),
-                SessionEvent(session_id, turn_id, 3, "approval_requested", approval_item, data={"approval_id": str(uuid4())}),
+                SessionEvent(session_id, turn_id, 3, "assistant_item_completed", assistant_item),
+                SessionEvent(session_id, turn_id, 4, "approval_requested", approval_item, data={"approval_id": str(uuid4())}),
             )
 
     output = StringIO()
@@ -108,6 +109,6 @@ def test_plain_local_controls_are_deterministic_and_do_not_reach_the_model() -> 
     ) == 0
     assert output.getvalue().splitlines() == [
         "pytest：passed", "Git diff：无变更",
-        "权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。",
+        "权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除和运行项目 Python 程序须逐次审批。",
         "诊断：凭据已配置",
     ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import shlex
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import sys
@@ -85,7 +86,7 @@ def discover_project(root: Path) -> ProjectProfile:
 
 
 def _configured_testpaths(root: Path) -> tuple[str, ...] | None:
-    for filename in ("pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg"):
+    for filename in ("pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"):
         path = root / filename
         if path.is_symlink() and not path.exists():
             raise ProjectDiscoveryError("invalid_pytest_config")
@@ -97,13 +98,28 @@ def _configured_testpaths(root: Path) -> tuple[str, ...] | None:
             raise ProjectDiscoveryError("invalid_pytest_config") from None
         if not valid_file:
             raise ProjectDiscoveryError("invalid_pytest_config")
-        if filename == "pyproject.toml":
-            return _toml_testpaths(path)
-        return _ini_testpaths(path)
+        options = _toml_options(path) if filename == "pyproject.toml" else _ini_options(path)
+        if options is None:
+            continue
+        if "testpaths" not in options:
+            return None
+        value = options["testpaths"]
+        if filename != "pyproject.toml":
+            try:
+                value = shlex.split(value)
+            except ValueError:
+                raise ProjectDiscoveryError("invalid_pytest_config") from None
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(not isinstance(item, str) or not item.strip() for item in value)
+        ):
+            raise ProjectDiscoveryError("invalid_pytest_config")
+        return tuple(value)
     return None
 
 
-def _toml_testpaths(path: Path) -> tuple[str, ...] | None:
+def _toml_options(path: Path) -> dict[str, object] | None:
     try:
         payload = tomllib.loads(path.read_text())
     except (OSError, UnicodeError, tomllib.TOMLDecodeError):
@@ -123,30 +139,19 @@ def _toml_testpaths(path: Path) -> tuple[str, ...] | None:
         return None
     if not isinstance(options, dict):
         raise ProjectDiscoveryError("invalid_pytest_config")
-    if "testpaths" not in options:
-        return None
-    value = options["testpaths"]
-    if (
-        not isinstance(value, list)
-        or not value
-        or any(not isinstance(item, str) or not item.strip() for item in value)
-    ):
-        raise ProjectDiscoveryError("invalid_pytest_config")
-    return tuple(value)
+    return options
 
 
-def _ini_testpaths(path: Path) -> tuple[str, ...] | None:
+def _ini_options(path: Path) -> dict[str, str] | None:
     parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read_string(path.read_text())
     except (OSError, UnicodeError, configparser.Error):
         raise ProjectDiscoveryError("invalid_pytest_config") from None
-    if not parser.has_option("pytest", "testpaths"):
-        return None
-    paths = tuple(parser.get("pytest", "testpaths").split())
-    if not paths:
-        raise ProjectDiscoveryError("invalid_pytest_config")
-    return paths
+    section = "tool:pytest" if path.name == "setup.cfg" else "pytest"
+    if not parser.has_section(section):
+        return {} if path.name == "pytest.ini" else None
+    return dict(parser.items(section))
 
 
 def _validated_testpaths(root: Path, values: tuple[str, ...]) -> tuple[PurePosixPath, ...]:
@@ -202,6 +207,8 @@ def _has_root_source(root: Path) -> bool:
 def _has_root_test_evidence(root: Path) -> bool:
     for pattern in ("test_*.py", "*_test.py"):
         for candidate in root.rglob(pattern):
+            if any(part.startswith(".") for part in candidate.relative_to(root).parts):
+                continue
             if candidate.is_file() and _contained_path(root, candidate):
                 return True
     return False

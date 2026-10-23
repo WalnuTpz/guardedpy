@@ -134,3 +134,19 @@ def test_continuous_runtime_composes_a_governed_session_for_the_interactive_surf
     session = continuous_runtime(runtime, profile)
 
     assert session.create_session(str(profile.root))
+
+
+def test_non_tty_keyring_failure_has_a_bounded_diagnostic(tmp_path: Path, monkeypatch) -> None:
+    from guardedpy.cli import main
+    from guardedpy.credentials import CredentialBackendUnavailableError
+
+    class UnavailableRuntime(_Runtime):
+        def credential_status(self):
+            raise CredentialBackendUnavailableError("backend details")
+
+    _project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    output = StringIO()
+    assert main(["inspect"], runtime_factory=UnavailableRuntime, stdin=StringIO(), stdout=output) == 1
+    assert "安全系统密钥环不可用" in output.getvalue()
+    assert "backend details" not in output.getvalue()

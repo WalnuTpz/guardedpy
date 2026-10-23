@@ -64,12 +64,26 @@ class _Completions:
         response = next(self._responses)
         if isinstance(response, Exception):
             raise response
-        return response
+        return _Response(response)
+
+
+class _Response:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def __iter__(self):
+        yield from self.chunks
+
+    def close(self):
+        pass
 
 
 class _Transport:
     def __init__(self, responses: list[object]) -> None:
         self.chat = SimpleNamespace(completions=_Completions(responses))
+
+    def close(self):
+        pass
 
 
 def test_deepseek_retries_one_temporary_transport_failure_before_first_chunk_only() -> None:

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="410" viewBox="0 0 1080 410" role="img" aria-labelledby="title description">
+  <title id="title">修改后的验证状态</title>
+  <desc id="description">成功补丁或删除使回合需要完整验证。定向测试通过保留要求，完整 pytest 通过清除要求，后续补丁或删除重新产生要求。</desc>
+  <defs>
+    <style>
+    text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Droid Sans Fallback", sans-serif; }
+    .heading { font-size: 25px; font-weight: 700; fill: #172B4D; }
+    .title { font-size: 23px; font-weight: 600; fill: #172B4D; }
+    .body { font-size: 17px; fill: #52627A; }
+    .label { font-size: 17px; font-weight: 500; fill: #52627A; }
+    .number { font-size: 16px; font-weight: 700; fill: #3667B7; }
+    .edge { fill: none; stroke: #7A8CA5; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#7A8CA5"/></marker>
+    <marker id="blue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#4E79BC"/></marker>
+    <marker id="green-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#39856C"/></marker>
+  </defs>
+<rect x="1" y="1" width="1078" height="408" rx="22" fill="#F7F9FC" stroke="#E1E7EF" stroke-width="1.4"/>
+<text x="48" y="54" text-anchor="start" class="heading">修改后的验证状态</text>
+<text x="48" y="88" text-anchor="start" class="body">验证要求随当前回合的补丁、删除和完整 pytest 结果更新</text>
+<path d="M 440 226 H 640" class="edge" marker-end="url(#green-arrow)" style="stroke: #39856C"/>
+<path d="M 120 226 H 68 V 138 H 280 V 170" class="edge" marker-end="url(#arrow)"/>
+<path d="M 800 282 V 348 H 280 V 282" class="edge" marker-end="url(#arrow)"/>
+<rect x="120" y="170" width="320" height="112" rx="14" fill="#FFF7E9" stroke="#EAD0A4" stroke-width="1.4"/>
+<text x="280.0" y="221.0" text-anchor="middle" class="title">等待完整验证</text>
+<text x="280.0" y="250.0" text-anchor="middle" class="body">补丁或删除成功后进入</text>
+<rect x="640" y="170" width="320" height="112" rx="14" fill="#ECF7F2" stroke="#B3D8C9" stroke-width="1.4"/>
+<text x="800.0" y="221.0" text-anchor="middle" class="title">验证要求已清除</text>
+<text x="800.0" y="250.0" text-anchor="middle" class="body">模型结束回复后可完成回合</text>
+<text x="540" y="211" text-anchor="middle" class="label" style="fill: #2F755D">完整 pytest 通过</text>
+<text x="280" y="124" text-anchor="middle" class="label">定向测试通过，要求保留</text>
+<text x="540" y="334" text-anchor="middle" class="label">再次补丁或删除成功</text>
+<text x="540" y="389" text-anchor="middle" class="body">此标记跟踪补丁与删除工具；/tests 是用户发起的独立本地检查。</text>
+</svg>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import chain
 from typing import Any, TextIO
 
 from guardedpy.conversation import SessionEvent, safe_event_message
@@ -28,7 +29,7 @@ def render_help() -> tuple[str, ...]:
         "/stop：非交互终端没有可中断的活跃回合。",
         "/queue <任务>：非交互终端不支持排队。",
         "/tests：运行配置的 pytest。",
-        "/diff：查看当前 Git diff。",
+        "/diff：显示 Git 未暂存修改状态。",
         "/doctor：查看本地项目状态。",
         "/permissions：查看自动允许与须审批的操作。",
         "/credentials：查看凭据状态；非交互终端不能录入凭据。",
@@ -49,7 +50,7 @@ def run_plain_conversation(
 ) -> int:
     """Run the sole continuous path without making approval decisions for a pipe."""
     session_id = runtime.create_session(project_title)
-    requests = ([initial_text] if initial_text else []) + list(input_stream)
+    requests = chain([initial_text] if initial_text else (), input_stream)
     for raw in requests:
         text = raw.strip()
         if not text:
@@ -77,11 +78,19 @@ def run_plain_conversation(
                 return 2
         turn_id, user_event = runtime.begin_turn(session_id, text, mode)
         _render_event(user_event, output)
+        streaming_text = False
         for event in runtime.run_turn(session_id, turn_id):
             if event.kind == "approval_requested":
                 output.write("需要精确审批，非交互模式已安全停止。\n")
                 return 1
+            if event.kind == "assistant_text_delta":
+                streaming_text = True
+            elif event.kind == "assistant_item_completed" and streaming_text:
+                output.write("\n")
+                streaming_text = False
             _render_event(event, output)
+            if event.kind in {"turn_failed", "turn_interrupted"}:
+                return 1
     return 0
 
 
@@ -110,7 +119,7 @@ def _local_command(
             output.write(f"{summary.id} {summary.updated_at.isoformat()}\n")
         return True, session_id, 0
     if name == "/permissions" and not argument:
-        output.write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除须逐次审批。\n")
+        output.write("权限：项目内读取、补丁、pytest 与只读 Git 自动允许；删除和运行项目 Python 程序须逐次审批。\n")
         return True, session_id, 0
     if name in {"/stop", "/queue"}:
         output.write("非交互模式没有可控制的活跃回合。\n")
@@ -142,11 +151,12 @@ def _render_event(event: SessionEvent, output: TextIO) -> None:
     if event.kind == "user_message":
         output.write(f"› {event.text}\n")
     elif event.kind == "assistant_text_delta":
-        output.write(f"{event.text}\n")
+        output.write(event.text)
     else:
         message = safe_event_message(event)
         if message is not None:
             output.write(f"{message}\n")
+    output.flush()
 
 
 def _render_summary(summary: Any, output: TextIO) -> None:

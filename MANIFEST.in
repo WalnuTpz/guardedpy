@@ -1,0 +1,5 @@
+include Makefile
+include .github/workflows/ci.yml .gitlab-ci.yml
+recursive-include docs *.md *.png *.svg
+recursive-include scripts *.py
+recursive-include tests *.py
